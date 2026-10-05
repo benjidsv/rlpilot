@@ -31,7 +31,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.num_envs = n = cfg.n_workers
         self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, auto_gear=cfg.auto_gear, spin_us=cfg.spin_us,
                              race=cfg.race, run_dir=cfg.run_dir, deterministic=cfg.deterministic)
-        self.act_dim = 3 if cfg.separate_pedals else 2
+        self.act_dim = (3 if cfg.separate_pedals else 2) + (0 if cfg.auto_gear else 1)  # [steer, pedal(s), shift?]
         od = features.obs_dim(self.act_dim)
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
@@ -43,6 +43,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._obs = np.zeros((n, od), np.float32)
         self._prev_action = np.zeros((n, self.act_dim), np.float32)
         self._cmds = np.full(n, CMD_STEP, np.uint32)
+        self._shift_wait = np.zeros(n, np.int64)  # agent steps until the next shift is allowed
+        self._shift_steps = int(np.ceil(cfg.shift_cooldown / cfg.step_seconds - 1e-9))
         self._rew = RewardTracker(n, cfg.reward, cfg.step_seconds, cfg.laps_per_episode)
         self._max_steps = int(round(cfg.max_episode_seconds / cfg.step_seconds))
         self.track_length = float(self._raw[0, F["track_length"]])
@@ -64,7 +66,18 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._clear(slice(None), time.perf_counter())
         return features.build_obs(self._raw, self._prev_action, self._obs).copy(), {}
 
+    def _write_gear(self, shift):
+        gear = np.rint(self._raw[:, F["gear"]]).astype(np.int64)
+        target = np.maximum(gear, 1)  # neutral/reverse at the start: engage first (the worker clamps the top gear)
+        dz = self.cfg.shift_deadzone
+        up = (shift > dz) & (self._shift_wait <= 0)
+        down = (shift < -dz) & (self._shift_wait <= 0) & (target > 1)
+        target = target + up - down
+        self._shift_wait = np.where(target != gear, self._shift_steps, np.maximum(self._shift_wait - 1, 0))
+        self._act[:, A["gear"]] = target
+
     def _clear(self, idx, now):
+        self._shift_wait[idx] = 0
         self._ret[idx] = self._len[idx] = 0
         self._t0[idx] = now
         self._comp[:, idx] = 0
@@ -73,6 +86,8 @@ class SpeedDreamsVecEnv(VectorEnv):
     def step(self, actions):
         actions = np.clip(np.asarray(actions, np.float32).reshape(self.num_envs, self.act_dim), -1, 1)
         features.write_actions(actions, self._act, self.cfg.separate_pedals)
+        if not self.cfg.auto_gear:
+            self._write_gear(actions[:, -1])
         self.client.exchange(CMD_STEP)
         self._dsteer += np.abs(actions[:, 0] - self._prev_action[:, 0])
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE

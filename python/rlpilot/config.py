@@ -25,7 +25,9 @@ class EnvConfig:
     n_workers: int = 4
     frame_skip: int = 2              # robot ticks (20 ms) per agent step -> 25 Hz control
     race: str = "rlpilot"            # data/raceman/<race>.xml
-    auto_gear: bool = True
+    auto_gear: bool = True           # False: the agent shifts (extra action: > +shift_deadzone up, < -shift_deadzone down)
+    shift_cooldown: float = 0.25     # s, minimum time between two agent shifts
+    shift_deadzone: float = 0.33
     separate_pedals: bool = False    # action = [steer, pedal] (pedal < 0 brakes) or [steer, accel, brake]
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")

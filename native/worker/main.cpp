@@ -253,7 +253,9 @@ void applyAction(int k, tCarElt *car)
     c.steer = clampf(a[RLP_A_STEER], -1, 1);
     c.accelCmd = clampf(a[RLP_A_ACCEL], 0, 1);
     c.brakeCmd = clampf(a[RLP_A_BRAKE], 0, 1);
-    c.gear = (H.shm->flags & RLP_FLAG_AUTO_GEAR) ? autoGear(car) : (int)lrintf(clampf(a[RLP_A_GEAR], -1, 6));
+    c.gear = (H.shm->flags & RLP_FLAG_AUTO_GEAR)
+                 ? autoGear(car)
+                 : (int)lrintf(clampf(a[RLP_A_GEAR], -1, car->_gearNb - 1 - car->_gearOffset));
     // The engine holds the clutch down during the pre-start and never releases it: slip it out
     // when pulling away in first or reverse, otherwise keep it engaged (the simu handles shifts).
     float v = fabsf(car->_speed_x);

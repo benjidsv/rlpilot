@@ -30,6 +30,7 @@ def main():
     p.add_argument("--run-name", default=None)
     p.add_argument("--device", default="cpu", help="small MLPs are usually fastest on CPU")
     p.add_argument("--laps-per-episode", type=int, default=0, help="training episodes end after N laps (0: time only)")
+    p.add_argument("--agent-shift", action="store_true", help="the agent shifts gears (extra action) instead of the worker")
     p.add_argument("--eval-every", type=int, default=100_000, help="timesteps between evaluations")
     p.add_argument("--eval-episodes", type=int, default=8, help="parallel eval envs (completion rate has 1/N steps)")
     p.add_argument("--eval-laps", type=int, default=3)
@@ -46,7 +47,8 @@ def main():
     p.add_argument("--batch-size", type=int, default=2048)
     a = p.parse_args()
 
-    cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode)
+    cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
+                    auto_gear=not a.agent_shift)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
     algo_kwargs = {
         "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=0.99, gae_lambda=0.95,
