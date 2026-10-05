@@ -8,7 +8,6 @@ brew install cmake sdl2 sdl2_mixer sdl2_ttf open-scene-graph openal-soft enet ex
   libpng curl rhash minizip cjson utf8proc freetype libvorbis libogg glm
 
 git -C "$SD" submodule update --init --recursive --depth 1
-git -C "$SD" apply --check "$ROOT/macos-build.patch" 2>/dev/null && git -C "$SD" apply "$ROOT/macos-build.patch"
 
 # plib (not in Homebrew): Speed Dreams' CMake fork, static, minus the 'sl' sound lib (Carbon-only on macOS)
 if [ ! -f "$DEPS/lib/libplibssg.a" ]; then
