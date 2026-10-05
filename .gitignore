@@ -1,0 +1,5 @@
+deps/
+sd-install/
+sd-local/
+*.log
+.DS_Store

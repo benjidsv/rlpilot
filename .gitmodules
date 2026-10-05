@@ -1,0 +1,4 @@
+[submodule "speed-dreams-code"]
+	path = speed-dreams-code
+	url = https://github.com/benjidsv/speed-dreams-code.git
+	branch = rlpilot
