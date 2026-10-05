@@ -3,3 +3,9 @@ sd-install/
 sd-local/
 *.log
 .DS_Store
+.venv/
+mlruns/
+__pycache__/
+native/build/
+mlflow.db
+reference/

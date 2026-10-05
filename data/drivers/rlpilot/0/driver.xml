@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE params SYSTEM "params.dtd">
+
+<params name="rlpilot">
+  <section name="driver">
+    <attstr name="name" val="rlpilot 0"/>
+    <attstr name="short name" val="rlpilot"/>
+    <attstr name="code name" val="RLP"/>
+    <attstr name="desc" val="rlpilot RL agent"/>
+    <attstr name="team" val="rlpilot"/>
+    <attstr name="author" val="rlpilot"/>
+    <attstr name="car name" val="sc-cavallo-360"/>
+    <attstr name="race number" val="7"/>
+    <attstr name="red" val="1.0"/>
+    <attstr name="green" val="0.5"/>
+    <attstr name="blue" val="0.0"/>
+    <attstr name="nation" val="FR"/>
+  </section>
+</params>

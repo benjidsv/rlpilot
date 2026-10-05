@@ -73,6 +73,8 @@ Flags: `-tl <0-5>` sets log verbosity, `-nr` makes randomness reproducible.
 - Process startup costs about 0.3 s headless and about 2 s rendered.
 
 ## Pointers for the gym wrapper
+Implemented: see [gym-wrapper.md](gym-wrapper.md). The notes below are the original research.
+
 - **Agent hook:** a robot module, i.e. a `.so` in `src/drivers/<name>/` built with the `ROBOT_MODULE` CMake macro. `simplix`/`axiom` are complete examples. `drive(tCarElt*, tSituation*)` runs every 20 ms and sets `car->_steerCmd`, `_accelCmd`, `_brakeCmd`, `_gearCmd`.
 - **Observations:** car state is in `tCarElt` (`src/interfaces/car.h`); track geometry is `tTrackSeg` (`track.h`).
 - **Headless UI:** `src/modules/userinterface/textonly/`.

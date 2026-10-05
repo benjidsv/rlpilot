@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Speed Dreams on macOS (Apple Silicon, Homebrew). Run from rlpilot/.
+# Build Speed Dreams on macOS (Apple Silicon, Homebrew), then the rlpilot native layer and Python env.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SD="$ROOT/speed-dreams-code"; DEPS="$ROOT/deps"; PREFIX="$ROOT/sd-install"
@@ -32,3 +32,16 @@ cmake -S "$SD" -B "$SD/build" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 cmake --build "$SD/build" -j
 cmake --install "$SD/build"
 cp "$ROOT/sd-local/config/raceman/rlbench.xml" "$PREFIX/share/games/speed-dreams-2/config/raceman/" 2>/dev/null || true
+
+# rlpilot native layer: worker host, robot module, client lib (installed into $PREFIX, next to the game)
+cmake -S "$ROOT/native" -B "$ROOT/native/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$ROOT/native/build" -j
+cmake --install "$ROOT/native/build"
+
+# Python env (gym wrapper, SB3, MLflow)
+if command -v uv >/dev/null; then
+  [ -d "$ROOT/.venv" ] || uv venv "$ROOT/.venv"
+  VIRTUAL_ENV="$ROOT/.venv" uv pip install -e "$ROOT[train,dev]"
+else
+  echo "uv not found: skipping the Python env (pip install -e '.[train,dev]' in a venv)"
+fi
