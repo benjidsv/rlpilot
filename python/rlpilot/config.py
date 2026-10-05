@@ -31,6 +31,7 @@ class EnvConfig:
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")
     deterministic: bool = True       # -nr: no srand(time) in the engine
     spin_us: int = 200               # busy-wait budget before sleeping (workers wait while Python runs)
+    recycle_resets: int = 2000       # replace a worker process after this many resets (engine grows ~0.15 MB/reset)
     run_dir: str | None = None       # worker local dirs; temp dir if None
     reference_race: str = "rlref"    # same track and car driven by a built-in bot (evaluation baseline)
     reward: RewardConfig = field(default_factory=RewardConfig)

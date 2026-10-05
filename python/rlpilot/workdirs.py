@@ -22,7 +22,8 @@ WORKER_BIN = ROOT / "sd-install/games/rlpilot-worker"
 CLIENT_LIB = ROOT / "sd-install/lib/librlpilot_client.dylib"
 
 
-def prepare(run_dir: Path, n_workers: int, race: str = "rlpilot") -> list[Path]:
+def prepare(run_dir: Path, n_workers: int, race: str = "rlpilot", only: int | None = None) -> list[Path]:
+    """Create run_dir/w<i>/ for every worker (or only worker `only`); returns the dirs created."""
     if not (TEMPLATE / "config").is_dir():
         raise FileNotFoundError(f"{TEMPLATE} is not initialized: run the game once with -lc {TEMPLATE}/")
     race_xml = DATA / "raceman" / f"{race}.xml"
@@ -31,7 +32,7 @@ def prepare(run_dir: Path, n_workers: int, race: str = "rlpilot") -> list[Path]:
     shutil.copyfile(race_xml, INSTALL_RACEMAN / race_xml.name)
 
     dirs = []
-    for i in range(n_workers):
+    for i in range(n_workers) if only is None else [only]:
         d = Path(run_dir) / f"w{i}"
         if d.exists():
             shutil.rmtree(d)

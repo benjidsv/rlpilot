@@ -124,9 +124,14 @@ class SpeedDreamsVecEnv(VectorEnv):
             "stats": stats, "_stats": done.copy(),
         }
 
+        recycle = idx[self.client.resets_since_spawn[idx] >= self.cfg.recycle_resets]
         self._cmds[:] = CMD_NONE
         self._cmds[idx] = CMD_RESET
-        self.client.exchange(self._cmds)
+        self._cmds[recycle] = CMD_NONE
+        if len(recycle) < len(idx):
+            self.client.exchange(self._cmds)
+        for i in recycle:
+            self.client.respawn(int(i))
         self._prev_action[idx] = 0
         self._rew.reset(self._raw, idx)
         self._clear(idx, now)

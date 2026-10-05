@@ -93,3 +93,23 @@ def test_lap_done_and_reward_components():
         assert 0 <= st["full_throttle_frac"][0] <= 1 and st["mean_speed"][0] > 10
     finally:
         e.close()
+
+
+def test_worker_recycling_is_equivalent_to_reset():
+    def episodes(recycle_resets):
+        e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, max_episode_seconds=4, recycle_resets=recycle_resets))
+        try:
+            e.reset()
+            pids0 = [w.pid for w in e.client.workers]
+            out = []
+            for _ in range(4 * int(4 / e.cfg.step_seconds)):  # 4 episodes
+                obs, *_ = e.step(follow_centreline(e))
+                out.append(obs.copy())
+            return np.stack(out), pids0 != [w.pid for w in e.client.workers]
+        finally:
+            e.close()
+
+    normal, respawned_normal = episodes(10_000)
+    recycled, respawned = episodes(2)
+    assert respawned and not respawned_normal
+    np.testing.assert_array_equal(normal, recycled)

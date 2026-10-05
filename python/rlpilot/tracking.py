@@ -13,6 +13,7 @@ Tier 2 (behavior / perf)
   perf/{env_steps_per_s,total_steps_per_s,reset_share}
 Tier 3 (artifacts, at each eval)
   eval/<timesteps>/track_map.png, speed_vs_distance.png, traces.npz
+  best/ (model + VecNormalize stats of the best eval so far; tag best_step), checkpoints/<timesteps>/
 Everything else SB3 logs is kept under sb3/. Nothing here runs per env step.
 """
 
@@ -149,9 +150,10 @@ class EvalCallback(BaseCallback):
     """Every `every` timesteps (and at the end): deterministic eval over `laps` laps on `episodes` envs,
     Tier 1 eval metrics, and the track map / speed trace artifacts."""
 
-    def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 4, laps: int = 3,
+    def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 8, laps: int = 3,
                  launch_noise: float = 0.1, verbose: int = 0):
         super().__init__(verbose)
+        self.best_score = -np.inf
         self.cfg = dataclasses.replace(cfg, n_workers=episodes, laps_per_episode=laps, run_dir=None,
                                        max_episode_seconds=min(400.0, 140.0 * laps))
         self.every, self.launch_noise = every, launch_noise
@@ -187,6 +189,17 @@ class EvalCallback(BaseCallback):
         step = self.num_timesteps
         mlflow.log_metrics(res.metrics, step=step)
 
+        # Best checkpoint by eval: finishing the distance first, lap time as the tie-break
+        # (1 ms of progress per second of median lap time, i.e. 10 s ~ 0.01 laps).
+        m = res.metrics
+        score = min(m["eval/progress"], self.cfg.laps_per_episode) - 1e-3 * m.get("eval/lap_time_median", 0.0)
+        mlflow.log_metric("eval/score", score, step=step)
+        if score > self.best_score:
+            self.best_score = score
+            save_model(self.model, "best")  # overwrites the previous best in the run's artifacts
+            mlflow.log_metrics({"best/score": score, "best/step": step}, step=step)
+            mlflow.set_tag("best_step", str(step))
+
         lap_trace, lap = res.best_lap_trace(0)
         # compare like with like: lap 1 starts from the grid, later laps are flying laps
         bot_lap = (lap or 1) if (lap or 1) <= len(self.ref.lap_times) else None
@@ -207,3 +220,27 @@ class EvalCallback(BaseCallback):
             mlflow.log_artifacts(d, f"eval/{step:010d}")
         if self.verbose:
             print({k: round(v, 3) for k, v in res.metrics.items()})
+
+
+class CheckpointCallback(BaseCallback):
+    """Every `every` timesteps: save the model and VecNormalize stats to checkpoints/<timesteps>/ in the
+    run's artifacts (a hard kill or power loss then loses at most `every` steps)."""
+
+    def __init__(self, every: int = 1_000_000):
+        super().__init__()
+        self.every, self._last = every, 0
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last >= self.every:
+            self._last = self.num_timesteps
+            save_model(self.model, f"checkpoints/{self.num_timesteps:010d}")
+        return True
+
+
+def save_model(model, artifact_path: str) -> None:
+    with tempfile.TemporaryDirectory() as d:
+        model.save(Path(d) / "model.zip")
+        env = model.get_env()
+        if isinstance(env, VecNormalize):
+            env.save(str(Path(d) / "vecnormalize.pkl"))
+        mlflow.log_artifacts(d, artifact_path)

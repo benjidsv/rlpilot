@@ -63,6 +63,14 @@ Everything else SB3 logs is under `sb3/`.
 - **Termination groups:** `off_track` = all wheels off for 1 s. `stuck_crashed` = stuck, backwards, damage, or race ended by the engine. `timeout` = `max_episode_seconds`. `lap_done` = `laps_per_episode` reached; this counts as terminated and gets no penalty.
 - **Behaviour definitions:** `steer_delta` = mean |Δsteer| per step, in action units. `offtrack_frac` = fraction of steps with ≥ 2 wheels off the road. `full_throttle_frac` = accel ≥ 0.95.
 
+## Training notes
+
+**pilot-1** (old defaults: `ent_coef=0`, 512 steps x 5 envs, minibatch 1024, constant lr 3e-4) peaked at 1-4M steps (3 laps completed in most evals, best lap 112.6 s vs the bot's 107.4 s) and then degraded: mean eval completion by 10M-step block was 0.62, 0.42, 0.35, 0.22. PPO health explains it: action std 0.19 -> 0.016, approx KL 0.018 -> 0.044, clip fraction 0.19 -> 0.30. The policy became near-deterministic and brittle.
+
+Current defaults (`scripts/train_sb3.py`): `ent_coef=0.01`, `target_kl=0.02`, linear lr decay to 10% (`--lr-schedule`), 2048 steps x workers per update with minibatch 2048, 8 eval episodes. The best eval so far is saved to `best/` (score = min(progress, laps) - 1 ms per second of median lap time); the tag `best_step` says when.
+
+Where the gap to the bot is: at 3M steps the agent matches the bot's corner speeds and braking points, and loses ~6.7 s per lap evenly in acceleration zones (203 vs 231 km/h on the main straight). Hypotheses, untested: the automatic gearbox (shift points and shift time), wheel spin without traction control, 25 Hz vs the bot's 50 Hz control.
+
 ## Performance (M1 Pro, 6 P + 2 E cores)
 
 | Path | Env steps/s |
@@ -84,8 +92,11 @@ Everything else SB3 logs is under `sb3/`.
 - **The engine eliminates non-human robots whose lap exceeds `84.5 + trackLen/10` s** (≈425 s on Jarama). Keep `max_episode_seconds` below that.
 - **The engine rewrites race configs when it loads them**, so `workdirs.py` re-copies them from `data/` on every launch.
 
+- **Memory grows ~0.14 MB per in-process restart** (measured with `footprint`; flat reset time, no file growth). `leaks` finds almost nothing unreachable, so the engine keeps something reachable across restarts. Workaround: `EnvConfig.recycle_resets` (default 2000) replaces a worker process after that many resets, which caps each worker near 300 MB. A respawned worker gives exactly the same episodes as a reset (tested).
+
 ## Next steps
 
-1. **Resets.** About 1% of worker time in a PPO run, but they block the lockstep batch. If early training (short episodes) shows it, a small fork patch could skip results XML and robot/physics reloads.
-2. **Opponents.** Add bots to `rlpilot.xml` and opponent sensors to the protocol. Then add K>1 agent cars per race: the shm is already `[worker][car]`, but `vec_env.py` assumes K=1.
-3. **Rendered evaluation.** Run the same robot in a normal-display race. That needs the policy reachable from the robot without the worker host, e.g. a worker flag that opens a window.
+1. **Find the per-restart memory growth** in the engine, then drop worker recycling.
+2. **Resets.** About 1% of worker time in a PPO run, but they block the lockstep batch. If early training (short episodes) shows it, a small fork patch could skip results XML and robot/physics reloads.
+3. **Opponents.** Add bots to `rlpilot.xml` and opponent sensors to the protocol. Then add K>1 agent cars per race: the shm is already `[worker][car]`, but `vec_env.py` assumes K=1.
+4. **Rendered evaluation.** Run the same robot in a normal-display race. That needs the policy reachable from the robot without the worker host, e.g. a worker flag that opens a window.

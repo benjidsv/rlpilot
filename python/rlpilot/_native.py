@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 import weakref
 from pathlib import Path
 
@@ -114,19 +115,43 @@ class Client:
             self._tmp = tempfile.TemporaryDirectory(prefix="rlpilot-")
             run_dir = self._tmp.name
         self.run_dir = Path(run_dir)
+        self.race, self.trace_level, self.deterministic = race, trace_level, deterministic
         self.dirs = workdirs.prepare(self.run_dir, n_workers, race)
-        self.procs: list[subprocess.Popen] = []
-        for i, d in enumerate(self.dirs):
-            args = [str(workdirs.WORKER_BIN), "-lc", f"{d}/", "-s", race, "-m", self.name.decode(), "-w", str(i),
-                    "-tl", str(trace_level)] + (["-nr"] if deterministic else [])
-            with open(d / "worker.log", "wb") as log:
-                self.procs.append(subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT,
-                                                   stdin=subprocess.DEVNULL))
+        self.procs: list[subprocess.Popen] = [self._spawn(i) for i in range(n_workers)]
+        self.resets_since_spawn = np.zeros(n_workers, np.int64)
         self._finalizer.detach()
         self._finalizer = weakref.finalize(self, Client._cleanup, self.lib, ptr, self.name, self.procs)
         rc = self.lib.rlp_wait_ready(ptr, timeout_ms, C.byref(self._bad))
         if rc:
             self._raise(rc, "startup")
+
+    def _spawn(self, i: int) -> subprocess.Popen:
+        args = [str(workdirs.WORKER_BIN), "-lc", f"{self.dirs[i]}/", "-s", self.race, "-m", self.name.decode(),
+                "-w", str(i), "-tl", str(self.trace_level)] + (["-nr"] if self.deterministic else [])
+        with open(self.dirs[i] / "worker.log", "wb") as log:
+            return subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+
+    def respawn(self, i: int) -> None:
+        """Replace worker i by a fresh process. Its first observation is the start of a new race, i.e. the
+        same as after a reset. Used to cap the engine's memory growth across in-process race restarts."""
+        p = self.procs[i]
+        p.terminate()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        w = self.workers[i]
+        w.status = 0  # STARTING; the new worker answers the current cmd seq once its race is running
+        workdirs.prepare(self.run_dir, self.n_workers, self.race, only=i)
+        self.procs[i] = self._spawn(i)
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while w.status != ST_READY:
+            if self.procs[i].poll() is not None or time.monotonic() > deadline:
+                self._bad.value = i
+                self._raise(-2 if self.procs[i].poll() is not None else -1, "respawn")
+            time.sleep(0.002)
+        self.resets_since_spawn[i] = 0
 
     def exchange(self, cmds: np.ndarray | int) -> None:
         """Send one command per worker (CMD_NONE skips it) and wait for all answers."""
@@ -134,6 +159,7 @@ class Client:
             self._cmds.fill(cmds)
         else:
             self._cmds[:] = cmds
+        self.resets_since_spawn += self._cmds == CMD_RESET
         rc = self.lib.rlp_exchange(self._ptr, self._cmds.ctypes.data, self.timeout_ms, C.byref(self._bad))
         if rc:
             self._raise(rc, "exchange")
