@@ -224,7 +224,9 @@ int autoGear(tCarElt *car)
     int gear = car->_gear;
     if (gear <= 0)
         return 1;
-    const float margin = 4.0f, up = 0.9f; // m/s, fraction of redline
+    // Shift-up point as a fraction of redline (RLP_SHIFT_UP overrides, for sweeps) and downshift margin (m/s).
+    static const float up = [] { const char *e = getenv("RLP_SHIFT_UP"); return e ? (float)atof(e) : 0.9f; }();
+    const float margin = 4.0f;
     float wr = car->_wheelRadius(2), v = car->_speed_x;
     int i = gear + car->_gearOffset;
     if (i + 1 < car->_gearNb && v > up * car->_enginerpmRedLine / car->_gearRatio[i] * wr)

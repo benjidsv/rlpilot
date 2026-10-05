@@ -37,7 +37,7 @@ def main():
     p.add_argument("--checkpoint-every", type=int, default=1_000_000, help="timesteps between checkpoints")
     # PPO. Defaults changed after pilot-1: entropy collapsed (std 0.19 -> 0.016) while approx_kl rose to 0.044
     # and the clip fraction to 0.30, and eval completion fell from ~1.0 to ~0.2 after 4M steps.
-    p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--ent-coef", type=float, default=0.003)
     p.add_argument("--target-kl", type=float, default=0.02, help="stop an update's epochs early above this (0: off)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",

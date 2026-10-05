@@ -189,10 +189,12 @@ class EvalCallback(BaseCallback):
         step = self.num_timesteps
         mlflow.log_metrics(res.metrics, step=step)
 
-        # Best checkpoint by eval: finishing the distance first, lap time as the tie-break
-        # (1 ms of progress per second of median lap time, i.e. 10 s ~ 0.01 laps).
+        # Best checkpoint by eval: pace first, with a moderate reliability penalty. Score is
+        # minus the median lap time (150 s if no lap finished) minus 10 s per unit of
+        # non-completion (no lap finished) and 10 s per lap of missing progress.
         m = res.metrics
-        score = min(m["eval/progress"], self.cfg.laps_per_episode) - 1e-3 * m.get("eval/lap_time_median", 0.0)
+        short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
+        score = -(m.get("eval/lap_time_median", 150.0) + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short)
         mlflow.log_metric("eval/score", score, step=step)
         if score > self.best_score:
             self.best_score = score

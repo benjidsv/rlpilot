@@ -67,7 +67,7 @@ Everything else SB3 logs is under `sb3/`.
 
 **pilot-1** (old defaults: `ent_coef=0`, 512 steps x 5 envs, minibatch 1024, constant lr 3e-4) peaked at 1-4M steps (3 laps completed in most evals, best lap 112.6 s vs the bot's 107.4 s) and then degraded: mean eval completion by 10M-step block was 0.62, 0.42, 0.35, 0.22. PPO health explains it: action std 0.19 -> 0.016, approx KL 0.018 -> 0.044, clip fraction 0.19 -> 0.30. The policy became near-deterministic and brittle.
 
-Current defaults (`scripts/train_sb3.py`): `ent_coef=0.01`, `target_kl=0.02`, linear lr decay to 10% (`--lr-schedule`), 2048 steps x workers per update with minibatch 2048, 8 eval episodes. The best eval so far is saved to `best/` (score = min(progress, laps) - 1 ms per second of median lap time); the tag `best_step` says when.
+Current defaults (`scripts/train_sb3.py`): `ent_coef=0.003`, `target_kl=0.02`, linear lr decay to 10% (`--lr-schedule`), 2048 steps x workers per update with minibatch 2048, 8 eval episodes. The best eval so far is saved to `best/` (score = -(median lap time, 150 s if none + 10 s x (1 - completion rate) + 10 s x missing laps of progress), i.e. pace first with a moderate reliability penalty); the tag `best_step` says when.
 
 Where the gap to the bot is: at 3M steps the agent matches the bot's corner speeds and braking points, and loses ~6.7 s per lap evenly in acceleration zones (203 vs 231 km/h on the main straight). Hypotheses, untested: the automatic gearbox (shift points and shift time), wheel spin without traction control, 25 Hz vs the bot's 50 Hz control.
 
