@@ -6,14 +6,13 @@ Native build of [Speed Dreams](https://forge.a-lec.org/speed-dreams/speed-dreams
 
 ```
 rlpilot/
-├── speed-dreams-code/      upstream engine, commit 62c97b7c6 (main), plus local patch
+├── speed-dreams-code/      submodule: my fork, branch `rlpilot` = upstream 62c97b7c6 + macOS fixes
 │   ├── speed-dreams-data/  submodule: base assets (1 track: Jarama, 1 car: sc-cavallo-360)
 │   ├── freesolid/          submodule: collision lib, built in-tree
 │   └── build/              CMake build dir
 ├── deps/                   plib (static), built from source; not in Homebrew
 ├── sd-install/             `cmake --install` prefix: binary, modules, data
 ├── sd-local/               game's user/settings dir, passed with `-lc`; downloads land here too
-├── macos-build.patch       all source changes to speed-dreams-code
 └── build-macos.sh          full reproducible build: brew deps → plib → configure → build → install
 ```
 
@@ -23,7 +22,7 @@ rlpilot/
 ./build-macos.sh
 ```
 
-Things that differ from the Linux README:
+Things that differ from the Linux README. The "(patch)" fixes are committed on the fork's `rlpilot` branch:
 
 | Problem | Fix |
 |---|---|
@@ -79,3 +78,46 @@ Flags: `-tl <0-5>` sets log verbosity, `-nr` makes randomness reproducible.
 - **Headless UI:** `src/modules/userinterface/textonly/`.
 - **Expected bottlenecks:** passing data to Python every step, and resets (relaunching the process). The simulator itself won't be the limit.
 - **Licence:** upstream is GPLv2+. `NOAI.md` rejects AI-assisted contributions, so keep these changes local and don't upstream them.
+
+## Git
+
+Three repos are involved:
+- **`rlpilot`** (`github.com/benjidsv/rlpilot`): my own work. It contains the wrapper, docs, build script and master configs.
+- **`speed-dreams-code`**: a submodule pointing to my fork (`github.com/benjidsv/speed-dreams-code`), branch `rlpilot`. Remotes: `origin` = fork, `upstream` = `forge.a-lec.org/speed-dreams/speed-dreams-code`.
+- **`speed-dreams-data` and `freesolid`**: submodules of the engine, pinned to upstream. I never edit them.
+
+Ignored in `rlpilot`: `deps/`, `sd-install/`, `sd-local/`, `*.log`. The engine's `build/` is ignored by upstream's own `.gitignore`.
+
+### Day to day
+
+**Change the engine.** Commit in the submodule first, then record the new pointer in `rlpilot`:
+```sh
+cd speed-dreams-code
+git switch rlpilot              # submodules start on a detached HEAD; check out the branch before committing
+git commit -am "…" && git push
+cd ..
+git add speed-dreams-code && git commit -m "Bump speed-dreams-code"
+```
+
+**Pull in upstream updates.**
+```sh
+cd speed-dreams-code
+git fetch upstream
+git rebase upstream/main
+git push --force-with-lease
+git submodule update --init --recursive     # upstream may have moved the data/freesolid pins
+cd .. && git add speed-dreams-code && git commit -m "Rebase engine on upstream"
+```
+Then rebuild with `./build-macos.sh`.
+
+**Fresh clone.**
+```sh
+git clone --recurse-submodules https://github.com/benjidsv/rlpilot.git
+cd rlpilot && ./build-macos.sh
+```
+
+**After pulling `rlpilot` on another machine:** run `git submodule update --init --recursive`.
+
+Reminders:
+- Remotes use HTTPS (auth via `gh auth login` + `gh auth setup-git`), not SSH.
+- Never open merge requests upstream from the fork (see `NOAI.md`).
