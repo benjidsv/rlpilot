@@ -20,7 +20,7 @@ from .vec_env import SpeedDreamsVecEnv
 
 TRACE_FIELDS = {"time": "time", "laps": "laps", "dist_from_start": "dist_from_start", "dist_raced": "dist_raced",
                 "speed_x": "speed_x", "x": "pos_x", "y": "pos_y", "last_lap_time": "last_lap_time",
-                "wheels_off": "wheels_off"}
+                "wheels_off": "wheels_off", "gear": "gear", "rpm": "rpm"}
 
 
 @dataclass

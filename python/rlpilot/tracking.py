@@ -91,6 +91,30 @@ def _base_env(training_env) -> tuple[SpeedDreamsVecEnv, object]:
     return venv.env, venv
 
 
+class StdClampCallback(BaseCallback):
+    """PPO only: keeps the Gaussian policy's action std inside [min_std, max_std] and logs the std of each action
+    dimension (`policy/std_<name>`) every `every` timesteps. Without a cap the entropy bonus can grow the std
+    without bound once the (clipped) actions saturate: pilot-4 (shifting, ent_coef 0.01) reached std 127.
+    The clamp runs before every rollout, i.e. right after each update."""
+
+    def __init__(self, names: tuple[str, ...], min_std: float = 0.135, max_std: float = 1.0, every: int = 20_000):
+        super().__init__()
+        self.names, self.every, self._last = names, every, 0
+        self.lo, self.hi = float(np.log(min_std)), float(np.log(max_std))
+
+    def _on_rollout_start(self):
+        import torch
+        with torch.no_grad():
+            self.model.policy.log_std.clamp_(self.lo, self.hi)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps - self._last >= self.every:
+            self._last = self.num_timesteps
+            std = self.model.policy.log_std.detach().exp().cpu().numpy()
+            mlflow.log_metrics({f"policy/std_{n}": float(v) for n, v in zip(self.names, std)}, step=self.num_timesteps)
+        return True
+
+
 class TrainingMetricsCallback(BaseCallback):
     """Tier 1/2 training metrics from ended episodes, logged at most every `every` timesteps."""
 

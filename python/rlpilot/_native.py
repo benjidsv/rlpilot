@@ -47,7 +47,8 @@ ACT_DIM = len(_ACTIONS)
 PROTOCOL_VERSION = int(_DEFS["version"])
 
 CMD_NONE, CMD_STEP, CMD_RESET, CMD_QUIT = 0, 1, 2, 3
-FLAG_AUTO_GEAR = 1
+FLAG_AUTO_GEAR, FLAG_SHIFT_POINTS = 1, 2
+GEARBOX_FLAGS = {"auto": FLAG_AUTO_GEAR, "points": FLAG_SHIFT_POINTS, "agent": 0}
 ST_READY = 1
 _ERRORS = {-1: "timeout", -2: "worker error/exited", -3: "system error"}
 
@@ -86,14 +87,14 @@ class Client:
     the shared memory: write `act`, call `exchange(cmds)`, read `obs`.
     """
 
-    def __init__(self, n_workers: int, n_cars: int = 1, frame_skip: int = 1, auto_gear: bool = True,
+    def __init__(self, n_workers: int, n_cars: int = 1, frame_skip: int = 1, gearbox: str = "auto",
                  spin_us: int = 50, race: str = "rlpilot", run_dir: str | Path | None = None,
                  deterministic: bool = True, trace_level: int = 1, timeout_ms: int = 30000):
         self.lib = _load_lib()
         self.n_workers, self.n_cars, self.timeout_ms = n_workers, n_cars, timeout_ms
         self.name = f"/rlp{os.getpid()}_{id(self) % 100000}".encode()  # macOS: <= 31 chars
         ptr = self.lib.rlp_create(self.name, n_workers, n_cars, frame_skip,
-                                  FLAG_AUTO_GEAR if auto_gear else 0, spin_us)
+                                  GEARBOX_FLAGS[gearbox], spin_us)
         if not ptr:
             raise OSError(C.get_errno(), "rlp_create failed")
         self._ptr = ptr

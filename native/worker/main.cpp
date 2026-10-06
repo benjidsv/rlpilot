@@ -65,6 +65,7 @@ struct Host
     bool race_over = false;
     bool quit = false;
     double last_tick_time = -1e9;
+    double last_shift[RLP_MAX_CARS]; // race time of each slot's last shift (SHIFT_POINTS gearbox)
     uint64_t tick = 0;
     uint64_t sim_t0 = 0;
 } H;
@@ -236,6 +237,33 @@ int autoGear(tCarElt *car)
     return gear;
 }
 
+float clampf(float v, float lo, float hi);
+
+// Gearbox driven by the agent's shift points (fractions of the redline), checked every robot tick:
+// upshift when the engine reaches `up`, downshift when the lower gear would turn at or below `down`.
+// `down` is kept kShiftGap below `up` so that a shift never immediately triggers the opposite one,
+// and kShiftCooldown stops noisy shift points from making the box hunt.
+int shiftPointGear(int k, tCarElt *car, float up, float down)
+{
+    const float kShiftGap = 0.05f, kShiftCooldown = 0.2f; // fraction of redline, s
+    int gear = car->_gear;
+    if (gear <= 0)
+        return 1;
+    if (H.s->currentTime - H.last_shift[k] < kShiftCooldown)
+        return gear;
+    up = clampf(up, 0.1f, 1.0f);
+    down = std::min(clampf(down, 0.0f, 1.0f), up - kShiftGap);
+    float spin = car->_speed_x / car->_wheelRadius(2), red = car->_enginerpmRedLine; // wheel rad/s
+    int i = gear + car->_gearOffset, next = gear;
+    if (i + 1 < car->_gearNb && spin * car->_gearRatio[i] >= up * red)
+        next = gear + 1;
+    else if (gear > 1 && spin * car->_gearRatio[i - 1] <= down * red)
+        next = gear - 1;
+    if (next != gear)
+        H.last_shift[k] = H.s->currentTime;
+    return next;
+}
+
 float clampf(float v, float lo, float hi) { return std::isfinite(v) ? std::min(hi, std::max(lo, v)) : 0; }
 
 void applyAction(int k, tCarElt *car)
@@ -253,9 +281,12 @@ void applyAction(int k, tCarElt *car)
     c.steer = clampf(a[RLP_A_STEER], -1, 1);
     c.accelCmd = clampf(a[RLP_A_ACCEL], 0, 1);
     c.brakeCmd = clampf(a[RLP_A_BRAKE], 0, 1);
-    c.gear = (H.shm->flags & RLP_FLAG_AUTO_GEAR)
-                 ? autoGear(car)
-                 : (int)lrintf(clampf(a[RLP_A_GEAR], -1, car->_gearNb - 1 - car->_gearOffset));
+    if (H.shm->flags & RLP_FLAG_AUTO_GEAR)
+        c.gear = autoGear(car);
+    else if (H.shm->flags & RLP_FLAG_SHIFT_POINTS)
+        c.gear = shiftPointGear(k, car, a[RLP_A_SHIFT_UP], a[RLP_A_SHIFT_DOWN]);
+    else
+        c.gear = (int)lrintf(clampf(a[RLP_A_GEAR], -1, car->_gearNb - 1 - car->_gearOffset));
     // The engine holds the clutch down during the pre-start and never releases it: slip it out
     // when pulling away in first or reverse, otherwise keep it engaged (the simu handles shifts).
     float v = fabsf(car->_speed_x);
@@ -441,6 +472,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     std::fill(std::begin(H.slot_of), std::end(H.slot_of), -1);
+    std::fill(std::begin(H.last_shift), std::end(H.last_shift), -1e9);
     if (!trace) {
         H.wid = (uint32_t)std::stoul(worker);
         H.shm = mapShm(shmName);
@@ -495,6 +527,7 @@ int main(int argc, char *argv[])
             H.fresh = H.hold = true;
             H.tick = 0;
             H.last_tick_time = -1e9;
+            std::fill(std::begin(H.last_shift), std::end(H.last_shift), -1e9);
             memset(H.cars, 0, sizeof(H.cars));
         }
         else if (!H.race_over && !H.quit && H.engine->inData()->_reState != RE_STATE_RACE) {

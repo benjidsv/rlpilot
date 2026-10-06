@@ -21,6 +21,7 @@ from .reward import REWARD_COMPONENTS, TERM_REASONS, RewardTracker
 
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
+GEARBOX_ACTIONS = {"auto": (), "agent": ("shift",), "points": ("shift_up", "shift_down")}  # extra actions
 
 
 class SpeedDreamsVecEnv(VectorEnv):
@@ -29,9 +30,13 @@ class SpeedDreamsVecEnv(VectorEnv):
     def __init__(self, cfg: EnvConfig = EnvConfig()):
         self.cfg = cfg
         self.num_envs = n = cfg.n_workers
-        self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, auto_gear=cfg.auto_gear, spin_us=cfg.spin_us,
+        self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, gearbox=cfg.gearbox, spin_us=cfg.spin_us,
                              race=cfg.race, run_dir=cfg.run_dir, deterministic=cfg.deterministic)
-        self.act_dim = (3 if cfg.separate_pedals else 2) + (0 if cfg.auto_gear else 1)  # [steer, pedal(s), shift?]
+        if cfg.gearbox not in GEARBOX_ACTIONS:
+            raise ValueError(f"gearbox must be one of {list(GEARBOX_ACTIONS)}, not {cfg.gearbox!r}")
+        self.action_names = (("steer", "accel", "brake") if cfg.separate_pedals else ("steer", "pedal")) \
+            + GEARBOX_ACTIONS[cfg.gearbox]
+        self.act_dim = len(self.action_names)
         od = features.obs_dim(self.act_dim)
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
@@ -76,6 +81,11 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._shift_wait = np.where(target != gear, self._shift_steps, np.maximum(self._shift_wait - 1, 0))
         self._act[:, A["gear"]] = target
 
+    def _write_shift_points(self, up, down):
+        (ulo, uhi), (dlo, dhi) = self.cfg.shift_up_range, self.cfg.shift_down_range
+        self._act[:, A["shift_up"]] = ulo + (up + 1) * 0.5 * (uhi - ulo)
+        self._act[:, A["shift_down"]] = dlo + (down + 1) * 0.5 * (dhi - dlo)
+
     def _clear(self, idx, now):
         self._shift_wait[idx] = 0
         self._ret[idx] = self._len[idx] = 0
@@ -86,8 +96,10 @@ class SpeedDreamsVecEnv(VectorEnv):
     def step(self, actions):
         actions = np.clip(np.asarray(actions, np.float32).reshape(self.num_envs, self.act_dim), -1, 1)
         features.write_actions(actions, self._act, self.cfg.separate_pedals)
-        if not self.cfg.auto_gear:
+        if self.cfg.gearbox == "agent":
             self._write_gear(actions[:, -1])
+        elif self.cfg.gearbox == "points":
+            self._write_shift_points(actions[:, -2], actions[:, -1])
         self.client.exchange(CMD_STEP)
         self._dsteer += np.abs(actions[:, 0] - self._prev_action[:, 0])
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE

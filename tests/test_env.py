@@ -113,3 +113,25 @@ def test_worker_recycling_is_equivalent_to_reset():
     recycled, respawned = episodes(2)
     assert respawned and not respawned_normal
     np.testing.assert_array_equal(normal, recycled)
+
+
+def test_shift_points_gearbox():
+    """gearbox="points": the two extra actions move the upshift point (early vs at the limiter)."""
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, gearbox="points", max_episode_seconds=30))
+    try:
+        assert e.action_names == ("steer", "pedal", "shift_up", "shift_down")
+        e.reset()
+        red = e._raw[0, F["rpm_redline"]]
+        points = np.array([[-1, -1], [1, -1]], np.float32)  # upshift at 70% / 97% of redline
+        prev_gear, prev_rpm = e._raw[:, F["gear"]].copy(), e._raw[:, F["rpm"]].copy()
+        at_upshift = [[], []]
+        for _ in range(400):
+            e.step(np.concatenate([follow_centreline(e), points], 1))
+            gear = e._raw[:, F["gear"]]
+            for i in np.flatnonzero(gear > prev_gear):
+                at_upshift[i].append(prev_rpm[i] / red)
+            prev_gear, prev_rpm = gear.copy(), e._raw[:, F["rpm"]].copy()
+        assert at_upshift[0] and at_upshift[1]
+        assert max(at_upshift[0]) < 0.8 and min(at_upshift[1]) > 0.9
+    finally:
+        e.close()

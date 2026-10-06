@@ -25,9 +25,14 @@ class EnvConfig:
     n_workers: int = 4
     frame_skip: int = 2              # robot ticks (20 ms) per agent step -> 25 Hz control
     race: str = "rlpilot"            # data/raceman/<race>.xml
-    auto_gear: bool = True           # False: the agent shifts (extra action: > +shift_deadzone up, < -shift_deadzone down)
-    shift_cooldown: float = 0.25     # s, minimum time between two agent shifts
-    shift_deadzone: float = 0.33
+    # "auto": the worker shifts at fixed points (90% of redline). "points": two extra actions set the worker's
+    # upshift / downshift points (fractions of redline, mapped from [-1, 1] onto the ranges below).
+    # "agent": one extra action shifts directly (> +shift_deadzone up, < -shift_deadzone down).
+    gearbox: str = "auto"
+    shift_up_range: tuple[float, float] = (0.7, 0.97)   # "points": upshift when the engine reaches this
+    shift_down_range: tuple[float, float] = (0.4, 0.9)  # "points": downshift when the lower gear would be <= this
+    shift_cooldown: float = 0.25     # s, "agent": minimum time between two agent shifts
+    shift_deadzone: float = 0.33     # "agent"
     separate_pedals: bool = False    # action = [steer, pedal] (pedal < 0 brakes) or [steer, accel, brake]
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")

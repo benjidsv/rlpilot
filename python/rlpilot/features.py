@@ -47,4 +47,4 @@ def write_actions(action: np.ndarray, act: np.ndarray, separate_pedals: bool) ->
     act[:, A["gear"]] = 0
 
 
-assert ACT_DIM == 4
+assert ACT_DIM == 6

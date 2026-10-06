@@ -19,14 +19,16 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 2
+#define RLP_VERSION 3
 #define RLP_MAX_CARS 8
 #define RLP_N_RAYS 19
 #define RLP_RAY_RANGE 200.0f
 
 enum rlp_cmd { RLP_CMD_NONE = 0, RLP_CMD_STEP = 1, RLP_CMD_RESET = 2, RLP_CMD_QUIT = 3 };
 enum rlp_status { RLP_ST_STARTING = 0, RLP_ST_READY = 1, RLP_ST_ERROR = 2, RLP_ST_EXITED = 3 };
-enum rlp_flags { RLP_FLAG_AUTO_GEAR = 1 };
+/* Gearbox: AUTO_GEAR = the worker's fixed shift points; SHIFT_POINTS = the worker shifts at the points the
+ * client sends (RLP_A_SHIFT_UP/DOWN); neither = the client sends the gear (RLP_A_GEAR). */
+enum rlp_flags { RLP_FLAG_AUTO_GEAR = 1, RLP_FLAG_SHIFT_POINTS = 2 };
 
 /* Raw per-car fields, followed by RLP_N_RAYS track-edge distances (m). */
 enum rlp_field {
@@ -68,7 +70,15 @@ enum rlp_field {
 };
 #define RLP_OBS_DIM (RLP_N_FIELDS + RLP_N_RAYS)
 
-enum rlp_action { RLP_A_STEER, RLP_A_ACCEL, RLP_A_BRAKE, RLP_A_GEAR, RLP_ACT_DIM };
+enum rlp_action {
+    RLP_A_STEER,
+    RLP_A_ACCEL,
+    RLP_A_BRAKE,
+    RLP_A_GEAR,
+    RLP_A_SHIFT_UP,   /* SHIFT_POINTS: upshift when the engine reaches this fraction of the redline */
+    RLP_A_SHIFT_DOWN, /* SHIFT_POINTS: downshift when the lower gear would be at or below this fraction */
+    RLP_ACT_DIM
+};
 
 typedef struct {
     uint32_t magic, version;
