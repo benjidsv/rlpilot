@@ -44,6 +44,8 @@ def main():
     p.add_argument("--min-std", type=float, default=0.135, help="PPO: floor on the action std (0.135 = exp(-2))")
     p.add_argument("--max-std", type=float, default=1.0,
                    help="PPO: cap on the action std; pilot-4's entropy bonus drove it to 127 (actions are clipped to [-1, 1])")
+    p.add_argument("--gamma", type=float, default=0.99,
+                   help="discount per agent step: the horizon is ~1/(1-gamma) steps, e.g. 0.99 at 25 Hz = 4 s")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decays to 10%% of --lr at the end of training")
@@ -55,10 +57,10 @@ def main():
                     gearbox=a.gearbox)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
     algo_kwargs = {
-        "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=0.99, gae_lambda=0.95,
+        "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=0.95,
                     learning_rate=lr, ent_coef=a.ent_coef, clip_range=0.2, target_kl=a.target_kl or None,
                     policy_kwargs=dict(net_arch=[256, 256])),
-        "sac": dict(buffer_size=1_000_000, batch_size=256, learning_starts=10_000, train_freq=1,
+        "sac": dict(gamma=a.gamma, buffer_size=1_000_000, batch_size=256, learning_starts=10_000, train_freq=1,
                     gradient_steps=1, policy_kwargs=dict(net_arch=[256, 256])),
     }[a.algo]
     logged = algo_kwargs | {"learning_rate": f"{a.lr} ({a.lr_schedule})", "min_std": a.min_std,
@@ -73,7 +75,7 @@ def main():
         log_provenance(cfg, **{f"algo.{k}": v for k, v in logged.items()}, algo=a.algo,
                        timesteps=a.timesteps)
         env = SB3VecEnv(SpeedDreamsVecEnv(cfg))
-        venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=algo_kwargs.get("gamma", 0.99))
+        venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=a.gamma)
         Model = {"ppo": PPO, "sac": SAC}[a.algo]
         model = Model("MlpPolicy", venv, device=a.device, verbose=0, **algo_kwargs)
         model.set_logger(Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout),

@@ -52,7 +52,7 @@ Each run gets the full `EnvConfig` and the algorithm hyperparameters as params, 
 
 | Tier | Metrics |
 |---|---|
-| 1. Dashboard | `eval/lap_time_best`, `eval/lap_time_median`, with `eval/bot_lap_time_best`/`_median` as the reference line (same car and track, built-in simplix bot). `eval/completion_rate`, `eval/progress`, `episode/progress` (distance / track length). `end/{off_track,stuck_crashed,timeout,lap_done}`. `reward/{progress,offtrack,damage,terminal,total}`. `ppo/{approx_kl,clip_fraction,entropy,explained_variance}` |
+| 1. Dashboard | `eval/lap_time_best`, `eval/lap_time_median`, with `eval/bot_lap_time_best`/`_median` as the reference line (same car and track, built-in simplix bot); `eval/flying_lap_time_*` exclude lap 1 (standing start). `eval/fail_dist_from_start`, `eval/fail_lap`: where failed eval episodes ended. `eval/completion_rate`, `eval/progress`, `episode/progress` (distance / track length). `end/{off_track,stuck_crashed,timeout,lap_done}`. `reward/{progress,offtrack,damage,terminal,total}`. `ppo/{approx_kl,clip_fraction,entropy,explained_variance}` |
 | 2. Behaviour | `behavior/{steer_delta,offtrack_frac,mean_speed,full_throttle_frac}` (training) and `eval/behavior/*`. `perf/{env_steps_per_s,total_steps_per_s,reset_share}` |
 | 3. Artifacts, per eval | `eval/<timesteps>/track_map.png` (line coloured by speed), `speed_vs_distance.png` (agent vs bot on the same lap index, plus the cumulative time gap), `traces.npz` (every eval episode, every step) |
 

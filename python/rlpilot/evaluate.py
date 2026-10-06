@@ -86,6 +86,15 @@ def evaluate(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv,
     if len(all_laps):
         m["eval/lap_time_best"] = float(all_laps.min())
         m["eval/lap_time_median"] = float(np.median(all_laps))
+    flying = np.concatenate([x[1:] for x in lap_times])  # lap 1 is from a standing start
+    if len(flying):
+        m["eval/flying_lap_time_best"] = float(flying.min())
+        m["eval/flying_lap_time_median"] = float(np.median(flying))
+    # Where failed episodes ended (not lap_done / time_limit): one spot means one corner the policy can't take.
+    failed = [i for i, s in enumerate(stats) if END_GROUPS[s["end"]] not in ("lap_done", "timeout")]
+    if failed:
+        m["eval/fail_dist_from_start"] = float(np.median([traces[i]["dist_from_start"][-1] for i in failed]))
+        m["eval/fail_lap"] = float(np.mean([traces[i]["laps"][-1] for i in failed]))
     if reference is not None and len(reference.lap_times):
         m["eval/bot_lap_time_best"] = reference.best_lap
         m["eval/bot_lap_time_median"] = reference.median_lap

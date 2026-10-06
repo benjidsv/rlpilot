@@ -3,7 +3,9 @@
 Tier 1 (dashboard)
   eval/lap_time_best, eval/lap_time_median   deterministic policy over a few laps; plotted with
   eval/bot_lap_time_best, ..._median         the built-in bot's lap times on the same car and track
+  eval/flying_lap_time_best, ..._median      the same without lap 1 (standing start, ~4 s slower)
   eval/completion_rate, eval/progress        fraction of eval episodes finishing a lap; distance / track length
+  eval/fail_dist_from_start, eval/fail_lap   median position along the lap (m) / mean lap where failed eval episodes ended
   episode/progress                           training episodes: distance / track length
   end/{off_track,stuck_crashed,timeout,lap_done}   why training episodes end (fractions)
   reward/{progress,offtrack,damage,terminal,total} per-episode reward components
