@@ -240,8 +240,9 @@ class EvalCallback(BaseCallback):
         # Best checkpoint by eval: pace first, with a moderate reliability penalty. Score is
         # minus the median lap time (150 s if no lap finished) minus 10 s per unit of
         # non-completion (no lap finished) and 10 s per lap of missing progress.
-        # With several training tracks: the mean over them, with lap times in % of the bot's best lap
-        # (~1 s per % on Jarama), so long and short tracks weigh the same. Held-out tracks never select.
+        # With several tracks: the mean over the evaluated training and held-out tracks, with lap times in % of
+        # the bot's best lap (~1 s per % on Jarama), so long and short tracks weigh the same. Held-out tracks
+        # are never trained on but do select the checkpoint, so their metrics at best/ are optimistic.
         m = res.metrics
         short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
         score = -(m.get("eval/lap_time_median", 150.0) + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short)
@@ -296,10 +297,9 @@ class EvalCallback(BaseCallback):
                 t["fail_dist_from_start"] = m["eval/fail_dist_from_start"]
             out |= {f"eval_track/{track_of(race)}/{k}": v for k, v in t.items()}
             groups["eval_train" if race in self.train_races else "eval_heldout"].append(t)
-            if race in self.train_races:
-                short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
-                lap_pct = 100.0 * m["eval/lap_time_median"] / bot if "eval/lap_time_median" in m else 140.0
-                scores.append(-(lap_pct + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short))
+            short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
+            lap_pct = 100.0 * m["eval/lap_time_median"] / bot if "eval/lap_time_median" in m else 140.0
+            scores.append(-(lap_pct + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short))
         for g, ts in groups.items():
             for k in ("progress", "completion_rate", "flying_gap_pct"):
                 vals = [t[k] for t in ts if k in t]

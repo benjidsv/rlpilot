@@ -137,16 +137,53 @@ def test_shift_points_gearbox():
         e.close()
 
 
-def test_track_profile_on_a_circle():
+@pytest.mark.parametrize("stat", ["mean", "peak"])
+def test_track_profile_on_a_circle(stat):
     from rlpilot.track import CURVATURE_SCALE, TrackProfile
     r, n = 100.0, 2000
     a = np.linspace(0, 2 * np.pi, n, endpoint=False)  # counter-clockwise = turning left
     circle = lambda rad: np.stack([rad * np.cos(a), rad * np.sin(a)], 1)
-    p = TrackProfile(circle(r + 5), circle(r - 5), length=2 * np.pi * r)
+    p = TrackProfile(circle(r + 5), circle(r - 5), length=2 * np.pi * r, stat=stat)
     assert abs(p.total_turn - 2 * np.pi) < 1e-6
     look = p.lookahead(np.array([0.0, 300.0, 600.0]))
     np.testing.assert_allclose(look, CURVATURE_SCALE / r, rtol=1e-3)
     np.testing.assert_allclose(p.table[::50], CURVATURE_SCALE / r, rtol=1e-3)
+
+
+def test_track_profile_peak_sees_short_corners():
+    """A rounded square (200 m straights, 20 m radius corners): in the 50 m windows far ahead, the mean dilutes
+    the 31 m corner while the peak reads its full curvature."""
+    from rlpilot.track import CURVATURE_SCALE, TrackProfile
+    r, side = 20.0, 200.0
+    pts = []
+    for q in range(4):  # counter-clockwise: straight along the heading, then a left quarter circle
+        h = q * np.pi / 2
+        d, c = np.array([np.cos(h), np.sin(h)]), np.array([-np.sin(h), np.cos(h)])
+        start = pts[-1] + d if pts else np.zeros(2)
+        pts += [start + d * t for t in np.arange(0, side, 1.0)]
+        centre = pts[-1] + d + c * r
+        pts += [centre - c * r * np.cos(u) + d * r * np.sin(u) for u in np.linspace(0, np.pi / 2, 32)[1:-1]]
+    mid = np.array(pts)
+    seg = np.diff(np.vstack([mid, mid[:1]]), axis=0)
+    normal = np.stack([-seg[:, 1], seg[:, 0]], 1) / np.hypot(seg[:, 0], seg[:, 1])[:, None]
+    length = float(np.hypot(seg[:, 0], seg[:, 1]).sum())
+    peak, mean = (TrackProfile(mid + 5 * normal, mid - 5 * normal, length, stat=s) for s in ("peak", "mean"))
+    s0 = np.array([side - 275.0 + length])  # the first corner is 250-300 m ahead
+    assert peak.lookahead(s0)[0, -1] > 0.9 * CURVATURE_SCALE / r
+    assert mean.lookahead(s0)[0, -1] < 0.7 * CURVATURE_SCALE / r
+    assert np.abs(peak.lookahead(np.array([side / 2]))[0, :4]).max() < 0.05  # the next 75 m are straight
+
+
+def test_steer_rate_penalty():
+    from rlpilot.config import RewardConfig
+    from rlpilot.reward import REWARD_COMPONENTS, RewardTracker
+    raw = np.zeros((2, N_FIELDS + N_RAYS), np.float32)
+    raw[:, F["speed_x"]] = 20.0
+    t = RewardTracker(2, RewardConfig(steer_rate=0.1), step_seconds=0.04)
+    t.reset(raw)
+    t.step(raw, np.array([0.0, 0.5], np.float32))
+    steer = t.components[REWARD_COMPONENTS.index("steer")]
+    np.testing.assert_allclose(steer, [0.0, -0.025])  # 0.1 x 0.5^2
 
 
 def test_multi_track_switching_and_lookahead():

@@ -12,6 +12,10 @@ class RewardConfig:
     offtrack: float = 0.05         # per step, scaled by the fraction of wheels off the road
     damage: float = 0.001          # per damage point
     terminal: float = 10.0         # penalty when an episode fails (terminated other than by lap_done)
+    steer_rate: float = 0.02       # per step, x (change of the steer action)^2: proto-4's deterministic steer
+                                   # flipped sign every step (steer_delta 0.5 -> 0.005/step); smooth driving (~0.05)
+                                   # costs ~nothing. It also taxes exploration noise (std 0.5: ~0.01/step), so 0.1
+                                   # outweighed the terminal penalty in early (noisy) episodes.
     # termination rules (seconds of sim time)
     offtrack_patience: float = 1.0   # all four wheels off the road for this long
     stuck_patience: float = 4.0      # slower than stuck_speed for this long
@@ -32,6 +36,8 @@ class EnvConfig:
     races: tuple[str, ...] = ()
     track_switch_steps: int = 200_000  # ~2 h 15 min of driving at 25 Hz; a respawn costs ~380 ms of the whole batch
     lookahead: bool = False          # add the centreline curvature over windows ahead (track.LOOKAHEAD_EDGES)
+    lookahead_stat: str = "peak"     # per window: "peak" (signed max |curvature|) or "mean" (proto-3/4; dilutes
+                                     # short tight corners, e.g. Spa's Bus Stop read -0.82 for a -1.34 peak)
     # Car randomization: factors drawn uniformly per episode (applied when the race restarts, ~ms).
     car_grip: tuple[float, float] = (1.0, 1.0)   # x tyre friction
     car_mass: tuple[float, float] = (1.0, 1.0)   # x car mass

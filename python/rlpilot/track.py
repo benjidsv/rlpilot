@@ -15,7 +15,8 @@ import numpy as np
 from . import reference, workdirs
 
 LOOKAHEAD_EDGES = (0, 10, 25, 50, 75, 100, 150, 200, 250, 300)  # m ahead; one feature per window between edges
-CURVATURE_SCALE = 25.0  # obs = mean curvature (1/m) x this: a 25 m radius bend reads 1, clipped to +-3
+CURVATURE_SCALE = 25.0  # obs = curvature (1/m) x this: a 25 m radius bend reads 1, clipped to +-3
+PEAK_SMOOTHING = 10     # m, moving average of the per-metre curvature before taking a window's peak
 
 
 @functools.cache
@@ -39,10 +40,17 @@ def reference_for(race: str) -> str:
 
 
 class TrackProfile:
-    """Unwrapped centreline heading on a 1 m grid; `lookahead(s)` gives the mean curvature over each window
-    [s + edges[k], s + edges[k+1]] ahead of distance-from-start s (+ = turning left, like to_middle)."""
+    """Unwrapped centreline heading on a 1 m grid; `lookahead(s)` gives the curvature over each window
+    [s + edges[k], s + edges[k+1]] ahead of distance-from-start s (+ = turning left, like to_middle).
+    stat "mean": the window's mean curvature (heading change / width), which dilutes a short tight corner in a
+    wide far window. "peak": the signed curvature of largest magnitude in the window (after PEAK_SMOOTHING),
+    so a chicane 250 m ahead reads as tight as it will be when the car gets there."""
 
-    def __init__(self, left: np.ndarray, right: np.ndarray, length: float, edges=LOOKAHEAD_EDGES):
+    def __init__(self, left: np.ndarray, right: np.ndarray, length: float, edges=LOOKAHEAD_EDGES,
+                 stat: str = "peak"):
+        if stat not in ("peak", "mean"):
+            raise ValueError(f"stat must be 'peak' or 'mean', not {stat!r}")
+        self.stat = stat
         mid = 0.5 * (left + right)
         seg = np.diff(np.vstack([mid, mid[:1]]), axis=0)  # closed loop
         ds = np.hypot(seg[:, 0], seg[:, 1])
@@ -61,9 +69,9 @@ class TrackProfile:
 
     @classmethod
     @functools.cache
-    def for_race(cls, race: str) -> "TrackProfile":
+    def for_race(cls, race: str, stat: str = "peak") -> "TrackProfile":
         ref = reference.load(reference_for(race), laps=3)
-        return cls(ref.track_left, ref.track_right, ref.track_length)
+        return cls(ref.track_left, ref.track_right, ref.track_length, stat=stat)
 
     @property
     def n_features(self) -> int:
@@ -72,9 +80,24 @@ class TrackProfile:
     def lookahead(self, dist_from_start: np.ndarray) -> np.ndarray:
         """[n] distances (m) -> [n, n_features] scaled, clipped mean curvatures."""
         s = np.mod(np.asarray(dist_from_start, np.float64), self.length)
+        if self.stat == "peak":
+            return self._peaks[np.minimum(s.astype(np.int64), len(self._peaks) - 1)]
         h = np.interp(s[:, None] + self.edges[None, :], np.arange(len(self.heading)), self.heading)
         k = np.diff(h, axis=1) / np.diff(self.edges)[None, :]
         return np.clip(k * CURVATURE_SCALE, -3, 3).astype(np.float32)
+
+    @functools.cached_property
+    def _peaks(self) -> np.ndarray:
+        """"peak" lookahead at every metre of the lap, [ceil(length), n_features] (window starts rounded down)."""
+        k = np.diff(self.heading)  # curvature (1/m) over each metre
+        w = PEAK_SMOOTHING
+        k = np.convolve(np.pad(k, (w // 2, w - 1 - w // 2), mode="edge"), np.ones(w) / w, mode="valid")
+        starts = np.arange(int(np.ceil(self.length)))
+        out = np.empty((len(starts), self.n_features), np.float32)
+        for j, (lo, hi) in enumerate(zip(self.edges[:-1].astype(int), self.edges[1:].astype(int))):
+            win = np.lib.stride_tricks.sliding_window_view(k, hi - lo)[starts + lo]
+            out[:, j] = win[np.arange(len(starts)), np.abs(win).argmax(axis=1)]
+        return np.clip(out * CURVATURE_SCALE, -3, 3)
 
     @functools.cached_property
     def table(self) -> np.ndarray:
@@ -85,9 +108,9 @@ class TrackProfile:
 class LookaheadTable:
     """All races' lookahead tables stacked, so a vector step is one gather: row = offset[race] + metre."""
 
-    def __init__(self, races):
+    def __init__(self, races, stat: str = "peak"):
         races = list(dict.fromkeys(races))
-        profiles = [TrackProfile.for_race(r) for r in races]
+        profiles = [TrackProfile.for_race(r, stat) for r in races]
         self.n_features = profiles[0].n_features
         sizes = [len(p.table) for p in profiles]
         self.table = np.concatenate([p.table for p in profiles])

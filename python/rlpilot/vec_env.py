@@ -38,7 +38,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, gearbox=cfg.gearbox, spin_us=cfg.spin_us,
                              race=[self.races[i % len(self.races)] for i in range(n)], run_dir=cfg.run_dir,
                              deterministic=cfg.deterministic)
-        self._look = LookaheadTable(self.races) if cfg.lookahead else None
+        self._look = LookaheadTable(self.races, cfg.lookahead_stat) if cfg.lookahead else None
         if self._look is not None:
             self._look_off, self._look_size = self._look.rows(self.client.races)
         if cfg.gearbox not in GEARBOX_ACTIONS:
@@ -141,12 +141,13 @@ class SpeedDreamsVecEnv(VectorEnv):
         elif self.cfg.gearbox == "points":
             self._write_shift_points(actions[:, -2], actions[:, -1])
         self.client.exchange(CMD_STEP)
-        self._dsteer += np.abs(actions[:, 0] - self._prev_action[:, 0])
+        d_steer = actions[:, 0] - self._prev_action[:, 0]
+        self._dsteer += np.abs(d_steer)
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE
         self._prev_action[:] = actions
 
         raw = self._raw
-        reward, terminated, reason = self._rew.step(raw)
+        reward, terminated, reason = self._rew.step(raw, d_steer)
         self._comp += self._rew.components
         self._off += raw[:, F["wheels_off"]] >= OFFTRACK_WHEELS
         self._speed += raw[:, F["speed_x"]]

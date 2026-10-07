@@ -18,7 +18,7 @@ LAP_DONE = TERM_REASONS.index("lap_done")
 END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "stuck_crashed",
               "damage": "stuck_crashed", "race_over": "stuck_crashed", "lap_done": "lap_done",
               "time_limit": "timeout"}
-REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal")
+REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer")
 
 
 class RewardTracker:
@@ -36,8 +36,9 @@ class RewardTracker:
         self.prev_damage[idx] = raw[idx, F["damage"]]
         self.off_t[idx] = self.stuck_t[idx] = self.back_t[idx] = 0
 
-    def step(self, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Returns reward [n], terminated [n] bool, reason [n] int (-1 = none, else TERM_REASONS index).
+    def step(self, raw: np.ndarray, d_steer: np.ndarray | float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """raw [n, OBS_DIM], d_steer [n] change of the steer action since the previous step.
+        Returns reward [n], terminated [n] bool, reason [n] int (-1 = none, else TERM_REASONS index).
         The per-component rewards of this step are left in self.components [n_components, n]."""
         c, dt = self.cfg, self.dt
         dist, damage = raw[:, F["dist_raced"]], raw[:, F["damage"]]
@@ -68,4 +69,5 @@ class RewardTracker:
         comp[1] = -c.offtrack * wheels_off / 4
         comp[2] = -c.damage * d_damage
         comp[3] = -c.terminal * failed
+        comp[4] = -c.steer_rate * np.square(d_steer)
         return comp.sum(axis=0), terminated, reason

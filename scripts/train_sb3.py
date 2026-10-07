@@ -15,6 +15,7 @@ from stable_baselines3.common.logger import HumanOutputFormat, Logger
 from stable_baselines3.common.vec_env import VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
+from rlpilot.config import RewardConfig
 from rlpilot.sb3 import CpuRolloutPPO, SB3VecEnv
 from rlpilot.track import race_for
 from rlpilot.tracking import (CheckpointCallback, EvalCallback, MLflowOutputFormat, StdClampCallback, TrainingMetricsCallback,
@@ -45,6 +46,10 @@ def main():
     p.add_argument("--track-switch-steps", type=int, default=200_000,
                    help="a worker switches track at its first reset after this many steps on it")
     p.add_argument("--lookahead", action="store_true", help="observe the track curvature over the next 300 m")
+    p.add_argument("--lookahead-stat", choices=["peak", "mean"], default="peak",
+                   help="curvature per lookahead window: signed peak (default) or mean (proto-3/4)")
+    p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
+                   help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
     p.add_argument("--car-random", type=float, default=0.0,
                    help="per episode, draw tyre grip, mass and engine power factors in [1 - x, 1 + x] (eval: stock car)")
     p.add_argument("--car-obs", action="store_true", help="observe the car factors (else the policy must be robust)")
@@ -60,8 +65,9 @@ def main():
     p.add_argument("--min-std", type=float, default=0.135, help="PPO: floor on the action std (0.135 = exp(-2))")
     p.add_argument("--max-std", type=float, default=1.0,
                    help="PPO: cap on the action std; pilot-4's entropy bonus drove it to 127 (actions are clipped to [-1, 1])")
-    p.add_argument("--gamma", type=float, default=0.99,
-                   help="discount per agent step: the horizon is ~1/(1-gamma) steps, e.g. 0.99 at 25 Hz = 4 s")
+    p.add_argument("--gamma", type=float, default=0.995,
+                   help="discount per agent step: the horizon is ~1/(1-gamma) steps, e.g. 0.99 at 25 Hz = 4 s, "
+                        "0.995 = 8 s (proto-4 braked too late for Spa's Bus Stop, ~4.2 s out at 0.99)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decays to 10%% of --lr at the end of training")
@@ -72,7 +78,8 @@ def main():
     races = tuple(race_for(t) for t in a.tracks)
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
                     gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
-                    track_switch_steps=a.track_switch_steps, lookahead=a.lookahead,
+                    track_switch_steps=a.track_switch_steps, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
+                    reward=RewardConfig(steer_rate=a.steer_rate),
                     car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
                     car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
