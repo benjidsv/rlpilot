@@ -39,35 +39,52 @@ class EvalResult:
 
 def evaluate(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, reference: Reference | None = None,
              launch_noise: float = 0.1, launch_seconds: float = 1.0, seed: int = 0) -> EvalResult:
+    """One episode per env, all on the same track (env 0 runs clean)."""
+    traces, lap_times, stats = rollout(policy, env, launch_noise, launch_seconds, seed)
+    return summarize(traces, lap_times, stats, reference)
+
+
+def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, launch_noise: float = 0.1,
+            launch_seconds: float = 1.0, seed: int = 0, clean=(0,), time_limits: np.ndarray | None = None
+            ) -> tuple[list[dict[str, np.ndarray]], list[np.ndarray], list[dict[str, float]]]:
+    """Runs one episode per env; the envs in `clean` get no launch noise. `time_limits` [n] (seconds) overrides
+    the env's max_episode_seconds per env (envs on different tracks). Returns per-env traces, lap times, stats.
+    Envs whose episode ended are paused (not simulated) until all have ended."""
     n = env.num_envs
     rng = np.random.default_rng(seed)
     noise_steps = int(round(launch_seconds / env.cfg.step_seconds))
+    noisy = np.ones(n, bool)
+    noisy[list(clean)] = False
     cols = [F[f] for f in TRACE_FIELDS.values()]
     rows: list[list[np.ndarray]] = [[] for _ in range(n)]
     acts: list[list[np.ndarray]] = [[] for _ in range(n)]
     stats: list[dict | None] = [None] * n
     active = np.ones(n, bool)
 
-    obs, _ = env.reset()
-    t = 0
-    while active.any():
-        action = np.asarray(policy(obs), np.float32).reshape(n, env.act_dim).copy()
-        if t < noise_steps and n > 1:
-            action[1:] += rng.normal(0, launch_noise, action[1:].shape).astype(np.float32)
-        obs, _, term, trunc, info = env.step(action)
-        done = term | trunc
-        for i in np.flatnonzero(active):
-            raw = info["final_raw"][i] if done[i] else env._raw[i]
-            rows[i].append(raw[cols].copy())
-            acts[i].append(np.clip(action[i, :2], -1, 1))
-            if done[i]:
-                s = {k: float(v[i]) for k, v in info["stats"].items()}
-                r = int(s.pop("term_reason"))
-                s["end"] = TERM_REASONS[r] if r >= 0 else "time_limit"
-                s["return"] = float(info["episode"]["r"][i])
-                stats[i] = s
-                active[i] = False
-        t += 1
+    env.set_time_limits(time_limits)
+    try:
+        obs, _ = env.reset()
+        t = 0
+        while active.any():
+            action = np.asarray(policy(obs), np.float32).reshape(n, env.act_dim).copy()
+            if t < noise_steps:
+                action[noisy] += rng.normal(0, launch_noise, action[noisy].shape).astype(np.float32)
+            obs, _, term, trunc, info = env.step(action, active)
+            done = term | trunc
+            for i in np.flatnonzero(active):
+                raw = info["final_raw"][i] if done[i] else env._raw[i]
+                rows[i].append(raw[cols].copy())
+                acts[i].append(np.clip(action[i, :2], -1, 1))
+                if done[i]:
+                    s = {k: float(v[i]) for k, v in info["stats"].items()}
+                    r = int(s.pop("term_reason"))
+                    s["end"] = TERM_REASONS[r] if r >= 0 else "time_limit"
+                    s["return"] = float(info["episode"]["r"][i])
+                    stats[i] = s
+                    active[i] = False
+            t += 1
+    finally:
+        env.set_time_limits(None)
 
     traces, lap_times = [], []
     for i in range(n):
@@ -76,7 +93,13 @@ def evaluate(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv,
         tr = {k: data[:, j] for j, k in enumerate(TRACE_FIELDS)} | {"steer": a[:, 0], "pedal": a[:, 1]}
         traces.append(tr)
         lap_times.append(lap_times_from_trace(tr))
+    return traces, lap_times, stats
 
+
+def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], stats: list[dict[str, float]],
+              reference: Reference | None = None) -> EvalResult:
+    """eval/* metrics over a set of episodes on one track (the first one is the clean episode)."""
+    n = len(traces)
     all_laps = np.concatenate(lap_times)
     m = {
         "eval/completion_rate": float(np.mean([len(x) >= 1 for x in lap_times])),

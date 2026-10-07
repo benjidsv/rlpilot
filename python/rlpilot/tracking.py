@@ -18,13 +18,15 @@ Tier 2 (behavior / perf)
   perf/{env_steps_per_s,total_steps_per_s,reset_share}
 Tier 3 (artifacts, at each eval)
   eval/<timesteps>/track_map.png, speed_vs_distance.png, traces.npz
-  best/ (model + VecNormalize stats of the best eval so far; tag best_step), checkpoints/<timesteps>/
+  best/ (model + VecNormalize stats of the best eval in the best window of 3 evals; tag best_step),
+  checkpoints/<timesteps>/
 Everything else SB3 logs is kept under sb3/. Nothing here runs per env step.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import subprocess
 import tempfile
 import time
@@ -42,7 +44,7 @@ from . import plots, workdirs
 from . import reference as reference_mod
 from ._native import PROTOCOL_VERSION
 from .config import EnvConfig
-from .evaluate import evaluate
+from .evaluate import rollout, summarize
 from .reward import END_GROUPS, REWARD_COMPONENTS
 from .track import reference_for, track_of
 from .vec_env import SpeedDreamsVecEnv
@@ -177,42 +179,54 @@ class TrainingMetricsCallback(BaseCallback):
 
 
 class EvalCallback(BaseCallback):
-    """Every `every` timesteps (and at the end): deterministic eval over `laps` laps on `episodes` envs,
+    """Every `every` timesteps (and at the end): deterministic eval over `laps` laps with `episodes` envs per track,
     Tier 1 eval metrics, and the track map / speed trace artifacts.
 
-    The first training track keeps its env between evals and gets the eval/* metrics and artifacts. The other
-    training tracks and the `heldout` races (never trained on) are evaluated in a fresh env each time and get
-    per-track and averaged metrics (eval_track/, eval_train/, eval_heldout/)."""
+    All evaluated tracks (the training tracks to evaluate, then the `heldout` races, never trained on) run at once
+    in one env kept between evals: worker i drives track i % n_tracks, so an eval lasts about as long as its longest
+    track rather than the sum of all of them. The first training track gets the eval/* metrics and artifacts; with
+    several tracks, per-track and averaged metrics go to eval_track/, eval_train/, eval_heldout/.
+
+    best/ holds the model of the best-scoring eval within the best window of `smooth` consecutive evals (by mean
+    score, logged as eval/score_smoothed), so that one lucky eval does not win. Each eval's model is kept locally
+    until it leaves the window."""
 
     def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 8, laps: int = 3,
                  launch_noise: float = 0.1, verbose: int = 0, heldout: tuple[str, ...] = (),
-                 eval_train: tuple[str, ...] = ()):
+                 eval_train: tuple[str, ...] = (), smooth: int = 3):
         super().__init__(verbose)
-        self.best_score = -np.inf
         # training tracks to evaluate (default: all of them); the first one gets eval/* and the artifacts
         self.train_races = tuple(eval_train) or tuple(cfg.races) or (cfg.race,)
-        self.heldout = tuple(heldout)
-        # evaluated on the stock car (factor observations, if any, read 0)
-        self.cfg = dataclasses.replace(cfg, n_workers=episodes, laps_per_episode=laps, run_dir=None, races=(),
+        self.heldout = tuple(r for r in heldout if r not in self.train_races)
+        self.races = self.train_races + self.heldout
+        # evaluated on the stock car (factor observations, if any, read 0). Workers never change track: no
+        # track switching, and no recycling (whose respawn would draw a random track).
+        self.cfg = dataclasses.replace(cfg, n_workers=episodes * len(self.races), laps_per_episode=laps,
+                                       run_dir=None, race=self.races[0],
+                                       races=self.races if len(self.races) > 1 else (),
+                                       track_switch_steps=2**62, recycle_resets=2**62,
                                        car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
-        self.every, self.launch_noise = every, launch_noise
+        self.every, self.launch_noise, self.smooth = every, launch_noise, max(1, smooth)
         self._last = 0
-
-    def _track_cfg(self, race: str, ref) -> EnvConfig:
-        # time for `laps` laps at 70% of the bot's pace, plus the standing start
-        return dataclasses.replace(self.cfg, race=race,
-                                   max_episode_seconds=self.cfg.laps_per_episode * ref.best_lap / 0.7 + 20.0)
+        self.best_score = -np.inf
+        self._window: list[tuple[int, float, Path]] = []  # (step, score, local model snapshot) of the last evals
 
     def _on_training_start(self):
-        races = self.train_races + self.heldout
-        self.refs = {r: reference_mod.load(reference_for(r), laps=3) for r in races}
+        self.refs = {r: reference_mod.load(reference_for(r), laps=3) for r in self.races}
         self.ref = self.refs[self.train_races[0]]
-        mlflow.log_params({"eval.episodes": self.cfg.n_workers, "eval.laps": self.cfg.laps_per_episode,
+        mlflow.log_params({"eval.episodes": self.cfg.n_workers // len(self.races),
+                           "eval.laps": self.cfg.laps_per_episode, "eval.smooth": self.smooth,
                            "eval.launch_noise": self.launch_noise, "eval.bot_race": reference_for(self.train_races[0]),
                            "eval.bot_lap_time_best": round(self.ref.best_lap, 3),
                            "eval.train_tracks": ",".join(track_of(r) for r in self.train_races),
                            "eval.heldout_tracks": ",".join(track_of(r) for r in self.heldout)})
-        self.env = SpeedDreamsVecEnv(self._track_cfg(self.train_races[0], self.ref))
+        self.env = SpeedDreamsVecEnv(self.cfg)
+        n_tracks = len(self.races)
+        assert list(self.env.client.races) == [self.races[i % n_tracks] for i in range(self.env.num_envs)]
+        # time for `laps` laps at 70% of the bot's pace, plus the standing start
+        self._limits = np.array([self.cfg.laps_per_episode * self.refs[self.races[i % n_tracks]].best_lap / 0.7 + 20.0
+                                 for i in range(self.env.num_envs)])
+        self._tmp = tempfile.TemporaryDirectory(prefix="rlpilot-eval-")
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last >= self.every:
@@ -224,6 +238,7 @@ class EvalCallback(BaseCallback):
         if self.num_timesteps != self._last:
             self.run()
         self.env.close()
+        self._tmp.cleanup()
 
     def run(self):
         norm = self.training_env if isinstance(self.training_env, VecNormalize) else None
@@ -233,36 +248,31 @@ class EvalCallback(BaseCallback):
                 obs = norm.normalize_obs(obs)
             return self.model.predict(obs, deterministic=True)[0]
 
-        res = evaluate(policy, self.env, self.ref, launch_noise=self.launch_noise)
+        n_tracks, n = len(self.races), self.env.num_envs
+        traces, lap_times, stats = rollout(policy, self.env, self.launch_noise, clean=range(n_tracks),
+                                           time_limits=self._limits)
+        results = {}
+        for t, race in enumerate(self.races):
+            idx = range(t, n, n_tracks)  # the first one (env t) is the clean episode
+            results[race] = summarize([traces[i] for i in idx], [lap_times[i] for i in idx], [stats[i] for i in idx],
+                                      self.refs[race])
+        res = results[self.train_races[0]]
         step = self.num_timesteps
         mlflow.log_metrics(res.metrics, step=step)
 
-        # Best checkpoint by eval: pace first, with a moderate reliability penalty. Score is
-        # minus the median lap time (150 s if no lap finished) minus 10 s per unit of
-        # non-completion (no lap finished) and 10 s per lap of missing progress.
+        # Score: pace first, with a moderate reliability penalty. Minus the median lap time (150 s if no lap
+        # finished) minus 10 s per unit of non-completion (no lap finished) and 10 s per lap of missing progress.
         # With several tracks: the mean over the evaluated training and held-out tracks, with lap times in % of
         # the bot's best lap (~1 s per % on Jarama), so long and short tracks weigh the same. Held-out tracks
         # are never trained on but do select the checkpoint, so their metrics at best/ are optimistic.
         m = res.metrics
         short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
         score = -(m.get("eval/lap_time_median", 150.0) + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short)
-        if len(self.train_races) + len(self.heldout) > 1:
-            per_track = {self.train_races[0]: res.metrics}
-            for race in self.train_races[1:] + self.heldout:
-                env = SpeedDreamsVecEnv(self._track_cfg(race, self.refs[race]))
-                try:
-                    per_track[race] = evaluate(policy, env, self.refs[race], launch_noise=self.launch_noise).metrics
-                finally:
-                    env.close()
-            agg, scores = self._track_metrics(per_track)
+        if n_tracks > 1:
+            agg, scores = self._track_metrics({r: x.metrics for r, x in results.items()})
             mlflow.log_metrics(agg, step=step)
             score = float(np.mean(scores))
-        mlflow.log_metric("eval/score", score, step=step)
-        if score > self.best_score:
-            self.best_score = score
-            save_model(self.model, "best")  # overwrites the previous best in the run's artifacts
-            mlflow.log_metrics({"best/score": score, "best/step": step}, step=step)
-            mlflow.set_tag("best_step", str(step))
+        self._select_best(step, score)
 
         lap_trace, lap = res.best_lap_trace(0)
         # compare like with like: lap 1 starts from the grid, later laps are flying laps
@@ -285,6 +295,20 @@ class EvalCallback(BaseCallback):
         if self.verbose:
             print({k: round(v, 3) for k, v in res.metrics.items()})
 
+    def _select_best(self, step: int, score: float) -> None:
+        snap = Path(self._tmp.name) / f"{step:012d}"
+        _save_local(self.model, snap)
+        self._window.append((step, score, snap))
+        if len(self._window) > self.smooth:
+            shutil.rmtree(self._window.pop(0)[2], ignore_errors=True)
+        smoothed = float(np.mean([s for _, s, _ in self._window]))
+        mlflow.log_metrics({"eval/score": score, "eval/score_smoothed": smoothed}, step=step)
+        if smoothed > self.best_score:
+            self.best_score = smoothed
+            best_step, best, best_snap = max(self._window, key=lambda w: w[1])
+            mlflow.log_artifacts(str(best_snap), "best")  # overwrites the previous best in the run's artifacts
+            mlflow.log_metrics({"best/score": smoothed, "best/step": best_step, "best/eval_score": best}, step=step)
+            mlflow.set_tag("best_step", str(best_step))
 
     def _track_metrics(self, per_track: dict[str, dict[str, float]]) -> tuple[dict[str, float], list[float]]:
         out, groups, scores = {}, {"eval_train": [], "eval_heldout": []}, []
@@ -325,10 +349,15 @@ class CheckpointCallback(BaseCallback):
         return True
 
 
+def _save_local(model, d: Path) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    model.save(d / "model.zip")
+    env = model.get_env()
+    if isinstance(env, VecNormalize):
+        env.save(str(d / "vecnormalize.pkl"))
+
+
 def save_model(model, artifact_path: str) -> None:
     with tempfile.TemporaryDirectory() as d:
-        model.save(Path(d) / "model.zip")
-        env = model.get_env()
-        if isinstance(env, VecNormalize):
-            env.save(str(Path(d) / "vecnormalize.pkl"))
+        _save_local(model, Path(d))
         mlflow.log_artifacts(d, artifact_path)

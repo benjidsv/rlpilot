@@ -63,7 +63,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._shift_wait = np.zeros(n, np.int64)  # agent steps until the next shift is allowed
         self._shift_steps = int(np.ceil(cfg.shift_cooldown / cfg.step_seconds - 1e-9))
         self._rew = RewardTracker(n, cfg.reward, cfg.step_seconds, cfg.laps_per_episode)
-        self._max_steps = int(round(cfg.max_episode_seconds / cfg.step_seconds))
+        self.set_time_limits(None)  # self._max_steps [n]
         self.track_length = float(self._raw[0, F["track_length"]])  # of worker 0; per env: raw track_length
         # per-episode accumulators
         self._ret = np.zeros(n, np.float64)
@@ -91,6 +91,11 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._car[idx] = self._rng.uniform(lo, hi, (len(idx), len(lo))) if (hi > lo).any() else lo
         a = A[CAR_FACTORS[0]]
         self._act[idx, a:a + len(CAR_FACTORS)] = self._car[idx]
+
+    def set_time_limits(self, seconds: np.ndarray | None) -> None:
+        """Per-env episode time limits (sim seconds, [n]); None restores cfg.max_episode_seconds for all."""
+        sec = self.cfg.max_episode_seconds if seconds is None else np.asarray(seconds, np.float64)
+        self._max_steps = np.round(np.broadcast_to(sec, (self.num_envs,)) / self.cfg.step_seconds).astype(np.int64)
 
     @property
     def car_factors(self) -> np.ndarray:
@@ -133,14 +138,16 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._comp[:, idx] = 0
         self._dsteer[idx] = self._off[idx] = self._speed[idx] = self._full[idx] = 0
 
-    def step(self, actions):
+    def step(self, actions, active: np.ndarray | None = None):
+        """active [n] bool (default all): envs left out are not simulated this step and cannot end; their
+        returned obs / reward are meaningless (evaluation pauses envs whose episode is over)."""
         actions = np.clip(np.asarray(actions, np.float32).reshape(self.num_envs, self.act_dim), -1, 1)
         features.write_actions(actions, self._act, self.cfg.separate_pedals)
         if self.cfg.gearbox == "agent":
             self._write_gear(actions[:, -1])
         elif self.cfg.gearbox == "points":
             self._write_shift_points(actions[:, -2], actions[:, -1])
-        self.client.exchange(CMD_STEP)
+        self.client.exchange(CMD_STEP if active is None else np.where(active, CMD_STEP, CMD_NONE).astype(np.uint32))
         d_steer = actions[:, 0] - self._prev_action[:, 0]
         self._dsteer += np.abs(d_steer)
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE
@@ -155,6 +162,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._len += 1
         self._steps_on_track += 1
         truncated = (self._len >= self._max_steps) & ~terminated
+        if active is not None:
+            terminated &= active
+            truncated &= active
         obs = features.build_obs(raw, self._prev_action, self._obs, self._extra()).copy()
         done = terminated | truncated
         if not done.any():

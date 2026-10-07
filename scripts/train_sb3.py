@@ -54,8 +54,12 @@ def main():
                    help="per episode, draw tyre grip, mass and engine power factors in [1 - x, 1 + x] (eval: stock car)")
     p.add_argument("--car-obs", action="store_true", help="observe the car factors (else the policy must be robust)")
     p.add_argument("--eval-every", type=int, default=100_000, help="timesteps between evaluations")
-    p.add_argument("--eval-episodes", type=int, default=8, help="parallel eval envs (completion rate has 1/N steps)")
-    p.add_argument("--eval-laps", type=int, default=3)
+    p.add_argument("--eval-episodes", type=int, default=8,
+                   help="eval envs per evaluated track, all tracks in parallel (completion rate has 1/N steps)")
+    p.add_argument("--eval-laps", type=int, default=2,
+                   help="laps per eval episode (2: one standing-start lap + one flying lap; proto-4 used 3)")
+    p.add_argument("--eval-smooth", type=int, default=3,
+                   help="best/ = best eval of the best window of this many consecutive evals (by mean score)")
     p.add_argument("--log-every", type=int, default=20_000, help="timesteps between training-metric logs")
     p.add_argument("--checkpoint-every", type=int, default=1_000_000, help="timesteps between checkpoints")
     # PPO. Defaults changed after pilot-1: entropy collapsed (std 0.19 -> 0.016) while approx_kl rose to 0.044
@@ -112,7 +116,7 @@ def main():
                 TrainingMetricsCallback(every=a.log_every),
                 EvalCallback(cfg, every=a.eval_every, episodes=a.eval_episodes, laps=a.eval_laps, verbose=1,
                              heldout=tuple(race_for(t) for t in a.heldout_tracks),
-                             eval_train=tuple(race_for(t) for t in a.eval_train_tracks)),
+                             eval_train=tuple(race_for(t) for t in a.eval_train_tracks), smooth=a.eval_smooth),
                 CheckpointCallback(every=a.checkpoint_every),
                 *([StdClampCallback(env.env.action_names, a.min_std, a.max_std, every=a.log_every)] if a.algo == "ppo" else []),
             ])

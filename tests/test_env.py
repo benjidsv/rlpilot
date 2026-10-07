@@ -224,3 +224,20 @@ def test_car_factors_change_physics_and_obs():
     assert heavy < stock - 1 and weak < stock - 1
     _, obs, e = speed_after(car_mass=(1.1, 1.1), car_obs=True)
     np.testing.assert_allclose(obs[0, -3:], [0.0, 1.0, 0.0], atol=1e-5)  # (factor - 1) x 10
+
+
+def test_paused_envs_are_not_simulated():
+    """step(active=...): left-out envs keep their state and cannot end (evaluation pauses finished episodes)."""
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, max_episode_seconds=1))
+    try:
+        e.reset()
+        active = np.array([True, False])
+        frozen = e._raw[1].copy()
+        ended = np.zeros(2, bool)
+        for _ in range(3 * int(1 / e.cfg.step_seconds)):  # three time limits
+            _, _, term, trunc, _ = e.step(follow_centreline(e), active)
+            ended |= term | trunc
+        assert ended[0] and not ended[1]
+        np.testing.assert_array_equal(e._raw[1], frozen)
+    finally:
+        e.close()
