@@ -6,6 +6,9 @@ Tier 1 (dashboard)
   eval/flying_lap_time_best, ..._median      the same without lap 1 (standing start, ~4 s slower)
   eval/completion_rate, eval/progress        fraction of eval episodes finishing a lap; distance / track length
   eval/fail_dist_from_start, eval/fail_lap   median position along the lap (m) / mean lap where failed eval episodes ended
+  (eval/* is the first training track.) With several tracks, per track and averaged over training / held-out tracks:
+  eval_track/<track>/{progress,completion_rate,flying_gap_pct,fail_dist_from_start},
+  eval_train/*, eval_heldout/* (flying_gap_pct: median flying lap vs the bot's best, in %)
   episode/progress                           training episodes: distance / track length
   end/{off_track,stuck_crashed,timeout,lap_done}   why training episodes end (fractions)
   reward/{progress,offtrack,damage,terminal,total} per-episode reward components
@@ -41,6 +44,7 @@ from ._native import PROTOCOL_VERSION
 from .config import EnvConfig
 from .evaluate import evaluate
 from .reward import END_GROUPS, REWARD_COMPONENTS
+from .track import reference_for, track_of
 from .vec_env import SpeedDreamsVecEnv
 
 
@@ -174,23 +178,41 @@ class TrainingMetricsCallback(BaseCallback):
 
 class EvalCallback(BaseCallback):
     """Every `every` timesteps (and at the end): deterministic eval over `laps` laps on `episodes` envs,
-    Tier 1 eval metrics, and the track map / speed trace artifacts."""
+    Tier 1 eval metrics, and the track map / speed trace artifacts.
+
+    The first training track keeps its env between evals and gets the eval/* metrics and artifacts. The other
+    training tracks and the `heldout` races (never trained on) are evaluated in a fresh env each time and get
+    per-track and averaged metrics (eval_track/, eval_train/, eval_heldout/)."""
 
     def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 8, laps: int = 3,
-                 launch_noise: float = 0.1, verbose: int = 0):
+                 launch_noise: float = 0.1, verbose: int = 0, heldout: tuple[str, ...] = (),
+                 eval_train: tuple[str, ...] = ()):
         super().__init__(verbose)
         self.best_score = -np.inf
-        self.cfg = dataclasses.replace(cfg, n_workers=episodes, laps_per_episode=laps, run_dir=None,
-                                       max_episode_seconds=min(400.0, 140.0 * laps))
+        # training tracks to evaluate (default: all of them); the first one gets eval/* and the artifacts
+        self.train_races = tuple(eval_train) or tuple(cfg.races) or (cfg.race,)
+        self.heldout = tuple(heldout)
+        # evaluated on the stock car (factor observations, if any, read 0)
+        self.cfg = dataclasses.replace(cfg, n_workers=episodes, laps_per_episode=laps, run_dir=None, races=(),
+                                       car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
         self.every, self.launch_noise = every, launch_noise
         self._last = 0
 
+    def _track_cfg(self, race: str, ref) -> EnvConfig:
+        # time for `laps` laps at 70% of the bot's pace, plus the standing start
+        return dataclasses.replace(self.cfg, race=race,
+                                   max_episode_seconds=self.cfg.laps_per_episode * ref.best_lap / 0.7 + 20.0)
+
     def _on_training_start(self):
-        self.ref = reference_mod.load(self.cfg.reference_race, laps=3)
+        races = self.train_races + self.heldout
+        self.refs = {r: reference_mod.load(reference_for(r), laps=3) for r in races}
+        self.ref = self.refs[self.train_races[0]]
         mlflow.log_params({"eval.episodes": self.cfg.n_workers, "eval.laps": self.cfg.laps_per_episode,
-                           "eval.launch_noise": self.launch_noise, "eval.bot_race": self.cfg.reference_race,
-                           "eval.bot_lap_time_best": round(self.ref.best_lap, 3)})
-        self.env = SpeedDreamsVecEnv(self.cfg)
+                           "eval.launch_noise": self.launch_noise, "eval.bot_race": reference_for(self.train_races[0]),
+                           "eval.bot_lap_time_best": round(self.ref.best_lap, 3),
+                           "eval.train_tracks": ",".join(track_of(r) for r in self.train_races),
+                           "eval.heldout_tracks": ",".join(track_of(r) for r in self.heldout)})
+        self.env = SpeedDreamsVecEnv(self._track_cfg(self.train_races[0], self.ref))
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last >= self.every:
@@ -218,9 +240,22 @@ class EvalCallback(BaseCallback):
         # Best checkpoint by eval: pace first, with a moderate reliability penalty. Score is
         # minus the median lap time (150 s if no lap finished) minus 10 s per unit of
         # non-completion (no lap finished) and 10 s per lap of missing progress.
+        # With several training tracks: the mean over them, with lap times in % of the bot's best lap
+        # (~1 s per % on Jarama), so long and short tracks weigh the same. Held-out tracks never select.
         m = res.metrics
         short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
         score = -(m.get("eval/lap_time_median", 150.0) + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short)
+        if len(self.train_races) + len(self.heldout) > 1:
+            per_track = {self.train_races[0]: res.metrics}
+            for race in self.train_races[1:] + self.heldout:
+                env = SpeedDreamsVecEnv(self._track_cfg(race, self.refs[race]))
+                try:
+                    per_track[race] = evaluate(policy, env, self.refs[race], launch_noise=self.launch_noise).metrics
+                finally:
+                    env.close()
+            agg, scores = self._track_metrics(per_track)
+            mlflow.log_metrics(agg, step=step)
+            score = float(np.mean(scores))
         mlflow.log_metric("eval/score", score, step=step)
         if score > self.best_score:
             self.best_score = score
@@ -248,6 +283,31 @@ class EvalCallback(BaseCallback):
             mlflow.log_artifacts(d, f"eval/{step:010d}")
         if self.verbose:
             print({k: round(v, 3) for k, v in res.metrics.items()})
+
+
+    def _track_metrics(self, per_track: dict[str, dict[str, float]]) -> tuple[dict[str, float], list[float]]:
+        out, groups, scores = {}, {"eval_train": [], "eval_heldout": []}, []
+        for race, m in per_track.items():
+            bot = self.refs[race].best_lap
+            t = {"progress": m["eval/progress"], "completion_rate": m["eval/completion_rate"]}
+            if "eval/flying_lap_time_median" in m:
+                t["flying_gap_pct"] = 100.0 * (m["eval/flying_lap_time_median"] / bot - 1)
+            if "eval/fail_dist_from_start" in m:
+                t["fail_dist_from_start"] = m["eval/fail_dist_from_start"]
+            out |= {f"eval_track/{track_of(race)}/{k}": v for k, v in t.items()}
+            groups["eval_train" if race in self.train_races else "eval_heldout"].append(t)
+            if race in self.train_races:
+                short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
+                lap_pct = 100.0 * m["eval/lap_time_median"] / bot if "eval/lap_time_median" in m else 140.0
+                scores.append(-(lap_pct + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short))
+        for g, ts in groups.items():
+            for k in ("progress", "completion_rate", "flying_gap_pct"):
+                vals = [t[k] for t in ts if k in t]
+                if vals:
+                    out[f"{g}/{k}"] = float(np.mean(vals))
+            if ts:  # tracks where at least one flying lap was completed
+                out[f"{g}/tracks_with_flying_lap"] = float(np.mean(["flying_gap_pct" in t for t in ts]))
+        return out, scores
 
 
 class CheckpointCallback(BaseCallback):

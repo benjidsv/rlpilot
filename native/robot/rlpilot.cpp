@@ -19,11 +19,11 @@
 static std::vector<std::string> names;
 static rlp_host_api *host;
 
-static void newTrack(int index, tTrack *track, void *, void **carParmHandle, tSituation *)
+static void newTrack(int index, tTrack *track, void *carHandle, void **carParmHandle, tSituation *)
 {
-    *carParmHandle = nullptr; // default car setup
+    *carParmHandle = nullptr; // no setup of our own: the host edits the car's params in place
     if (host)
-        host->new_track(index, track);
+        host->new_track(index, track, carHandle);
 }
 
 static void newRace(int index, tCarElt *car, tSituation *s)

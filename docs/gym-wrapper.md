@@ -71,6 +71,21 @@ Current defaults (`scripts/train_sb3.py`): `ent_coef=0.003`, `target_kl=0.02`, l
 
 Where the gap to the bot is: at 3M steps the agent matches the bot's corner speeds and braking points, and loses ~6.7 s per lap evenly in acceleration zones (203 vs 231 km/h on the main straight). Hypotheses, untested: the automatic gearbox (shift points and shift time), wheel spin without traction control, 25 Hz vs the bot's 50 Hz control.
 
+## Multiple tracks and the curvature lookahead
+
+- **Tracks.** Track `t` is raced with `data/raceman/rlpilot-<t>.xml` (Jarama: `rlpilot.xml`) and has its bot reference in `rlref-<t>.xml`. Both are the Jarama files with only the track name and category changed. The downloaded tracks live in `sd-local/tracks/`.
+- **Training on several tracks** (`--tracks a b c`, `EnvConfig.races`): each worker starts on a track and, at its first reset after `track_switch_steps` steps on it (default 200k, ~2 h 15 min of driving; a respawn costs ~380 ms of the whole batch, ~2% of the run at this default), respawns on a random one (~0.3 s, blocking the batch, hence not counted in resets). Workers can be on different tracks within the same batch.
+- **Evaluation** (`--heldout-tracks x y`): every eval runs all training tracks plus the held-out ones (never trained on). The first training track keeps the `eval/*` metrics and artifacts. Others log `eval_track/<t>/*`, and the averages go to `eval_train/*` and `eval_heldout/*`. `flying_gap_pct` is the median flying lap vs the bot's best, in %. With several training tracks the best-checkpoint score is averaged over training tracks, with lap times in % of the bot.
+- **Lookahead** (`--lookahead`, `EnvConfig.lookahead`): 9 extra observations, the mean centreline curvature over windows 0-10, 10-25, ..., 250-300 m ahead (x25, + = left, clipped to ±3). It's computed in Python from the bot reference's border samples (`track.py`), with each track precomputed on a 1 m grid (~2 µs per vector step). Its distance-from-start matches the engine's to ~1 m (Imola: up to 5.5 m). It's 2D only, with no elevation.
+- **Why** (2026-10-07): Jarama-only checkpoints crashed at the first heavy braking zone on every other track, braking 40-60 m late. A probe showed the braking onset doesn't depend on speed at all: telling the policy it was 40% faster before a braking point made it brake in only 3% of cases. Shrinking the forward rays did trigger it. On one track the speed at each point is nearly constant, so the policy learned "brake when the road looks like this".
+
+## Track library and car randomization
+
+- **Tracks:** `scripts/download_tracks.py` fetches tracks from the official asset index (the same index and sha256 check as the in-game download manager) into `sd-local/tracks/`. `scripts/setup_tracks.py` writes the `rlpilot-<t>.xml` / `rlref-<t>.xml` race configs and runs the bot reference on each track, writing `reference/tracks.csv`. Status on 2026-10-07: 41 usable circuit/road/gprix tracks. Melbourne was dropped (the bot can't complete a lap). Karwada is a figure-eight (net turn 0, which is correct).
+- **The bot is handicapped by simplix "skilling"** (`drivers/simplix/default.xml`, driver level 0.6). With it off, the bot is ~2% faster (Jarama 105.3 s, Braga 83.8 s). The references keep it on.
+- **Car randomization** (`--car-random 0.1`, `EnvConfig.car_grip/car_mass/car_power`): per episode, the tyre mu (all compounds, dry and wet), the car mass and the engine torque curve are each scaled by a factor drawn in [1-x, 1+x]. The factors travel in shm act slots `RLP_A_CAR_*` (protocol v4). The worker scales the car's merged params in `rbNewTrack` (host API v2). A RESET restarts the race whenever the factors changed, including right after a spawn. `--car-obs` adds the factors to the observation as (f-1)x10. Evaluation always uses the stock car.
+- **The downshift action** (proto-3) is used as a two-position switch: its output is beyond ±1 78% of the time, which is why its std drifted to the 0.5 cap without affecting behaviour. Forcing any fixed downshift point in the gearbox breaks the trained policy, even with the observation kept unchanged: its driving is co-adapted to its own gear timing. 34-63% of downshifts are decided by the `down <= up - 0.05` clamp, i.e. the request was "as early as possible".
+
 ## Performance (M1 Pro, 6 P + 2 E cores)
 
 | Path | Env steps/s |
@@ -78,9 +93,11 @@ Where the gap to the bot is: at 3M steps the agent matches the bot's corner spee
 | C bench, 1 worker, 50 Hz control | 49k (~980× real time) |
 | C bench, 5 workers, 50 Hz | **178k** (~3,560× real time) |
 | Python VectorEnv, 5 workers, 25 Hz | ~46k |
-| SB3 PPO, 5 workers (whole training loop) | ~6k. The learner is the bottleneck. |
+| SB3 PPO, 5 workers, 200 µs spin (whole training loop) | ~6-8.6k |
+| SB3 PPO, 20 workers, 50 µs spin, one-thread rollouts (current defaults) | **~10.5-12.3k** (rollout ≈ update time, ~0.45 s each per 10k samples) |
 
-- **Use at most (performance cores − 1) workers.** Batches are lockstep, so a worker on an efficiency core, or more workers than cores, slows every env. Here 6 workers gave 80k steps/s against 178k for 5.
+- **Env alone (C bench): use at most (performance cores − 1) workers.** Batches are lockstep, so a worker on an efficiency core, or more workers than cores, slows every env. Here 6 workers gave 80k steps/s against 178k for 5.
+- **Whole PPO loop: the opposite.** Each vector step spends ~300 µs in SB3/torch and the env's Python, and the sim workers are idle ~75% of the time. So 20 workers with a short spin (50 µs, then sleep) amortize the per-step policy cost over 4x more envs. A long spin (1 ms) with more than 5 workers oversubscribes the cores and is much slower (4.2k at 8 workers). Measured 2026-10-07: 5→20 workers +40-50%, one-thread rollouts (`CpuRolloutPPO`) +13-33% at 20 workers. MPS for the updates was slower (SB3 syncs every minibatch). Keep n_steps x workers ≈ 10k samples per update.
 - **Spin-waiting matters.** Without spinning, the C bench dropped to 69k. `spin_us` (default 200) is how long a waiter busy-waits before sleeping.
 - **Python overhead is ~35 µs per vector step** (obs 9, reward 19, actions 4), independent of N.
 

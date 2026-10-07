@@ -88,7 +88,7 @@ class Client:
     """
 
     def __init__(self, n_workers: int, n_cars: int = 1, frame_skip: int = 1, gearbox: str = "auto",
-                 spin_us: int = 50, race: str = "rlpilot", run_dir: str | Path | None = None,
+                 spin_us: int = 50, race: str | list[str] = "rlpilot", run_dir: str | Path | None = None,
                  deterministic: bool = True, trace_level: int = 1, timeout_ms: int = 30000):
         self.lib = _load_lib()
         self.n_workers, self.n_cars, self.timeout_ms = n_workers, n_cars, timeout_ms
@@ -116,8 +116,10 @@ class Client:
             self._tmp = tempfile.TemporaryDirectory(prefix="rlpilot-")
             run_dir = self._tmp.name
         self.run_dir = Path(run_dir)
-        self.race, self.trace_level, self.deterministic = race, trace_level, deterministic
-        self.dirs = workdirs.prepare(self.run_dir, n_workers, race)
+        self.races = [race] * n_workers if isinstance(race, str) else list(race)  # one race per worker
+        assert len(self.races) == n_workers
+        self.trace_level, self.deterministic = trace_level, deterministic
+        self.dirs = [workdirs.prepare(self.run_dir, n_workers, r, only=i)[0] for i, r in enumerate(self.races)]
         self.procs: list[subprocess.Popen] = [self._spawn(i) for i in range(n_workers)]
         self.resets_since_spawn = np.zeros(n_workers, np.int64)
         self._finalizer.detach()
@@ -127,14 +129,15 @@ class Client:
             self._raise(rc, "startup")
 
     def _spawn(self, i: int) -> subprocess.Popen:
-        args = [str(workdirs.WORKER_BIN), "-lc", f"{self.dirs[i]}/", "-s", self.race, "-m", self.name.decode(),
+        args = [str(workdirs.WORKER_BIN), "-lc", f"{self.dirs[i]}/", "-s", self.races[i], "-m", self.name.decode(),
                 "-w", str(i), "-tl", str(self.trace_level)] + (["-nr"] if self.deterministic else [])
         with open(self.dirs[i] / "worker.log", "wb") as log:
             return subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
 
-    def respawn(self, i: int) -> None:
-        """Replace worker i by a fresh process. Its first observation is the start of a new race, i.e. the
-        same as after a reset. Used to cap the engine's memory growth across in-process race restarts."""
+    def respawn(self, i: int, race: str | None = None) -> None:
+        """Replace worker i by a fresh process (racing `race` if given). Its first observation is the start of a
+        new race, i.e. the same as after a reset. Used to cap the engine's memory growth across in-process race
+        restarts, and to switch tracks."""
         p = self.procs[i]
         p.terminate()
         try:
@@ -144,7 +147,9 @@ class Client:
             p.wait()
         w = self.workers[i]
         w.status = 0  # STARTING; the new worker answers the current cmd seq once its race is running
-        workdirs.prepare(self.run_dir, self.n_workers, self.race, only=i)
+        if race is not None:
+            self.races[i] = race
+        workdirs.prepare(self.run_dir, self.n_workers, self.races[i], only=i)
         self.procs[i] = self._spawn(i)
         deadline = time.monotonic() + self.timeout_ms / 1000
         while w.status != ST_READY:

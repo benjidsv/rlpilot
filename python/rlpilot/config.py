@@ -25,6 +25,18 @@ class EnvConfig:
     n_workers: int = 4
     frame_skip: int = 2              # robot ticks (20 ms) per agent step -> 25 Hz control
     race: str = "rlpilot"            # data/raceman/<race>.xml
+    # Several races: each worker drives one, drawn at random, and switches to another random one every
+    # track_switch_steps agent steps on a track, at its next reset (by respawning, ~0.3 s, which blocks the whole
+    # batch: counting resets instead made early training, with its short episodes, respawn constantly).
+    # Empty: every worker drives `race`.
+    races: tuple[str, ...] = ()
+    track_switch_steps: int = 200_000  # ~2 h 15 min of driving at 25 Hz; a respawn costs ~380 ms of the whole batch
+    lookahead: bool = False          # add the centreline curvature over windows ahead (track.LOOKAHEAD_EDGES)
+    # Car randomization: factors drawn uniformly per episode (applied when the race restarts, ~ms).
+    car_grip: tuple[float, float] = (1.0, 1.0)   # x tyre friction
+    car_mass: tuple[float, float] = (1.0, 1.0)   # x car mass
+    car_power: tuple[float, float] = (1.0, 1.0)  # x engine torque
+    car_obs: bool = False            # observe the factors, as (factor - 1) x CAR_OBS_SCALE (+-10% -> +-1)
     # "auto": the worker shifts at fixed points (90% of redline). "points": two extra actions set the worker's
     # upshift / downshift points (fractions of redline, mapped from [-1, 1] onto the ranges below).
     # "agent": one extra action shifts directly (> +shift_deadzone up, < -shift_deadzone down).

@@ -1,4 +1,5 @@
-"""Stable-Baselines3 VecEnv adapter over SpeedDreamsVecEnv (no extra processes or copies).
+"""Stable-Baselines3 VecEnv adapter over SpeedDreamsVecEnv (no extra processes or copies), and a PPO with
+single-threaded rollouts.
 
 SB3 wants per-env info dicts; non-empty ones are only built for envs whose episode ended, carrying
 "terminal_observation", "TimeLimit.truncated", the Monitor-style "episode" dict (so SB3 logs
@@ -10,6 +11,8 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import torch as th
+from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
 from .vec_env import SpeedDreamsVecEnv
@@ -70,3 +73,18 @@ class SB3VecEnv(VecEnv):
 
     def get_images(self):
         return [None] * self.num_envs
+
+
+class CpuRolloutPPO(PPO):
+    """PPO whose rollouts use one torch thread: the policy runs on a batch of n_envs observations per step,
+    where waking a thread pool costs more than it saves (and the threads compete with the sim workers).
+    The updates keep all threads. Measured +6% end to end with 5 workers. Saved models load with PPO.load.
+    (Running the updates on MPS was slower: SB3 syncs to the CPU after every minibatch.)"""
+
+    def collect_rollouts(self, *args, **kwargs):
+        threads = th.get_num_threads()
+        th.set_num_threads(1)
+        try:
+            return super().collect_rollouts(*args, **kwargs)
+        finally:
+            th.set_num_threads(threads)

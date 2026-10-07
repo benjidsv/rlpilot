@@ -10,12 +10,13 @@ import sys
 from pathlib import Path
 
 import mlflow
-from stable_baselines3 import PPO, SAC
+from stable_baselines3 import SAC
 from stable_baselines3.common.logger import HumanOutputFormat, Logger
 from stable_baselines3.common.vec_env import VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
-from rlpilot.sb3 import SB3VecEnv
+from rlpilot.sb3 import CpuRolloutPPO, SB3VecEnv
+from rlpilot.track import race_for
 from rlpilot.tracking import (CheckpointCallback, EvalCallback, MLflowOutputFormat, StdClampCallback, TrainingMetricsCallback,
                               log_provenance, save_model)
 
@@ -23,15 +24,30 @@ from rlpilot.tracking import (CheckpointCallback, EvalCallback, MLflowOutputForm
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
-    p.add_argument("--workers", type=int, default=5)
+    # Workers mostly wait for the Python side, so more than the core count pays: 20 workers sleeping after a
+    # 50 us spin gave ~12k steps/s on an M1 Pro vs ~8.6k for 5 workers / 200 us (keep n_steps x workers ~10k).
+    p.add_argument("--workers", type=int, default=20)
+    p.add_argument("--spin-us", type=int, default=50, help="worker busy-wait before sleeping between steps")
     p.add_argument("--frame-skip", type=int, default=2)
     p.add_argument("--timesteps", type=int, default=1_000_000)
     p.add_argument("--experiment", default="rlpilot")
     p.add_argument("--run-name", default=None)
+    p.add_argument("--seed", type=int, default=None, help="network init and action sampling (the sim is deterministic)")
     p.add_argument("--device", default="cpu", help="small MLPs are usually fastest on CPU")
     p.add_argument("--laps-per-episode", type=int, default=0, help="training episodes end after N laps (0: time only)")
     p.add_argument("--gearbox", choices=["auto", "points", "agent"], default="auto",
                    help="auto: fixed shift points; points: the agent sets the up/downshift points; agent: the agent shifts")
+    p.add_argument("--tracks", nargs="+", default=["jarama"],
+                   help="training tracks (data/raceman/rlpilot-<track>.xml); several: each worker draws one at random")
+    p.add_argument("--heldout-tracks", nargs="*", default=[], help="evaluated at every eval, never trained on")
+    p.add_argument("--eval-train-tracks", nargs="*", default=[],
+                   help="training tracks to evaluate (default: all); the first gets eval/* and the plots")
+    p.add_argument("--track-switch-steps", type=int, default=200_000,
+                   help="a worker switches track at its first reset after this many steps on it")
+    p.add_argument("--lookahead", action="store_true", help="observe the track curvature over the next 300 m")
+    p.add_argument("--car-random", type=float, default=0.0,
+                   help="per episode, draw tyre grip, mass and engine power factors in [1 - x, 1 + x] (eval: stock car)")
+    p.add_argument("--car-obs", action="store_true", help="observe the car factors (else the policy must be robust)")
     p.add_argument("--eval-every", type=int, default=100_000, help="timesteps between evaluations")
     p.add_argument("--eval-episodes", type=int, default=8, help="parallel eval envs (completion rate has 1/N steps)")
     p.add_argument("--eval-laps", type=int, default=3)
@@ -49,12 +65,16 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decays to 10%% of --lr at the end of training")
-    p.add_argument("--n-steps", type=int, default=2048, help="rollout length per env (x workers per update)")
+    p.add_argument("--n-steps", type=int, default=512, help="rollout length per env (x workers per update)")
     p.add_argument("--batch-size", type=int, default=2048)
     a = p.parse_args()
 
+    races = tuple(race_for(t) for t in a.tracks)
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
-                    gearbox=a.gearbox)
+                    gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
+                    track_switch_steps=a.track_switch_steps, lookahead=a.lookahead,
+                    car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
+                    car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
     algo_kwargs = {
         "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=0.95,
@@ -73,17 +93,19 @@ def main():
     mlflow.set_experiment(a.experiment)
     with mlflow.start_run(run_name=a.run_name):
         log_provenance(cfg, **{f"algo.{k}": v for k, v in logged.items()}, algo=a.algo,
-                       timesteps=a.timesteps)
+                       timesteps=a.timesteps, seed=a.seed)
         env = SB3VecEnv(SpeedDreamsVecEnv(cfg))
         venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=a.gamma)
-        Model = {"ppo": PPO, "sac": SAC}[a.algo]
-        model = Model("MlpPolicy", venv, device=a.device, verbose=0, **algo_kwargs)
+        Model = {"ppo": CpuRolloutPPO, "sac": SAC}[a.algo]
+        model = Model("MlpPolicy", venv, device=a.device, verbose=0, seed=a.seed, **algo_kwargs)
         model.set_logger(Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout),
                                                              MLflowOutputFormat()]))
         try:
             model.learn(a.timesteps, callback=[
                 TrainingMetricsCallback(every=a.log_every),
-                EvalCallback(cfg, every=a.eval_every, episodes=a.eval_episodes, laps=a.eval_laps, verbose=1),
+                EvalCallback(cfg, every=a.eval_every, episodes=a.eval_episodes, laps=a.eval_laps, verbose=1,
+                             heldout=tuple(race_for(t) for t in a.heldout_tracks),
+                             eval_train=tuple(race_for(t) for t in a.eval_train_tracks)),
                 CheckpointCallback(every=a.checkpoint_every),
                 *([StdClampCallback(env.env.action_names, a.min_std, a.max_std, every=a.log_every)] if a.algo == "ppo" else []),
             ])

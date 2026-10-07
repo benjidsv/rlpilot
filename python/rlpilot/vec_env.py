@@ -18,9 +18,12 @@ from . import features
 from ._native import CMD_NONE, CMD_RESET, CMD_STEP, A, Client, F
 from .config import EnvConfig
 from .reward import REWARD_COMPONENTS, TERM_REASONS, RewardTracker
+from .track import LookaheadTable
 
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
+CAR_FACTORS = ("car_grip", "car_mass", "car_power")  # EnvConfig ranges = shm act slots, in this order
+CAR_OBS_SCALE = 10.0  # observation = (factor - 1) x this
 GEARBOX_ACTIONS = {"auto": (), "agent": ("shift",), "points": ("shift_up", "shift_down")}  # extra actions
 
 
@@ -30,14 +33,23 @@ class SpeedDreamsVecEnv(VectorEnv):
     def __init__(self, cfg: EnvConfig = EnvConfig()):
         self.cfg = cfg
         self.num_envs = n = cfg.n_workers
+        self.races = tuple(cfg.races) or (cfg.race,)
+        self._rng = np.random.default_rng(0)  # track draws (the sim itself is deterministic)
         self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, gearbox=cfg.gearbox, spin_us=cfg.spin_us,
-                             race=cfg.race, run_dir=cfg.run_dir, deterministic=cfg.deterministic)
+                             race=[self.races[i % len(self.races)] for i in range(n)], run_dir=cfg.run_dir,
+                             deterministic=cfg.deterministic)
+        self._look = LookaheadTable(self.races) if cfg.lookahead else None
+        if self._look is not None:
+            self._look_off, self._look_size = self._look.rows(self.client.races)
         if cfg.gearbox not in GEARBOX_ACTIONS:
             raise ValueError(f"gearbox must be one of {list(GEARBOX_ACTIONS)}, not {cfg.gearbox!r}")
         self.action_names = (("steer", "accel", "brake") if cfg.separate_pedals else ("steer", "pedal")) \
             + GEARBOX_ACTIONS[cfg.gearbox]
         self.act_dim = len(self.action_names)
-        od = features.obs_dim(self.act_dim)
+        self._car_ranges = np.array([getattr(cfg, f) for f in CAR_FACTORS], np.float32)  # [3, (lo, hi)]
+        self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
+        n_extra = (self._look.n_features if self._look is not None else 0) + (len(CAR_FACTORS) if cfg.car_obs else 0)
+        od = features.obs_dim(self.act_dim, n_extra)
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
         self.observation_space = gym.vector.utils.batch_space(self.single_observation_space, n)
@@ -52,9 +64,10 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._shift_steps = int(np.ceil(cfg.shift_cooldown / cfg.step_seconds - 1e-9))
         self._rew = RewardTracker(n, cfg.reward, cfg.step_seconds, cfg.laps_per_episode)
         self._max_steps = int(round(cfg.max_episode_seconds / cfg.step_seconds))
-        self.track_length = float(self._raw[0, F["track_length"]])
+        self.track_length = float(self._raw[0, F["track_length"]])  # of worker 0; per env: raw track_length
         # per-episode accumulators
         self._ret = np.zeros(n, np.float64)
+        self._steps_on_track = np.zeros(n, np.int64)  # since the worker's last (re)spawn
         self._len = np.zeros(n, np.int64)
         self._t0 = np.zeros(n, np.float64)
         self._comp = np.zeros((len(REWARD_COMPONENTS), n), np.float64)
@@ -65,11 +78,38 @@ class SpeedDreamsVecEnv(VectorEnv):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)  # the sim is deterministic; seed only feeds self.np_random
+        self._draw_car(np.arange(self.num_envs))
         self.client.exchange(CMD_RESET)
         self._prev_action[:] = 0
         self._rew.reset(self._raw)
         self._clear(slice(None), time.perf_counter())
-        return features.build_obs(self._raw, self._prev_action, self._obs).copy(), {}
+        return features.build_obs(self._raw, self._prev_action, self._obs, self._extra()).copy(), {}
+
+    def _draw_car(self, idx: np.ndarray) -> None:
+        """New car factors for envs idx; the workers apply them when these envs' races restart."""
+        lo, hi = self._car_ranges[:, 0], self._car_ranges[:, 1]
+        self._car[idx] = self._rng.uniform(lo, hi, (len(idx), len(lo))) if (hi > lo).any() else lo
+        a = A[CAR_FACTORS[0]]
+        self._act[idx, a:a + len(CAR_FACTORS)] = self._car[idx]
+
+    @property
+    def car_factors(self) -> np.ndarray:
+        """[n, 3] grip, mass, power factors of each env's current episode."""
+        return self._car.copy()
+
+    def _extra(self, idx: np.ndarray | None = None) -> np.ndarray | None:
+        parts = [self._lookahead(idx)]
+        if self.cfg.car_obs:
+            parts.append(((self._car if idx is None else self._car[idx]) - 1.0) * CAR_OBS_SCALE)
+        parts = [x for x in parts if x is not None]
+        return np.concatenate(parts, axis=1).astype(np.float32) if parts else None
+
+    def _lookahead(self, idx: np.ndarray | None = None) -> np.ndarray | None:
+        if self._look is None:
+            return None
+        if idx is None:
+            return self._look(self._raw[:, F["dist_from_start"]], self._look_off, self._look_size)
+        return self._look(self._raw[idx, F["dist_from_start"]], self._look_off[idx], self._look_size[idx])
 
     def _write_gear(self, shift):
         gear = np.rint(self._raw[:, F["gear"]]).astype(np.int64)
@@ -112,8 +152,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._speed += raw[:, F["speed_x"]]
         self._ret += reward
         self._len += 1
+        self._steps_on_track += 1
         truncated = (self._len >= self._max_steps) & ~terminated
-        obs = features.build_obs(raw, self._prev_action, self._obs).copy()
+        obs = features.build_obs(raw, self._prev_action, self._obs, self._extra()).copy()
         done = terminated | truncated
         if not done.any():
             return obs, reward, terminated, truncated, {}
@@ -129,7 +170,7 @@ class SpeedDreamsVecEnv(VectorEnv):
 
         stats = {
             "dist_raced": at_end(_scatter(final_raw[:, F["dist_raced"]], idx, n)),
-            "progress": at_end(_scatter(np.maximum(final_raw[:, F["dist_raced"]], 0) / self.track_length, idx, n)),
+            "progress": at_end(_scatter(np.maximum(final_raw[:, F["dist_raced"]], 0) / final_raw[:, F["track_length"]], idx, n)),
             "laps": at_end(_scatter(np.maximum(final_raw[:, F["laps"]] - 1, 0), idx, n)),
             "best_lap_time": at_end(_scatter(final_raw[:, F["best_lap_time"]], idx, n)),
             "damage": at_end(_scatter(final_raw[:, F["damage"]], idx, n)),
@@ -151,18 +192,27 @@ class SpeedDreamsVecEnv(VectorEnv):
             "stats": stats, "_stats": done.copy(),
         }
 
-        recycle = idx[self.client.resets_since_spawn[idx] >= self.cfg.recycle_resets]
+        since = self.client.resets_since_spawn[idx]
+        switch = self._steps_on_track[idx] >= self.cfg.track_switch_steps if len(self.races) > 1 \
+            else np.zeros(len(idx), bool)
+        recycle = idx[(since >= self.cfg.recycle_resets) | switch]
         self._cmds[:] = CMD_NONE
         self._cmds[idx] = CMD_RESET
+        self._draw_car(idx)  # before the reset / respawn, which applies them
         self._cmds[recycle] = CMD_NONE
         if len(recycle) < len(idx):
             self.client.exchange(self._cmds)
         for i in recycle:
-            self.client.respawn(int(i))
+            race = str(self._rng.choice(self.races)) if len(self.races) > 1 else None
+            self.client.respawn(int(i), race)
+            self._steps_on_track[i] = 0
+            if self._look is not None:
+                self._look_off[i], self._look_size[i] = self._look.offset[race or self.client.races[i]], \
+                    self._look.size[race or self.client.races[i]]
         self._prev_action[idx] = 0
         self._rew.reset(self._raw, idx)
         self._clear(idx, now)
-        obs[idx] = features.build_obs(self._raw[idx], self._prev_action[idx], self._obs[idx])
+        obs[idx] = features.build_obs(self._raw[idx], self._prev_action[idx], self._obs[idx], self._extra(idx))
         return obs, reward, terminated, truncated, info
 
     def close_extras(self, **kwargs):

@@ -135,3 +135,55 @@ def test_shift_points_gearbox():
         assert max(at_upshift[0]) < 0.8 and min(at_upshift[1]) > 0.9
     finally:
         e.close()
+
+
+def test_track_profile_on_a_circle():
+    from rlpilot.track import CURVATURE_SCALE, TrackProfile
+    r, n = 100.0, 2000
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)  # counter-clockwise = turning left
+    circle = lambda rad: np.stack([rad * np.cos(a), rad * np.sin(a)], 1)
+    p = TrackProfile(circle(r + 5), circle(r - 5), length=2 * np.pi * r)
+    assert abs(p.total_turn - 2 * np.pi) < 1e-6
+    look = p.lookahead(np.array([0.0, 300.0, 600.0]))
+    np.testing.assert_allclose(look, CURVATURE_SCALE / r, rtol=1e-3)
+    np.testing.assert_allclose(p.table[::50], CURVATURE_SCALE / r, rtol=1e-3)
+
+
+def test_multi_track_switching_and_lookahead():
+    from rlpilot.track import race_for
+    races = (race_for("jarama"), race_for("braga"))
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, races=races, lookahead=True, max_episode_seconds=2,
+                                    track_switch_steps=1))
+    try:
+        assert e.single_observation_space.shape[0] == 31 + 2 + 9
+        e.reset()
+        seen = []
+        for _ in range(6 * int(2 / e.cfg.step_seconds)):
+            obs, *_ = e.step(follow_centreline(e))
+            assert np.isfinite(obs).all()
+            seen.append(tuple(e.client.races))
+        assert len(set(seen)) > 1  # workers changed track
+        # the lookahead follows each worker's current track
+        assert set(r for s in seen for r in s) <= set(races)
+        np.testing.assert_array_equal(obs[:, -9:], e._lookahead())
+    finally:
+        e.close()
+
+
+def test_car_factors_change_physics_and_obs():
+    def speed_after(**kw):  # full throttle from the grid, 4 s
+        e = SpeedDreamsVecEnv(EnvConfig(n_workers=1, max_episode_seconds=10, **kw))
+        try:
+            e.reset()
+            for _ in range(100):
+                obs, *_ = e.step(np.array([[0.0, 1.0]], np.float32))
+            return e._raw[0, F["speed_x"]], obs, e
+        finally:
+            e.close()
+
+    stock, _, _ = speed_after()
+    heavy, _, _ = speed_after(car_mass=(1.2, 1.2))
+    weak, _, _ = speed_after(car_power=(0.8, 0.8))
+    assert heavy < stock - 1 and weak < stock - 1
+    _, obs, e = speed_after(car_mass=(1.1, 1.1), car_obs=True)
+    np.testing.assert_allclose(obs[0, -3:], [0.0, 1.0, 0.0], atol=1e-5)  # (factor - 1) x 10

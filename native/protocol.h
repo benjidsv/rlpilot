@@ -19,7 +19,7 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 3
+#define RLP_VERSION 4
 #define RLP_MAX_CARS 8
 #define RLP_N_RAYS 19
 #define RLP_RAY_RANGE 200.0f
@@ -77,6 +77,10 @@ enum rlp_action {
     RLP_A_GEAR,
     RLP_A_SHIFT_UP,   /* SHIFT_POINTS: upshift when the engine reaches this fraction of the redline */
     RLP_A_SHIFT_DOWN, /* SHIFT_POINTS: downshift when the lower gear would be at or below this fraction */
+    /* Car factors, applied when the race (re)starts (a RESET restarts it if they changed). 0 = 1 = stock. */
+    RLP_A_CAR_GRIP,   /* x tyre friction (mu) */
+    RLP_A_CAR_MASS,   /* x car mass */
+    RLP_A_CAR_POWER,  /* x engine torque curve */
     RLP_ACT_DIM
 };
 

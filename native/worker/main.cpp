@@ -66,6 +66,7 @@ struct Host
     bool quit = false;
     double last_tick_time = -1e9;
     double last_shift[RLP_MAX_CARS]; // race time of each slot's last shift (SHIFT_POINTS gearbox)
+    float car_factors[RLP_MAX_CARS][3] = {}; // grip, mass, power applied to each slot's car in this race
     uint64_t tick = 0;
     uint64_t sim_t0 = 0;
 } H;
@@ -174,6 +175,9 @@ void publish()
     rlp_signal(&H.w->done_sync, H.last_cmd_seq);
 }
 
+bool carFactorsChanged();
+int slotOf(int index);
+
 // Publish observations, then block until a command we must act on arrives.
 void decide()
 {
@@ -193,7 +197,7 @@ void decide()
             H.quit = true;
             break;
         }
-        if (cmd == RLP_CMD_RESET && !H.fresh) {
+        if (cmd == RLP_CMD_RESET && (!H.fresh || carFactorsChanged())) {
             H.reset_requested = true;
             H.hold = true;
             break;
@@ -295,7 +299,66 @@ void applyAction(int k, tCarElt *car)
 
 // ---- rlp_host callbacks (called from the robot module) ----
 
-void hostNewTrack(int, tTrack *) {}
+// Car factors requested by the client for slot k (0 = stock), in RLP_A_CAR_* order.
+void requestedFactors(uint32_t k, float out[3])
+{
+    const float *a = rlp_act_at(H.shm, H.wid, k);
+    for (int j = 0; j < 3; j++) {
+        float v = a[RLP_A_CAR_GRIP + j];
+        out[j] = (std::isfinite(v) && v > 0) ? v : 1.0f;
+    }
+}
+
+bool carFactorsChanged()
+{
+    for (uint32_t k = 0; k < H.n_slots; k++) {
+        float f[3];
+        requestedFactors(k, f);
+        if (f[0] != H.car_factors[k][0] || f[1] != H.car_factors[k][1] || f[2] != H.car_factors[k][2])
+            return true;
+    }
+    return false;
+}
+
+void scaleNum(void *h, const char *path, const char *key, float factor)
+{
+    float v = GfParmGetNum(h, path, key, (char *)NULL, NAN);
+    if (std::isfinite(v))
+        GfParmSetNum(h, path, key, (char *)NULL, v * factor);
+}
+
+// Called while the engine loads the race, with the car's merged params (re-read for every race, so the
+// factors never accumulate). Edited in place: rlpilot returns no setup handle of its own.
+void hostNewTrack(int index, tTrack *, void *car)
+{
+    if (!H.shm)
+        return;
+    uint32_t k = slotOf(index);
+    float f[3];
+    requestedFactors(k, f);
+    static const char *wheels[] = {SECT_FRNTRGTWHEEL, SECT_FRNTLFTWHEEL, SECT_REARRGTWHEEL, SECT_REARLFTWHEEL};
+    static const char *compounds[] = {SECT_SOFT, SECT_MEDIUM, SECT_HARD, SECT_WET};
+    if (f[0] != 1.0f)
+        for (const char *w : wheels) {
+            scaleNum(car, w, PRM_MU, f[0]);
+            scaleNum(car, w, PRM_MUWET, f[0]);
+            for (const char *c : compounds) {
+                std::string path = std::string(w) + "/" + SECT_COMPOUNDS + "/" + c;
+                scaleNum(car, path.c_str(), PRM_MU, f[0]);
+                scaleNum(car, path.c_str(), PRM_MUWET, f[0]);
+            }
+        }
+    if (f[1] != 1.0f)
+        scaleNum(car, SECT_CAR, PRM_MASS, f[1]);
+    if (f[2] != 1.0f)
+        for (int i = 1;; i++) {
+            std::string path = std::string(SECT_ENGINE) + "/" + ARR_DATAPTS + "/" + std::to_string(i);
+            if (!GfParmExistsSection(car, path.c_str()))
+                break;
+            scaleNum(car, path.c_str(), PRM_TQ, f[2]);
+        }
+    std::copy(f, f + 3, H.car_factors[k]);
+}
 
 int slotOf(int index)
 {

@@ -13,12 +13,13 @@ OBS_NAMES = (["speed_x", "speed_y", "speed_z", "yaw_rate", "angle", "to_middle",
              + [f"wheel_spin{i}" for i in range(4)] + [f"ray{i}" for i in range(N_RAYS)])
 
 
-def obs_dim(action_dim: int) -> int:
-    return len(OBS_NAMES) + action_dim  # + previous action
+def obs_dim(action_dim: int, n_extra: int = 0) -> int:
+    return len(OBS_NAMES) + action_dim + n_extra  # + previous action + extras (lookahead, car factors)
 
 
-def build_obs(raw: np.ndarray, prev_action: np.ndarray, out: np.ndarray) -> np.ndarray:
-    """raw [n, OBS_DIM] (shm layout), prev_action [n, action_dim] -> out [n, obs_dim], float32."""
+def build_obs(raw: np.ndarray, prev_action: np.ndarray, out: np.ndarray, extra: np.ndarray | None = None
+              ) -> np.ndarray:
+    """raw [n, OBS_DIM] (shm layout), prev_action [n, action_dim], extra [n, k] or None -> out [n, obs_dim]."""
     half_width = np.maximum(raw[:, F["track_width"]], 1.0) * 0.5
     out[:, 0] = raw[:, F["speed_x"]] / 50.0
     out[:, 1] = raw[:, F["speed_y"]] / 10.0
@@ -30,7 +31,10 @@ def build_obs(raw: np.ndarray, prev_action: np.ndarray, out: np.ndarray) -> np.n
     out[:, 7] = raw[:, F["gear"]] / 6.0
     out[:, 8:12] = raw[:, F["wheel_spin0"]:F["wheel_spin0"] + 4] * (WHEEL_RADIUS / 50.0)
     out[:, 12:12 + N_RAYS] = raw[:, N_FIELDS:N_FIELDS + N_RAYS] / RAY_RANGE
-    out[:, 12 + N_RAYS:] = prev_action
+    a = 12 + N_RAYS + prev_action.shape[1]
+    out[:, 12 + N_RAYS:a] = prev_action
+    if extra is not None:
+        out[:, a:] = extra
     return out
 
 
@@ -47,4 +51,4 @@ def write_actions(action: np.ndarray, act: np.ndarray, separate_pedals: bool) ->
     act[:, A["gear"]] = 0
 
 
-assert ACT_DIM == 6
+assert ACT_DIM == 9
