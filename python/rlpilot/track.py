@@ -124,3 +124,64 @@ class LookaheadTable:
     def __call__(self, dist_from_start: np.ndarray, offset: np.ndarray, size: np.ndarray) -> np.ndarray:
         m = np.mod(dist_from_start.astype(np.int64), size)
         return self.table[offset + m]
+
+
+LINE_POINTS = (0, 10, 25, 50, 75, 100, 150, 200)  # m ahead where the racing-line observation is sampled
+
+
+class RacingLine:
+    """The built-in bot's racing line: its lateral offset from the centreline (m, + = left, like to_middle) at
+    every metre of the lap, from its fastest reference lap. Simplix computes this line itself (clothoid-smoothed,
+    unitclothoid.cpp), so it is a decent line on any track that has a reference."""
+
+    def __init__(self, left: np.ndarray, right: np.ndarray, length: float, trace: dict[str, np.ndarray]):
+        mid = 0.5 * (left + right)
+        seg = np.diff(np.vstack([mid, mid[:1]]), axis=0)  # closed loop, as in TrackProfile
+        ds = np.hypot(seg[:, 0], seg[:, 1])
+        keep = ds > 1e-6
+        mid, seg, ds = mid[keep], seg[keep], ds[keep]
+        self.length = float(length)
+        self._s = np.concatenate([[0.0], np.cumsum(ds)[:-1]]) * (length / ds.sum())
+        self._mid = mid
+        self._left = np.stack([-seg[:, 1], seg[:, 0]], 1) / ds[:, None]  # unit normal pointing left
+        lat = self.lateral(trace["x"], trace["y"], trace["dist_from_start"])
+        grid = np.arange(int(np.ceil(length)), dtype=np.float64)
+        self.table = np.interp(grid, trace["dist_from_start"], lat, period=length).astype(np.float32)
+        # the bot's own mean |offset| / half width, for comparison with the agent's (behavior/abs_offset)
+        half_width = 0.5 * np.hypot(*(left[keep] - right[keep]).T)
+        self.abs_offset = float(np.mean(np.abs(self.table) / np.interp(grid, self._s, half_width, period=length)))
+
+    def lateral(self, x: np.ndarray, y: np.ndarray, dist_from_start: np.ndarray) -> np.ndarray:
+        """Signed lateral offset (m, + = left) of positions from the centreline at the same distance from start."""
+        s = np.mod(np.asarray(dist_from_start, np.float64), self.length)
+        p = lambda a: np.interp(s, self._s, a, period=self.length)
+        mx, my = p(self._mid[:, 0]), p(self._mid[:, 1])
+        nx, ny = p(self._left[:, 0]), p(self._left[:, 1])
+        return ((np.asarray(x) - mx) * nx + (np.asarray(y) - my) * ny) / np.hypot(nx, ny)
+
+    @classmethod
+    @functools.cache
+    def for_race(cls, race: str) -> "RacingLine":
+        ref = reference.load(reference_for(race), laps=3)
+        return cls(ref.track_left, ref.track_right, ref.track_length, ref.lap_trace())
+
+
+class LineTable:
+    """All races' racing lines stacked, like LookaheadTable: row = offset[race] + metre."""
+
+    def __init__(self, races):
+        races = list(dict.fromkeys(races))
+        tables = [RacingLine.for_race(r).table for r in races]
+        self.table = np.concatenate(tables)
+        sizes = [len(t) for t in tables]
+        self.offset = dict(zip(races, np.cumsum([0] + sizes[:-1]).tolist()))
+        self.size = dict(zip(races, sizes))
+        self.points = np.asarray(LINE_POINTS, np.int64)
+
+    def rows(self, races) -> tuple[np.ndarray, np.ndarray]:
+        return (np.array([self.offset[r] for r in races], np.int64), np.array([self.size[r] for r in races], np.int64))
+
+    def __call__(self, dist_from_start: np.ndarray, offset: np.ndarray, size: np.ndarray, ahead=(0,)) -> np.ndarray:
+        """Line offset (m) at each distance + each of `ahead` metres: [n, len(ahead)]."""
+        m = np.mod(dist_from_start.astype(np.int64)[:, None] + np.asarray(ahead, np.int64)[None, :], size[:, None])
+        return self.table[offset[:, None] + m]

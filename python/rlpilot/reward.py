@@ -18,7 +18,7 @@ LAP_DONE = TERM_REASONS.index("lap_done")
 END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "stuck_crashed",
               "damage": "stuck_crashed", "race_over": "stuck_crashed", "lap_done": "lap_done",
               "time_limit": "timeout"}
-REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer")
+REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line")
 
 
 class RewardTracker:
@@ -30,14 +30,21 @@ class RewardTracker:
         self.stuck_t = np.zeros(n, np.float32)
         self.back_t = np.zeros(n, np.float32)
         self.components = np.zeros((len(REWARD_COMPONENTS), n), np.float32)
+        self.line_k = cfg.line_shaping  # mutable: training can fade it
+        self.prev_dev = np.zeros(n, np.float32)  # |offset from the racing line| (m) at the previous state
 
-    def reset(self, raw: np.ndarray, idx: np.ndarray | slice = slice(None)) -> None:
+    def reset(self, raw: np.ndarray, idx: np.ndarray | slice = slice(None), line_dev: np.ndarray | None = None) -> None:
+        """line_dev: |offset from the racing line| (m) of the envs idx (all n if idx is a slice)."""
+        if line_dev is not None:
+            self.prev_dev[idx] = line_dev
         self.prev_dist[idx] = raw[idx, F["dist_raced"]]
         self.prev_damage[idx] = raw[idx, F["damage"]]
         self.off_t[idx] = self.stuck_t[idx] = self.back_t[idx] = 0
 
-    def step(self, raw: np.ndarray, d_steer: np.ndarray | float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """raw [n, OBS_DIM], d_steer [n] change of the steer action since the previous step.
+    def step(self, raw: np.ndarray, d_steer: np.ndarray | float = 0.0, line_dev: np.ndarray | None = None
+             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """raw [n, OBS_DIM], d_steer [n] change of the steer action since the previous step, line_dev [n]
+        |offset from the racing line| (m) of the new state (needed when line_k > 0).
         Returns reward [n], terminated [n] bool, reason [n] int (-1 = none, else TERM_REASONS index).
         The per-component rewards of this step are left in self.components [n_components, n]."""
         c, dt = self.cfg, self.dt
@@ -70,4 +77,13 @@ class RewardTracker:
         comp[2] = -c.damage * d_damage
         comp[3] = -c.terminal * failed
         comp[4] = -c.steer_rate * np.square(d_steer)
+        if line_dev is not None and self.line_k > 0:
+            # both potentials with the current k, so fading it never creates a one-off jump
+            phi = -self.line_k * np.minimum(line_dev, c.line_cap) * ~terminated
+            prev = -self.line_k * np.minimum(self.prev_dev, c.line_cap)
+            comp[5] = c.gamma * phi - prev
+        else:
+            comp[5] = 0
+        if line_dev is not None:
+            self.prev_dev[:] = line_dev
         return comp.sum(axis=0), terminated, reason

@@ -12,6 +12,13 @@ class RewardConfig:
     offtrack: float = 0.05         # per step, scaled by the fraction of wheels off the road
     damage: float = 0.001          # per damage point
     terminal: float = 10.0         # penalty when an episode fails (terminated other than by lap_done)
+    # Potential-based shaping towards the bot's racing line: Phi = -line_shaping x min(|offset from the line|,
+    # line_cap) (m), reward += gamma x Phi(next) - Phi(current), Phi = 0 at a terminal state. Over an episode it
+    # sums to ~-Phi(start), so it leaves the optimal policy unchanged (Ng et al. 1999) and only moves credit earlier.
+    # The cap keeps it from pushing back from far off the line. 0: off. Training can fade it (set_line_shaping).
+    line_shaping: float = 0.0      # per metre
+    line_cap: float = 3.0          # m
+    gamma: float = 0.995           # shaping discount; must equal the algorithm's gamma
     steer_rate: float = 0.02       # per step, x (change of the steer action)^2: proto-4's deterministic steer
                                    # flipped sign every step (steer_delta 0.5 -> 0.005/step); smooth driving (~0.05)
                                    # costs ~nothing. It also taxes exploration noise (std 0.5: ~0.01/step), so 0.1
@@ -36,6 +43,8 @@ class EnvConfig:
     races: tuple[str, ...] = ()
     track_switch_steps: int = 200_000  # ~2 h 15 min of driving at 25 Hz; a respawn costs ~380 ms of the whole batch
     lookahead: bool = False          # add the centreline curvature over windows ahead (track.LOOKAHEAD_EDGES)
+    line_obs: bool = False           # add the bot's racing line at track.LINE_POINTS ahead, relative to the car
+                                     # ((line - to_middle) / half width): the line through the next 200 m
     lookahead_stat: str = "peak"     # per window: "peak" (signed max |curvature|) or "mean" (proto-3/4; dilutes
                                      # short tight corners, e.g. Spa's Bus Stop read -0.82 for a -1.34 peak)
     # Car randomization: factors drawn uniformly per episode (applied when the race restarts, ~ms).

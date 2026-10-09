@@ -123,7 +123,7 @@ def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], 
         m["eval/bot_lap_time_median"] = reference.median_lap
         if len(all_laps):
             m["eval/gap_to_bot_best"] = m["eval/lap_time_best"] - reference.best_lap
-    for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac"):
+    for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
         m[f"eval/behavior/{k}"] = float(np.mean([s[k] for s in stats]))
     groups = [END_GROUPS[s["end"]] for s in stats]
     for g in sorted(set(END_GROUPS.values())):

@@ -18,7 +18,7 @@ from . import features
 from ._native import CMD_NONE, CMD_RESET, CMD_STEP, A, Client, F
 from .config import EnvConfig
 from .reward import REWARD_COMPONENTS, TERM_REASONS, RewardTracker
-from .track import LookaheadTable
+from .track import LineTable, LookaheadTable
 
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
@@ -41,6 +41,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._look = LookaheadTable(self.races, cfg.lookahead_stat) if cfg.lookahead else None
         if self._look is not None:
             self._look_off, self._look_size = self._look.rows(self.client.races)
+        self._line = LineTable(self.races)  # also for the line_dev / abs_offset behaviour metrics
+        if self._line is not None:
+            self._line_off, self._line_size = self._line.rows(self.client.races)
         if cfg.gearbox not in GEARBOX_ACTIONS:
             raise ValueError(f"gearbox must be one of {list(GEARBOX_ACTIONS)}, not {cfg.gearbox!r}")
         self.action_names = (("steer", "accel", "brake") if cfg.separate_pedals else ("steer", "pedal")) \
@@ -48,7 +51,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.act_dim = len(self.action_names)
         self._car_ranges = np.array([getattr(cfg, f) for f in CAR_FACTORS], np.float32)  # [3, (lo, hi)]
         self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
-        n_extra = (self._look.n_features if self._look is not None else 0) + (len(CAR_FACTORS) if cfg.car_obs else 0)
+        n_extra = ((self._look.n_features if self._look is not None else 0)
+                   + (len(self._line.points) if cfg.line_obs else 0) + (len(CAR_FACTORS) if cfg.car_obs else 0))
         od = features.obs_dim(self.act_dim, n_extra)
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
@@ -76,6 +80,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._t0 = np.zeros(n, np.float64)
         self._comp = np.zeros((len(REWARD_COMPONENTS), n), np.float64)
         self._dsteer = np.zeros(n, np.float64)
+        self._linedev = np.zeros(n, np.float64)
+        self._absoff = np.zeros(n, np.float64)
         self._off = np.zeros(n, np.int64)
         self._speed = np.zeros(n, np.float64)
         self._full = np.zeros(n, np.int64)
@@ -85,7 +91,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._draw_car(np.arange(self.num_envs))
         self.client.exchange(CMD_RESET)
         self._prev_action[:] = 0
-        self._rew.reset(self._raw)
+        self._rew.reset(self._raw, line_dev=self._line_dev())
         self._clear(slice(None), time.perf_counter())
         return features.build_obs(self._raw, self._prev_action, self._obs, self._extra()).copy(), {}
 
@@ -107,11 +113,33 @@ class SpeedDreamsVecEnv(VectorEnv):
         return self._car.copy()
 
     def _extra(self, idx: np.ndarray | None = None) -> np.ndarray | None:
-        parts = [self._lookahead(idx)]
+        parts = [self._lookahead(idx), self._line_obs(idx) if self.cfg.line_obs else None]
         if self.cfg.car_obs:
             parts.append(((self._car if idx is None else self._car[idx]) - 1.0) * CAR_OBS_SCALE)
         parts = [x for x in parts if x is not None]
         return np.concatenate(parts, axis=1).astype(np.float32) if parts else None
+
+    def _line_at(self, idx: np.ndarray | None, ahead) -> np.ndarray:
+        """The racing line's offset (m) at `ahead` metres from each env's position: [n or len(idx), len(ahead)]."""
+        sel = slice(None) if idx is None else idx
+        return self._line(self._raw[sel, F["dist_from_start"]], self._line_off[sel], self._line_size[sel], ahead)
+
+    def _line_dev(self, idx: np.ndarray | None = None) -> np.ndarray | None:
+        """|offset from the racing line| (m), or None without a racing line."""
+        if self._line is None:
+            return None
+        sel = slice(None) if idx is None else idx
+        return np.abs(self._raw[sel, F["to_middle"]] - self._line_at(idx, (0,))[:, 0])
+
+    def _line_obs(self, idx: np.ndarray | None = None) -> np.ndarray:
+        sel = slice(None) if idx is None else idx
+        half_width = np.maximum(self._raw[sel, F["track_width"]], 1.0)[:, None] * 0.5
+        rel = (self._line_at(idx, self._line.points) - self._raw[sel, F["to_middle"]][:, None]) / half_width
+        return np.clip(rel, -3, 3)
+
+    def set_line_shaping(self, k: float) -> None:
+        """Racing-line shaping coefficient from now on (training fades it)."""
+        self._rew.line_k = float(k)
 
     def _lookahead(self, idx: np.ndarray | None = None) -> np.ndarray | None:
         if self._look is None:
@@ -154,6 +182,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._t0[idx] = now
         self._comp[:, idx] = 0
         self._dsteer[idx] = self._off[idx] = self._speed[idx] = self._full[idx] = 0
+        self._linedev[idx] = self._absoff[idx] = 0
 
     def step(self, actions, active: np.ndarray | None = None):
         """active [n] bool (default all): envs left out are not simulated this step and cannot end; their
@@ -171,7 +200,10 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._prev_action[:] = actions
 
         raw = self._raw
-        reward, terminated, reason = self._rew.step(raw, d_steer)
+        line_dev = self._line_dev()
+        reward, terminated, reason = self._rew.step(raw, d_steer, line_dev)
+        self._linedev += line_dev
+        self._absoff += np.abs(raw[:, F["to_middle"]]) / (np.maximum(raw[:, F["track_width"]], 1.0) * 0.5)
         self._comp += self._rew.components
         self._off += raw[:, F["wheels_off"]] >= OFFTRACK_WHEELS
         self._speed += raw[:, F["speed_x"]]
@@ -204,6 +236,8 @@ class SpeedDreamsVecEnv(VectorEnv):
             "damage": at_end(_scatter(final_raw[:, F["damage"]], idx, n)),
             "term_reason": reason.copy(),
             "steer_delta": at_end(self._dsteer / steps),
+            "line_dev": at_end(self._linedev / steps),
+            "abs_offset": at_end(self._absoff / steps),
             "offtrack_frac": at_end(self._off / steps),
             "mean_speed": at_end(self._speed / steps),
             "full_throttle_frac": at_end(self._full / steps),
@@ -237,8 +271,11 @@ class SpeedDreamsVecEnv(VectorEnv):
             if self._look is not None:
                 self._look_off[i], self._look_size[i] = self._look.offset[race or self.client.races[i]], \
                     self._look.size[race or self.client.races[i]]
+            if self._line is not None:
+                self._line_off[i], self._line_size[i] = self._line.offset[race or self.client.races[i]], \
+                    self._line.size[race or self.client.races[i]]
         self._prev_action[idx] = 0
-        self._rew.reset(self._raw, idx)
+        self._rew.reset(self._raw, idx, self._line_dev(idx))
         self._clear(idx, now)
         obs[idx] = features.build_obs(self._raw[idx], self._prev_action[idx], self._obs[idx], self._extra(idx))
         return obs, reward, terminated, truncated, info

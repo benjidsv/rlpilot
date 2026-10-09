@@ -91,6 +91,8 @@ def test_lap_done_and_reward_components():
         total = sum(st[f"reward_{c}"][0] for c in REWARD_COMPONENTS)
         assert abs(total - info["episode"]["r"][0]) < 1e-3
         assert 0 <= st["full_throttle_frac"][0] <= 1 and st["mean_speed"][0] > 10
+        assert st["abs_offset"][0] < 0.3  # follow_centreline stays near the middle
+        assert 0 < st["line_dev"][0] < 6  # ... so it is off the bot's line, by less than a track width
     finally:
         e.close()
 
@@ -263,3 +265,65 @@ def test_upshift_hold_stops_flicked_shift_points():
 
     assert downshifts_while_accelerating(None) >= 5
     assert downshifts_while_accelerating(0.05) == 0
+
+
+def test_racing_line_matches_engine_lateral_offset():
+    """RacingLine.lateral (from x, y) agrees with the engine's to_middle, sign included, so the bot's line and the
+    car's offset are in the same frame."""
+    from rlpilot.track import RacingLine, race_for
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=1, max_episode_seconds=60))
+    try:
+        e.reset()
+        line = RacingLine.for_race(race_for("jarama"))
+        errs, offsets = [], []
+        for t in range(600):
+            a = follow_centreline(e)
+            a[:, 0] += 0.15 * np.sin(t / 15)  # weave so the offset spans both sides
+            e.step(a)
+            r = e._raw[0]
+            if r[F["speed_x"]] > 5:
+                lat = line.lateral(r[F["pos_x"]], r[F["pos_y"]], r[F["dist_from_start"]])
+                errs.append(lat - r[F["to_middle"]])
+                offsets.append(r[F["to_middle"]])
+        assert min(offsets) < -0.5 and max(offsets) > 0.5
+        assert np.percentile(np.abs(errs), 95) < 0.3
+    finally:
+        e.close()
+
+
+def test_line_shaping_telescopes():
+    """Potential-based shaping sums to -Phi(start) over an episode whatever the path (gamma 1, terminal Phi = 0)."""
+    from rlpilot.config import RewardConfig
+    from rlpilot.reward import REWARD_COMPONENTS, RewardTracker
+    k, cap = 0.5, 3.0
+    raw = np.zeros((1, N_FIELDS + N_RAYS), np.float32)
+    raw[:, F["speed_x"]] = 20.0
+    for path in ([1.0, 2.0, 1.0, 5.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 4.0, 4.0, 2.5, 6.0]):
+        t = RewardTracker(1, RewardConfig(line_shaping=k, line_cap=cap, gamma=1.0, max_damage=1e9), 0.04)
+        t.reset(raw, line_dev=np.array([path[0]], np.float32))
+        total = 0.0
+        for i, dev in enumerate(path[1:]):
+            last = i == len(path) - 2
+            raw[:, F["race_over"]] = float(last)  # ends the episode (terminated) on the last step
+            t.step(raw, 0.0, np.array([dev], np.float32))
+            total += t.components[REWARD_COMPONENTS.index("line")][0]
+        raw[:, F["race_over"]] = 0
+        np.testing.assert_allclose(total, k * min(path[0], cap), atol=1e-6)
+
+
+def test_line_obs_follows_track_switches():
+    from rlpilot.track import LINE_POINTS, race_for
+    races = (race_for("jarama"), race_for("braga"))
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, races=races, line_obs=True, max_episode_seconds=2,
+                                    track_switch_steps=1))
+    try:
+        assert e.single_observation_space.shape[0] == 31 + 2 + len(LINE_POINTS)
+        e.reset()
+        for _ in range(4 * int(2 / e.cfg.step_seconds)):
+            obs, *_ = e.step(follow_centreline(e))
+            assert np.isfinite(obs).all()
+        np.testing.assert_array_equal(obs[:, -len(LINE_POINTS):], e._line_obs())
+        for i, race in enumerate(e.client.races):
+            assert e._line_off[i] == e._line.offset[race]
+    finally:
+        e.close()

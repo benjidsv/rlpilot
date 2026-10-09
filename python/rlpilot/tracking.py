@@ -15,6 +15,8 @@ Tier 1 (dashboard)
   ppo/{approx_kl,clip_fraction,entropy,explained_variance}
 Tier 2 (behavior / perf)
   behavior/{steer_delta,offtrack_frac,mean_speed,full_throttle_frac}, eval/behavior/*
+  behavior/line_dev   mean |offset from the bot's racing line| (m); behavior/abs_offset: mean |to_middle| / half
+                      width (0 = centre line, 1 = on the edge), vs eval_track/<t>/bot_abs_offset (the bot's own)
   perf/{env_steps_per_s,total_steps_per_s,reset_share}
 Tier 3 (artifacts, at each eval)
   eval/<timesteps>/track_map.png, speed_vs_distance.png, traces.npz
@@ -46,7 +48,7 @@ from ._native import PROTOCOL_VERSION
 from .config import EnvConfig
 from .evaluate import rollout, summarize
 from .reward import END_GROUPS, REWARD_COMPONENTS
-from .track import reference_for, track_of
+from .track import RacingLine, reference_for, track_of
 from .vec_env import SpeedDreamsVecEnv
 
 
@@ -123,6 +125,23 @@ class StdClampCallback(BaseCallback):
         return True
 
 
+class LineShapingFadeCallback(BaseCallback):
+    """Fades the racing-line shaping coefficient linearly from `k` to 0 at `fade` x total timesteps (fade 0: keep k),
+    so the end of training is unbiased by the bot's line. Set before every rollout; logged as line/shaping_k."""
+
+    def __init__(self, k: float, total_timesteps: int, fade: float):
+        super().__init__()
+        self.k, self.end = k, fade * total_timesteps
+
+    def _on_rollout_start(self):
+        k = self.k * max(0.0, 1.0 - self.num_timesteps / self.end) if self.end > 0 else self.k
+        _base_env(self.training_env)[0].set_line_shaping(k)
+        mlflow.log_metric("line/shaping_k", k, step=self.num_timesteps)
+
+    def _on_step(self) -> bool:
+        return True
+
+
 class TrainingMetricsCallback(BaseCallback):
     """Tier 1/2 training metrics from ended episodes, logged at most every `every` timesteps."""
 
@@ -160,7 +179,7 @@ class TrainingMetricsCallback(BaseCallback):
                 m[f"reward/{c}"] = float(np.mean([s[f"reward_{c}"] for s in b]))
                 total += m[f"reward/{c}"]
             m["reward/total"] = total
-            for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac"):
+            for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
                 m[f"behavior/{k}"] = float(np.mean([s[k] for s in b]))
             self.buf.clear()
         env, sb3env = _base_env(self.training_env)
@@ -222,6 +241,8 @@ class EvalCallback(BaseCallback):
                            "eval.heldout_tracks": ",".join(track_of(r) for r in self.heldout)})
         self.env = SpeedDreamsVecEnv(self.cfg)
         n_tracks = len(self.races)
+        mlflow.log_metrics({f"eval_track/{track_of(r)}/bot_abs_offset": RacingLine.for_race(r).abs_offset
+                            for r in self.races}, step=0)
         assert list(self.env.client.races) == [self.races[i % n_tracks] for i in range(self.env.num_envs)]
         # time for `laps` laps at 70% of the bot's pace, plus the standing start
         self._limits = np.array([self.cfg.laps_per_episode * self.refs[self.races[i % n_tracks]].best_lap / 0.7 + 20.0
@@ -314,7 +335,8 @@ class EvalCallback(BaseCallback):
         out, groups, scores = {}, {"eval_train": [], "eval_heldout": []}, []
         for race, m in per_track.items():
             bot = self.refs[race].best_lap
-            t = {"progress": m["eval/progress"], "completion_rate": m["eval/completion_rate"]}
+            t = {"progress": m["eval/progress"], "completion_rate": m["eval/completion_rate"],
+                 "line_dev": m["eval/behavior/line_dev"], "abs_offset": m["eval/behavior/abs_offset"]}
             if "eval/flying_lap_time_median" in m:
                 t["flying_gap_pct"] = 100.0 * (m["eval/flying_lap_time_median"] / bot - 1)
             if "eval/fail_dist_from_start" in m:
@@ -325,7 +347,7 @@ class EvalCallback(BaseCallback):
             lap_pct = 100.0 * m["eval/lap_time_median"] / bot if "eval/lap_time_median" in m else 140.0
             scores.append(-(lap_pct + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short))
         for g, ts in groups.items():
-            for k in ("progress", "completion_rate", "flying_gap_pct"):
+            for k in ("progress", "completion_rate", "flying_gap_pct", "line_dev", "abs_offset"):
                 vals = [t[k] for t in ts if k in t]
                 if vals:
                     out[f"{g}/{k}"] = float(np.mean(vals))

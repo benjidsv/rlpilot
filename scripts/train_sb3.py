@@ -18,8 +18,8 @@ from rlpilot import EnvConfig, SpeedDreamsVecEnv
 from rlpilot.config import RewardConfig
 from rlpilot.sb3 import CpuRolloutPPO, SB3VecEnv
 from rlpilot.track import race_for
-from rlpilot.tracking import (CheckpointCallback, EvalCallback, MLflowOutputFormat, StdClampCallback, TrainingMetricsCallback,
-                              log_provenance, save_model)
+from rlpilot.tracking import (CheckpointCallback, EvalCallback, LineShapingFadeCallback, MLflowOutputFormat,
+                              StdClampCallback, TrainingMetricsCallback, log_provenance, save_model)
 
 
 def main():
@@ -48,6 +48,14 @@ def main():
     p.add_argument("--lookahead", action="store_true", help="observe the track curvature over the next 300 m")
     p.add_argument("--lookahead-stat", choices=["peak", "mean"], default="peak",
                    help="curvature per lookahead window: signed peak (default) or mean (proto-3/4)")
+    p.add_argument("--line-obs", action="store_true",
+                   help="observe the bot's racing line over the next 200 m, relative to the car")
+    p.add_argument("--line-shaping", type=float, default=0.0,
+                   help="potential-based shaping towards the bot's racing line, per metre of offset (0: off; ~0.1)")
+    p.add_argument("--line-cap", type=float, default=RewardConfig.line_cap,
+                   help="offsets beyond this (m) count as this in the shaping potential")
+    p.add_argument("--line-fade", type=float, default=0.5,
+                   help="line shaping fades linearly to 0 at this fraction of --timesteps (0: never)")
     p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
                    help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
     p.add_argument("--car-random", type=float, default=0.0,
@@ -83,7 +91,9 @@ def main():
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
                     gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
                     track_switch_steps=a.track_switch_steps, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
-                    reward=RewardConfig(steer_rate=a.steer_rate),
+                    line_obs=a.line_obs,
+                    reward=RewardConfig(steer_rate=a.steer_rate, line_shaping=a.line_shaping,
+                                        line_cap=a.line_cap, gamma=a.gamma),
                     car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
                     car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
@@ -118,6 +128,7 @@ def main():
                              heldout=tuple(race_for(t) for t in a.heldout_tracks),
                              eval_train=tuple(race_for(t) for t in a.eval_train_tracks), smooth=a.eval_smooth),
                 CheckpointCallback(every=a.checkpoint_every),
+                *([LineShapingFadeCallback(a.line_shaping, a.timesteps, a.line_fade)] if a.line_shaping > 0 else []),
                 *([StdClampCallback(env.env.action_names, a.min_std, a.max_std, every=a.log_every)] if a.algo == "ppo" else []),
             ])
         finally:
