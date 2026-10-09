@@ -61,6 +61,10 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._prev_action = np.zeros((n, self.act_dim), np.float32)
         self._cmds = np.full(n, CMD_STEP, np.uint32)
         self._shift_wait = np.zeros(n, np.int64)  # agent steps until the next shift is allowed
+        # "points" upshift hold: gear and rpm fraction at the previous step, and the current cap on the down point
+        self._gear_prev = np.zeros(n, np.float32)
+        self._rpm_prev = np.zeros(n, np.float32)
+        self._down_cap = np.full(n, np.inf, np.float32)
         self._shift_steps = int(np.ceil(cfg.shift_cooldown / cfg.step_seconds - 1e-9))
         self._rew = RewardTracker(n, cfg.reward, cfg.step_seconds, cfg.laps_per_episode)
         self.set_time_limits(None)  # self._max_steps [n]
@@ -128,11 +132,24 @@ class SpeedDreamsVecEnv(VectorEnv):
 
     def _write_shift_points(self, up, down):
         (ulo, uhi), (dlo, dhi) = self.cfg.shift_up_range, self.cfg.shift_down_range
+        down_point = dlo + (down + 1) * 0.5 * (dhi - dlo)
+        gap = self.cfg.upshift_hold_gap
+        if gap is not None:
+            # an upshift seen now happened during the last step, at about the rpm of the previous step
+            gear = self._raw[:, F["gear"]]
+            rpm = self._raw[:, F["rpm"]] / np.maximum(self._raw[:, F["rpm_redline"]], 1.0)
+            upshifted = (gear > self._gear_prev) & (self._gear_prev >= 1)
+            self._down_cap = np.where(upshifted, self._rpm_prev - gap,
+                                      np.where(gear != self._gear_prev, np.inf, self._down_cap))
+            self._gear_prev[:], self._rpm_prev[:] = gear, rpm
+            down_point = np.minimum(down_point, self._down_cap)
         self._act[:, A["shift_up"]] = ulo + (up + 1) * 0.5 * (uhi - ulo)
-        self._act[:, A["shift_down"]] = dlo + (down + 1) * 0.5 * (dhi - dlo)
+        self._act[:, A["shift_down"]] = down_point
 
     def _clear(self, idx, now):
         self._shift_wait[idx] = 0
+        self._gear_prev[idx] = self._rpm_prev[idx] = 0
+        self._down_cap[idx] = np.inf
         self._ret[idx] = self._len[idx] = 0
         self._t0[idx] = now
         self._comp[:, idx] = 0

@@ -50,6 +50,11 @@ class EnvConfig:
     shift_up_range: tuple[float, float] = (0.7, 0.97)   # "points": upshift when the engine reaches this
     shift_down_range: tuple[float, float] = (0.4, 0.9)  # "points": downshift when the lower gear would be <= this
     shift_cooldown: float = 0.25     # s, "agent": minimum time between two agent shifts
+    # "points": after an upshift at engine rpm r (fraction of redline), the downshift point is capped at r - this
+    # until the next gear change, so an upshift is only undone once the car has slowed down. proto-5 flicked its
+    # upshift point to the floor and back, upshifting and re-downshifting ~20 times a minute under throttle.
+    # None: off (proto-1..5).
+    upshift_hold_gap: float | None = 0.05
     shift_deadzone: float = 0.33     # "agent"
     separate_pedals: bool = False    # action = [steer, pedal] (pedal < 0 brakes) or [steer, accel, brake]
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)

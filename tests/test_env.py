@@ -241,3 +241,25 @@ def test_paused_envs_are_not_simulated():
         np.testing.assert_array_equal(e._raw[1], frozen)
     finally:
         e.close()
+
+
+def test_upshift_hold_stops_flicked_shift_points():
+    """proto-5's pattern: the upshift point flicked between floor and ceiling with the downshift point at its max
+    upshifts early, then downshifts straight back under throttle. With the hold, an upshift stays until the car
+    slows down."""
+    def downshifts_while_accelerating(gap):
+        e = SpeedDreamsVecEnv(EnvConfig(n_workers=1, gearbox="points", max_episode_seconds=30, upshift_hold_gap=gap))
+        try:
+            e.reset()
+            n = 0
+            for t in range(500):
+                gear, speed = e._raw[0, F["gear"]], e._raw[0, F["speed_x"]]
+                flick = np.array([[-1.0 if t % 2 else 1.0, 1.0]], np.float32)
+                e.step(np.concatenate([follow_centreline(e), flick], 1))
+                n += e._raw[0, F["gear"]] < gear and e._raw[0, F["speed_x"]] > speed
+            return n
+        finally:
+            e.close()
+
+    assert downshifts_while_accelerating(None) >= 5
+    assert downshifts_while_accelerating(0.05) == 0
