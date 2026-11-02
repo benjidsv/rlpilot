@@ -18,4 +18,12 @@ typedef struct {
     void (*end_race)(int index, struct CarElt *car, struct Situation *s);
 } rlp_host_api;
 
+/* One robot tick of a recorded episode: the worker writes these (RLP_RECORD_CONTROLS=<path>), the robot
+ * replays them in the regular game (RLP_REPLAY=<path>). x and y only check that the replay stays on the lap. */
+typedef struct {
+    float steer, accel, brake, clutch;
+    int gear;
+    float x, y;
+} rlp_tick;
+
 #endif

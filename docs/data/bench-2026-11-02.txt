@@ -1,0 +1,27 @@
+Mon Nov  2 16:10:45 CET 2026
+Now drawing from 'AC Power'
+16:10  up 13 days, 21:45, 1 user, load averages: 18.21 9.57 6.80
+n=1 spin=50:   env steps/s: 41393 total, 41393 per worker (828 sim-s per wall-s)
+n=1 spin=50:   env steps/s: 41329 total, 41329 per worker (827 sim-s per wall-s)
+n=1 spin=50:   env steps/s: 40853 total, 40853 per worker (817 sim-s per wall-s)
+n=1 spin=50:   env steps/s: 41192 total, 41192 per worker (824 sim-s per wall-s)
+n=1 spin=50:   env steps/s: 41079 total, 41079 per worker (822 sim-s per wall-s)
+n=1 spin=200:   env steps/s: 41560 total, 41560 per worker (831 sim-s per wall-s)
+n=1 spin=200:   env steps/s: 41688 total, 41688 per worker (834 sim-s per wall-s)
+n=1 spin=200:   env steps/s: 41485 total, 41485 per worker (830 sim-s per wall-s)
+n=1 spin=200:   env steps/s: 41782 total, 41782 per worker (836 sim-s per wall-s)
+n=1 spin=200:   env steps/s: 42660 total, 42660 per worker (853 sim-s per wall-s)
+n=5 spin=50:   env steps/s: 163141 total, 32628 per worker (3263 sim-s per wall-s)
+n=5 spin=50:   env steps/s: 164865 total, 32973 per worker (3297 sim-s per wall-s)
+n=5 spin=50:   env steps/s: 161419 total, 32284 per worker (3228 sim-s per wall-s)
+n=5 spin=50:   env steps/s: 163527 total, 32705 per worker (3271 sim-s per wall-s)
+n=5 spin=50:   env steps/s: 166804 total, 33361 per worker (3336 sim-s per wall-s)
+n=5 spin=200:   env steps/s: 168926 total, 33785 per worker (3379 sim-s per wall-s)
+n=5 spin=200:   env steps/s: 157109 total, 31422 per worker (3142 sim-s per wall-s)
+n=5 spin=200:   env steps/s: 167546 total, 33509 per worker (3351 sim-s per wall-s)
+n=5 spin=200:   env steps/s: 164348 total, 32870 per worker (3287 sim-s per wall-s)
+n=5 spin=200:   env steps/s: 167799 total, 33560 per worker (3356 sim-s per wall-s)
+workers=5 fs=2 scripted: 40,679 env steps/s (1,627x real time), 85 episodes, reset 7.7 ms each, reset share 5%, mean dist 1020 m
+workers=5 fs=2 scripted: 37,444 env steps/s (1,498x real time), 85 episodes, reset 7.8 ms each, reset share 5%, mean dist 1020 m
+workers=5 fs=2 scripted: 36,605 env steps/s (1,464x real time), 85 episodes, reset 8.0 ms each, reset share 5%, mean dist 1020 m
+16:12  up 13 days, 21:47, 1 user, load averages: 8.93 9.42 7.18

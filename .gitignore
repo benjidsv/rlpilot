@@ -9,3 +9,8 @@ __pycache__/
 native/build/
 mlflow.db
 reference/
+replay/
+*.mov
+
+.claude
+.pytest_cache/

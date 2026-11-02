@@ -1,0 +1,5 @@
+run,run_id,git_sha,git_dirty,seed,train_tracks,eval_train_tracks,heldout_tracks,eval_every_steps,train_completion,train_flying_gap_pct,heldout_completion,heldout_flying_gap_pct,heldout_share_tracks_with_flying_lap,jarama_flying_median_s,jarama_steer_delta_final
+proto-3,1c4e0e2cb93540cd9db3946b9c659579,18c6975,True,None,4,4,2,2000000,0.7812,-9.9285,0.0,,0.0,96.0013,0.095
+proto-4,c9058ddde8de4c7f8347bb443a599f85,18c6975,True,1,35,4,6,8000000,0.4813,-3.6492,0.3896,-2.5358,0.4667,103.6927,0.6885
+proto-5,88cf392dbeca4059ac4eb4a9d3aea156,bc152fa,False,1,35,4,6,8000000,0.4906,2.0043,0.2958,1.3721,0.4333,109.1947,0.1156
+proto-6,116a8a8675604dd28a29046d12508db4,437d573,False,1,35,4,6,8000000,0.6344,-0.847,0.2042,0.3009,0.3333,107.3416,0.0937

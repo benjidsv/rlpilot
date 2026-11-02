@@ -69,6 +69,7 @@ struct Host
     float car_factors[RLP_MAX_CARS][3] = {}; // grip, mass, power applied to each slot's car in this race
     uint64_t tick = 0;
     uint64_t sim_t0 = 0;
+    FILE *record = nullptr;     // RLP_RECORD_CONTROLS: car controls of the first episode, per robot tick
 } H;
 
 void fatal(const char *msg)
@@ -390,6 +391,12 @@ void hostDrive(int index, tCarElt *car, tSituation *s)
         onTick();
     }
     applyAction(k, car);
+    if (H.record && !H.hold) {
+        const tCarCtrl &c = car->ctrl;
+        rlp_tick t = {c.steer, c.accelCmd, c.brakeCmd, c.clutchCmd, c.gear, car->_pos_X, car->_pos_Y};
+        fwrite(&t, sizeof t, 1, H.record);
+        fflush(H.record);
+    }
 }
 
 void hostEndRace(int, tCarElt *, tSituation *) {}
@@ -575,6 +582,9 @@ int main(int argc, char *argv[])
     if (trace)
         return runTrace(tracePrefix, std::stoi(traceLaps));
     H.sim_t0 = rlp_now_ns();
+    if (const char *path = getenv("RLP_RECORD_CONTROLS"))
+        if (!(H.record = fopen(path, "wb")))
+            fatal("cannot open RLP_RECORD_CONTROLS");
 
     while (!H.quit) {
         H.engine->updateState();
@@ -586,6 +596,10 @@ int main(int argc, char *argv[])
             H.engine->restartRace();
             H.w->reset_seconds += (rlp_now_ns() - t0) * 1e-9;
             H.w->n_resets++;
+            if (H.record) { // only the first episode is recorded
+                fclose(H.record);
+                H.record = nullptr;
+            }
             H.reset_requested = H.race_over = false;
             H.fresh = H.hold = true;
             H.tick = 0;

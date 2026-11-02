@@ -1,8 +1,12 @@
 // rlpilot robot module: forwards its callbacks to the rlpilot-worker host (rlp_host, looked up with
 // dlsym) so that the agent's state survives the dlclose/reload done on every race restart.
 // When loaded by the regular game (no host), it drives a simple centreline follower instead, which
-// keeps the module usable in rendered runs and as a smoke test.
+// keeps the module usable in rendered runs and as a smoke test. With RLP_REPLAY=<path> it replays the
+// controls recorded by a worker (scripts/record_lap.py), tick by tick, and logs its position against
+// the recording to <path>.check.csv: the engine is deterministic, so the two should match.
 
+#include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <string>
 #include <vector>
@@ -18,6 +22,9 @@
 
 static std::vector<std::string> names;
 static rlp_host_api *host;
+static std::vector<rlp_tick> replay;
+static size_t replayPos;
+static FILE *replayCheck;
 
 static void newTrack(int index, tTrack *track, void *carHandle, void **carParmHandle, tSituation *)
 {
@@ -26,10 +33,56 @@ static void newTrack(int index, tTrack *track, void *carHandle, void **carParmHa
         host->new_track(index, track, carHandle);
 }
 
+static void loadReplay(const char *path)
+{
+    replay.clear();
+    replayPos = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        GfLogError("rlpilot: cannot open replay %s\n", path);
+        return;
+    }
+    rlp_tick t;
+    while (fread(&t, sizeof t, 1, f) == 1)
+        replay.push_back(t);
+    fclose(f);
+    if (replayCheck)
+        fclose(replayCheck);
+    replayCheck = fopen((std::string(path) + ".check.csv").c_str(), "w");
+    GfLogInfo("rlpilot: replaying %zu ticks from %s\n", replay.size(), path);
+}
+
 static void newRace(int index, tCarElt *car, tSituation *s)
 {
     if (host)
         host->new_race(index, car, s);
+    else if (const char *path = getenv("RLP_REPLAY"))
+        loadReplay(path);
+}
+
+// Same commands as the worker: braked with the clutch down until the start, then the recording, then stop.
+static void replayDrive(tCarElt *car, tSituation *s)
+{
+    tCarCtrl &c = car->ctrl;
+    if (s->currentTime < 0 || replayPos >= replay.size()) {
+        c.steer = 0;
+        c.accelCmd = 0;
+        c.brakeCmd = 1;
+        c.clutchCmd = s->currentTime < 0 ? 1 : 0;
+        c.gear = s->currentTime < 0 ? 1 : car->_gear;
+        return;
+    }
+    const rlp_tick &t = replay[replayPos++];
+    c.steer = t.steer;
+    c.accelCmd = t.accel;
+    c.brakeCmd = t.brake;
+    c.clutchCmd = t.clutch;
+    c.gear = t.gear;
+    if (replayCheck) {
+        fprintf(replayCheck, "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%.1f,%.1f\n", s->currentTime, car->_pos_X, car->_pos_Y,
+                t.x, t.y, car->_speed_x, car->_gear, car->_enginerpm, car->_enginerpmRedLine);
+        fflush(replayCheck);
+    }
 }
 
 static void fallbackDrive(tCarElt *car)
@@ -47,6 +100,8 @@ static void drive(int index, tCarElt *car, tSituation *s)
 {
     if (host)
         host->drive(index, car, s);
+    else if (!replay.empty())
+        replayDrive(car, s);
     else
         fallbackDrive(car);
 }

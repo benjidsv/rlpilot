@@ -1,0 +1,11 @@
+run,track,split,completion,flying_gap_pct,evals_with_flying_lap,evals
+proto-6,jarama,train,0.6,-0.0692,8,10
+proto-6,braga,train,0.6,-0.8511,9,10
+proto-6,sao-paulo,train,0.425,-1.7472,9,10
+proto-6,petit,train,0.9125,-0.6685,10,10
+proto-6,Imula,heldout,0.3375,0.9316,5,10
+proto-6,ardennen-spa,heldout,0.0,,0,10
+proto-6,brno,heldout,0.0125,-2.2191,1,10
+proto-6,corkscrew,heldout,0.1,-1.1095,4,10
+proto-6,lombaro,heldout,0.0,,0,10
+proto-6,street-1,heldout,0.775,0.8571,10,10
