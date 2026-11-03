@@ -4,7 +4,7 @@
     python scripts/record_lap.py --prepare-only --track jarama   # new take: the engine rewrites the race file
 
 The worker saves its exact car controls per robot tick. The script then prepares a settings dir with a rendered
-race, with the driver-input HUD on, and prints the command that replays the recording in the normal game. The defaults match proto-6's observations.
+race, with the driver-input HUD on, and prints the command that replays the recording in the normal game. The defaults match proto-6's observations; pass --run-id for any other run.
 """
 
 import argparse
@@ -12,11 +12,12 @@ import os
 import re
 from pathlib import Path
 
+import mlflow
 from PIL import Image
 from stable_baselines3 import PPO
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv, workdirs
-from rlpilot.evaluate import rollout
+from rlpilot.evaluate import eval_config, rollout
 from rlpilot.reference import lap_times_from_trace
 from rlpilot.track import race_for
 
@@ -31,8 +32,7 @@ def main():
     p.add_argument("--prepare-only", action="store_true", help="keep the recording, only reset the settings dir")
     p.add_argument("--track", default="jarama")
     p.add_argument("--laps", type=int, default=2)
-    p.add_argument("--steer-filter", type=float, default=1.0, help="must match the checkpoint's run")
-    p.add_argument("--pedal-filter", type=float, default=1.0, help="must match the checkpoint's run")
+    p.add_argument("--run-id", default=None, help="MLflow run of the checkpoint, to use its env config (default: proto-6's)")
     a = p.parse_args()
     if not a.prepare_only and not a.checkpoint:
         p.error("a checkpoint is required unless --prepare-only is set")
@@ -41,7 +41,7 @@ def main():
     controls = OUT / f"{a.track}.controls"
     OUT.mkdir(exist_ok=True)
     if not a.prepare_only:
-        record(a.checkpoint, race, a.laps, controls, a.steer_filter, a.pedal_filter)
+        record(a.checkpoint, race, a.laps, controls, a.run_id)
 
     lc = workdirs.prepare(OUT / "lc", 1, race)[0]
     race_xml = lc / "config/raceman" / f"{race}.xml"
@@ -75,13 +75,16 @@ def show_inputs(hud: Path) -> None:
     hud.write_text(text)
 
 
-def record(checkpoint: str, race: str, laps: int, controls: Path, steer_filter: float, pedal_filter: float) -> None:
+def record(checkpoint: str, race: str, laps: int, controls: Path, run_id: str | None = None) -> None:
     os.environ["RLP_RECORD_CONTROLS"] = str(controls)  # inherited by the worker
 
     model = PPO.load(Path(checkpoint) / "model.zip", device="cpu")
-    cfg = EnvConfig(n_workers=1, race=race, gearbox="points", lookahead=True, lookahead_stat="peak", line_obs=True,
-                    car_obs=True, laps_per_episode=laps, spin_us=50, recycle_resets=2**62, track_switch_steps=2**62,
-                    steer_filter=steer_filter, pedal_filter=pedal_filter)
+    if run_id:
+        params = mlflow.MlflowClient(tracking_uri=f"sqlite:///{workdirs.ROOT / 'mlflow.db'}").get_run(run_id).data.params
+        cfg = eval_config(EnvConfig.from_flat(params, "env."), (race,), 1, laps)
+    else:
+        cfg = EnvConfig(n_workers=1, race=race, gearbox="points", lookahead=True, lookahead_stat="peak", line_obs=True,
+                        car_obs=True, laps_per_episode=laps, spin_us=50, recycle_resets=2**62)
     env = SpeedDreamsVecEnv(cfg)
     try:
         traces, _, stats = rollout(lambda o: model.predict(o, deterministic=True)[0], env)

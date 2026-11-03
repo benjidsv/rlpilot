@@ -18,13 +18,14 @@ LAP_DONE = TERM_REASONS.index("lap_done")
 END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "stuck_crashed",
               "damage": "stuck_crashed", "race_over": "stuck_crashed", "lap_done": "lap_done",
               "time_limit": "timeout"}
-REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line")
+REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line", "steer_change", "steer_reversal")
 
 
 class RewardTracker:
     def __init__(self, n: int, cfg: RewardConfig, step_seconds: float, laps_per_episode: int = 0):
         self.cfg, self.dt, self.laps_per_episode = cfg, step_seconds, laps_per_episode
         self.prev_dist = np.zeros(n, np.float32)
+        self.raced = np.zeros(n, np.float64)  # m along the track this episode, without lap-sized jumps (see step)
         self.prev_damage = np.zeros(n, np.float32)
         self.off_t = np.zeros(n, np.float32)
         self.stuck_t = np.zeros(n, np.float32)
@@ -32,13 +33,17 @@ class RewardTracker:
         self.components = np.zeros((len(REWARD_COMPONENTS), n), np.float32)
         self.line_k = cfg.line_shaping  # mutable: training can fade it
         self.prev_dev = np.zeros(n, np.float32)  # |offset from the racing line| (m) at the previous state
+        self.prev_change = np.zeros(n, np.float32)  # steering change of the previous step
+        self.reversed = np.zeros(n, bool)  # this step's reversal flags: consecutive changes of opposite signs, both
+                                           # above the dead-band
 
     def reset(self, raw: np.ndarray, idx: np.ndarray | slice = slice(None), line_dev: np.ndarray | None = None) -> None:
         """line_dev: |offset from the racing line| (m) of the envs idx (all n if idx is a slice)."""
         if line_dev is not None:
             self.prev_dev[idx] = line_dev
-        self.prev_dist[idx] = raw[idx, F["dist_raced"]]
+        self.prev_dist[idx] = self.raced[idx] = raw[idx, F["dist_raced"]]
         self.prev_damage[idx] = raw[idx, F["damage"]]
+        self.prev_change[idx] = 0  # the first change of an episode can't be a reversal
         self.off_t[idx] = self.stuck_t[idx] = self.back_t[idx] = 0
 
     def step(self, raw: np.ndarray, d_steer: np.ndarray | float = 0.0, line_dev: np.ndarray | None = None
@@ -50,7 +55,14 @@ class RewardTracker:
         c, dt = self.cfg, self.dt
         dist, damage = raw[:, F["dist_raced"]], raw[:, F["damage"]]
         wheels_off = raw[:, F["wheels_off"]]
+        # The engine's dist_raced = (laps - 1) x length + dist_from_start jumps by a lap when a car crosses the start line
+        # backwards (no lap is counted, but dist_from_start wraps), and back when it recrosses. A policy found this: creep
+        # off the grid, spin at full lock across the line, collect a lap of reward. Remove anything lap-sized: a car can't
+        # cover half a lap in one step, so real driving is unchanged.
+        length = raw[:, F["track_length"]]
         progress = dist - self.prev_dist
+        progress = progress - length * np.rint(progress / np.maximum(length, 1.0))
+        self.raced += progress
         d_damage = damage - self.prev_damage
         self.prev_dist[:], self.prev_damage[:] = dist, damage
 
@@ -77,6 +89,11 @@ class RewardTracker:
         comp[2] = -c.damage * d_damage
         comp[3] = -c.terminal * failed
         comp[4] = -c.steer_rate * np.square(d_steer)
+        comp[6] = -c.steer_change * np.abs(d_steer)
+        self.reversed = (d_steer * self.prev_change < 0) & (np.abs(d_steer) > c.steer_deadband) \
+            & (np.abs(self.prev_change) > c.steer_deadband)
+        comp[7] = -c.steer_reversal * self.reversed
+        self.prev_change[:] = d_steer
         if line_dev is not None and self.line_k > 0:
             # both potentials with the current k, so fading it never creates a one-off jump
             phi = -self.line_k * np.minimum(line_dev, c.line_cap) * ~terminated

@@ -11,13 +11,18 @@ Tier 1 (dashboard)
   eval_train/*, eval_heldout/* (flying_gap_pct: median flying lap vs the bot's best, in %)
   episode/progress                           training episodes: distance / track length
   end/{off_track,stuck_crashed,timeout,lap_done}   why training episodes end (fractions)
-  reward/{progress,offtrack,damage,terminal,total} per-episode reward components
+  reward/{progress,offtrack,damage,terminal,steer,steer_change,steer_reversal,line,total} per-episode reward components
   ppo/{approx_kl,clip_fraction,entropy,explained_variance}
 Tier 2 (behavior / perf)
-  behavior/{steer_delta,offtrack_frac,mean_speed,full_throttle_frac}, eval/behavior/*
+  behavior/{steer_delta,steer_requested,steer_reversal_frac,steer_limit_frac,steer_lock_frac,steer_abs,offtrack_frac,
+            mean_speed,full_throttle_frac}, eval/behavior/*
+            (steer_delta: applied change per step; steer_requested: what the policy asked for)
   behavior/line_dev   mean |offset from the bot's racing line| (m); behavior/abs_offset: mean |to_middle| / half
                       width (0 = centre line, 1 = on the edge), vs eval_track/<t>/bot_abs_offset (the bot's own)
   perf/{env_steps_per_s,total_steps_per_s,reset_share}
+  tracks/{covered,n_tracks,min_samples_per_update,max_samples_per_update}: worst update since the last log; the artifact
+  tracks/assignment_{start,end}.json map worker -> race
+  obs/<group>/{min,max,abs_mean,std}, obs/{nonfinite,dead_slots}: what the policy actually receives, from the rollout buffer
 Tier 3 (artifacts, at each eval)
   eval/<timesteps>/track_map.png, speed_vs_distance.png, traces.npz
   best/ (model + VecNormalize stats of the best eval in the best window of 3 evals; tag best_step),
@@ -46,10 +51,10 @@ from . import plots, workdirs
 from . import reference as reference_mod
 from ._native import PROTOCOL_VERSION
 from .config import EnvConfig
-from .evaluate import rollout, summarize
+from .evaluate import eval_config, eval_time_limits, rollout, summarize
 from .reward import END_GROUPS, REWARD_COMPONENTS
 from .track import RacingLine, reference_for, track_of
-from .vec_env import SpeedDreamsVecEnv
+from .vec_env import BEHAVIOR_STATS, SpeedDreamsVecEnv
 
 
 SCORE_GAP_WEIGHT = 0.02  # score per % of pace: 5% is worth 0.1 of a track's completion
@@ -167,7 +172,23 @@ class TrainingMetricsCallback(BaseCallback):
         _, self._sb3env = _base_env(self.training_env)
         self._t = time.perf_counter()
         self._env_s, self._env_n, self._steps = 0.0, 0, self.num_timesteps
-        self._reset_s = _base_env(self.training_env)[0].client.stats()["worker_reset_seconds"]
+        env = _base_env(self.training_env)[0]
+        self._reset_s = env.client.stats()["worker_reset_seconds"]
+        self._log_assignment(env, "start")
+        self._tracks: list[np.ndarray] = []  # samples per track of each update since the last log
+
+    @staticmethod
+    def _log_assignment(env: SpeedDreamsVecEnv, when: str) -> None:
+        mlflow.log_dict({str(i): r for i, r in enumerate(env.client.races)}, f"tracks/assignment_{when}.json")
+
+    def _on_rollout_start(self):
+        self._track_steps0 = _base_env(self.training_env)[0].track_steps.copy()
+
+    def _on_rollout_end(self):
+        self._tracks.append(_base_env(self.training_env)[0].track_steps - self._track_steps0)
+
+    def _on_training_end(self):
+        self._log_assignment(_base_env(self.training_env)[0], "end")
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
@@ -192,11 +213,17 @@ class TrainingMetricsCallback(BaseCallback):
                 m[f"reward/{c}"] = float(np.mean([s[f"reward_{c}"] for s in b]))
                 total += m[f"reward/{c}"]
             m["reward/total"] = total
-            for k in ("steer_delta", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev",
-                      "abs_offset"):
+            for k in BEHAVIOR_STATS:
                 m[f"behavior/{k}"] = float(np.mean([s[k] for s in b]))
             self.buf.clear()
         env, sb3env = _base_env(self.training_env)
+        if self._tracks:
+            samples = np.stack(self._tracks)
+            self._tracks.clear()
+            m["tracks/n_tracks"] = samples.shape[1]
+            m["tracks/covered"] = int((samples > 0).sum(axis=1).min())
+            m["tracks/min_samples_per_update"] = int(samples.min())
+            m["tracks/max_samples_per_update"] = int(samples.max())
         now = time.perf_counter()
         wall, n = now - self._t, self.num_timesteps - self._steps
         env_s, env_n = sb3env.env_seconds - self._env_s, sb3env.env_steps - self._env_n
@@ -208,6 +235,32 @@ class TrainingMetricsCallback(BaseCallback):
             m["perf/reset_share"] = (reset_s - self._reset_s) / (env.num_envs * wall)
         self._t, self._steps, self._env_s, self._env_n, self._reset_s = now, self.num_timesteps, sb3env.env_seconds, \
             sb3env.env_steps, reset_s
+        mlflow.log_metrics(m, step=self.num_timesteps)
+
+
+class ObsStatsCallback(BaseCallback):
+    """Per named observation group, what the policy actually received over the last rollout (not what a test assumed):
+    range, mean magnitude and spread, plus the count of non-finite values and of slots with one value throughout. Every `every`
+    timesteps; reads the rollout buffer, so it costs nothing during rollouts."""
+
+    def __init__(self, every: int = 1_000_000):
+        super().__init__()
+        self.every, self._last = every, -every
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self):
+        if self.num_timesteps - self._last < self.every:
+            return
+        self._last = self.num_timesteps
+        layout = _base_env(self.training_env)[0].obs_layout
+        obs = self.model.rollout_buffer.observations.reshape(-1, layout.dim)
+        m = {"obs/nonfinite": int((~np.isfinite(obs)).sum()), "obs/dead_slots": int((obs.max(axis=0) == obs.min(axis=0)).sum())}
+        for g in layout.groups:
+            v = layout.group(obs, g.name)
+            m |= {f"obs/{g.name}/min": float(v.min()), f"obs/{g.name}/max": float(v.max()),
+                  f"obs/{g.name}/abs_mean": float(np.abs(v).mean()), f"obs/{g.name}/std": float(v.std())}
         mlflow.log_metrics(m, step=self.num_timesteps)
 
 
@@ -232,13 +285,7 @@ class EvalCallback(BaseCallback):
         self.train_races = tuple(eval_train) or tuple(cfg.races) or (cfg.race,)
         self.heldout = tuple(r for r in heldout if r not in self.train_races)
         self.races = self.train_races + self.heldout
-        # evaluated on the stock car (factor observations, if any, read 0). Workers never change track: no
-        # track switching, and no recycling (whose respawn would draw a random track).
-        self.cfg = dataclasses.replace(cfg, n_workers=episodes * len(self.races), laps_per_episode=laps,
-                                       run_dir=None, race=self.races[0],
-                                       races=self.races if len(self.races) > 1 else (),
-                                       track_switch_steps=2**62, recycle_resets=2**62,
-                                       car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
+        self.cfg = eval_config(cfg, self.races, episodes, laps)
         self.every, self.launch_noise, self.smooth = every, launch_noise, max(1, smooth)
         self.at_start = at_start  # also evaluate at step 0: the baseline of a resumed run
         self._last = 0
@@ -259,9 +306,8 @@ class EvalCallback(BaseCallback):
         mlflow.log_metrics({f"eval_track/{track_of(r)}/bot_abs_offset": RacingLine.for_race(r).abs_offset
                             for r in self.races}, step=0)
         assert list(self.env.client.races) == [self.races[i % n_tracks] for i in range(self.env.num_envs)]
-        # time for `laps` laps at 70% of the bot's pace, plus the standing start
-        self._limits = np.array([self.cfg.laps_per_episode * self.refs[self.races[i % n_tracks]].best_lap / 0.7 + 20.0
-                                 for i in range(self.env.num_envs)])
+        self._limits = eval_time_limits([self.refs[r].best_lap for r in self.races], self.env.num_envs,
+                                        self.cfg.laps_per_episode)
         self._tmp = tempfile.TemporaryDirectory(prefix="rlpilot-eval-")
         if self.at_start:
             self.run()

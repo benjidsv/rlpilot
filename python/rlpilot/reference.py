@@ -23,6 +23,13 @@ TRACE_COLUMNS = ("time", "laps", "dist_from_start", "dist_raced", "speed_x", "x"
 
 
 @dataclass
+class TrackGeometry:
+    left: np.ndarray    # [m, 2] border polylines, from the start line on, with the same samples on both sides
+    right: np.ndarray
+    length: float       # the engine's lap length
+
+
+@dataclass
 class Reference:
     name: str
     lap_times: np.ndarray        # completed laps, in order (first one from a standing start)
@@ -59,18 +66,31 @@ def lap_times_from_trace(trace: dict[str, np.ndarray]) -> np.ndarray:
     return trace["last_lap_time"][ends].astype(np.float64)
 
 
-def load(race: str = "rlref", laps: int = 3) -> Reference:
+def _cached(race: str, laps: int) -> Path:
+    """Prefix of a race's cached reference files, generating them if needed."""
     race_xml = workdirs.DATA / "raceman" / f"{race}.xml"
     key = hashlib.sha1(race_xml.read_bytes() + str(laps).encode()).hexdigest()[:10]
     prefix = CACHE / f"{race}-{key}"
     if not Path(f"{prefix}_laps.csv").exists():
         _generate(race, laps, prefix)
-    data = np.loadtxt(f"{prefix}_laps.csv", ndmin=2)
-    trace = {c: data[:, i] for i, c in enumerate(TRACE_COLUMNS)}
+    return prefix
+
+
+def load_track(race: str = "rlref", laps: int = 3) -> TrackGeometry:
+    """Only the track map, which the engine samples from its segments before the race. Never reads the bot's laps:
+    everything that feeds a policy input must come through here."""
+    prefix = _cached(race, laps)
     track = np.loadtxt(f"{prefix}_track.csv", ndmin=2)
     with open(f"{prefix}_track.csv") as f:
         length = float(f.readline().split("length=")[1].split()[0])
-    return Reference(race, lap_times_from_trace(trace), trace, track[:, 0:2], track[:, 2:4], length)
+    return TrackGeometry(track[:, 0:2], track[:, 2:4], length)
+
+
+def load(race: str = "rlref", laps: int = 3) -> Reference:
+    geometry = load_track(race, laps)
+    data = np.loadtxt(f"{_cached(race, laps)}_laps.csv", ndmin=2)
+    trace = {c: data[:, i] for i, c in enumerate(TRACE_COLUMNS)}
+    return Reference(race, lap_times_from_trace(trace), trace, geometry.left, geometry.right, geometry.length)
 
 
 def _generate(race: str, laps: int, prefix: Path) -> None:

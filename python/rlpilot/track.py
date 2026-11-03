@@ -70,8 +70,8 @@ class TrackProfile:
     @classmethod
     @functools.cache
     def for_race(cls, race: str, stat: str = "peak") -> "TrackProfile":
-        ref = reference.load(reference_for(race), laps=3)
-        return cls(ref.track_left, ref.track_right, ref.track_length, stat=stat)
+        track = reference.load_track(reference_for(race), laps=3)
+        return cls(track.left, track.right, track.length, stat=stat)
 
     @property
     def n_features(self) -> int:
@@ -185,3 +185,87 @@ class LineTable:
         """Line offset (m) at each distance + each of `ahead` metres: [n, len(ahead)]."""
         m = np.mod(dist_from_start.astype(np.int64)[:, None] + np.asarray(ahead, np.int64)[None, :], size[:, None])
         return self.table[offset[:, None] + m]
+
+
+class TrackEdges:
+    """One track's left and right borders on a uniform grid of centreline distance from the start line, closed: row
+    `cells` is the start line again, so interpolating across the line needs no special case.
+
+    The borders are indexed by the distance along the lap, never by the nearest point: at a figure-eight's crossing,
+    the nearest border can belong to the other branch. Their distance is the centreline polyline's, anchored at the
+    engine's lap length rather than rescaled to it: on Imola the map doesn't quite close (a 5 m last gap where 2 m is
+    the norm, in the engine's own geometry), and a rescale spreads that error over the lap, 3 m at worst, against
+    0.18 m (p99) when it stays in the last cell. Geometry only: nothing here knows where any car drove."""
+
+    def __init__(self, left: np.ndarray, right: np.ndarray, length: float):
+        mid = 0.5 * (left + right)
+        ds = np.hypot(*np.diff(mid, axis=0).T)
+        keep = np.concatenate([[True], ds > 1e-6])  # no duplicate abscissa for np.interp
+        s = np.concatenate([[0.0], np.cumsum(ds)])[keep]
+        if s[-1] >= length:
+            raise ValueError(f"track map ({s[-1]:.1f} m before closing) is longer than the lap ({length:.1f} m)")
+        self.length = float(length)
+        self.cells = int(np.ceil(length))
+        self.spacing = self.length / self.cells  # just under 1 m
+        grid = np.arange(self.cells + 1) * self.spacing
+        s_closed = np.concatenate([s, [length]])
+        columns = np.hstack([left[keep], right[keep]])
+        columns = np.vstack([columns, columns[:1]])
+        self.table = np.stack([np.interp(grid, s_closed, c) for c in columns.T], 1).astype(np.float32)  # lx ly rx ry
+
+    @classmethod
+    @functools.cache
+    def for_race(cls, race: str) -> "TrackEdges":
+        track = reference.load_track(reference_for(race), laps=3)
+        return cls(track.left, track.right, track.length)
+
+
+class EdgeTable:
+    """All races' borders stacked, so a vector step is one gather: row = offset[race] + cell, per env and per point.
+
+    Points k = 0..n-1 are at centreline distance s + span x k / (n - 1) along the lap, with
+    span = max(horizon x speed, floor): the first one is abreast of the car, and a corner reaches a given point index
+    earlier when the car is faster. Returned in the car's frame, in metres: x forward, y + = left, like to_middle."""
+
+    def __init__(self, races, n_points: int, horizon: float, floor: float):
+        if n_points < 2:
+            raise ValueError("an edge needs at least 2 points")
+        self.horizon, self.floor = float(horizon), float(floor)
+        self.fractions = np.arange(n_points, dtype=np.float64)[None, :] / (n_points - 1)
+        self.races = list(dict.fromkeys(races))
+        edges = [TrackEdges.for_race(r) for r in self.races]
+        self.table = np.concatenate([e.table for e in edges])
+        sizes = [len(e.table) for e in edges]
+        self.offset = dict(zip(self.races, np.cumsum([0] + sizes[:-1]).tolist()))
+        self.cells = {r: e.cells for r, e in zip(self.races, edges)}
+        self.spacing = {r: e.spacing for r, e in zip(self.races, edges)}
+
+    def rows(self, races) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-env (offset, cells, spacing) arrays for the given per-env races."""
+        return (np.array([self.offset[r] for r in races], np.int64), np.array([self.cells[r] for r in races], np.int64),
+                np.array([self.spacing[r] for r in races], np.float64))
+
+    def span(self, speed: np.ndarray) -> np.ndarray:
+        """Distance (m) covered by the points at a speed (m/s, its magnitude)."""
+        return np.maximum(self.horizon * np.abs(speed), self.floor)
+
+    def world(self, dist_from_start: np.ndarray, speed: np.ndarray, offset: np.ndarray, cells: np.ndarray,
+              spacing: np.ndarray) -> np.ndarray:
+        """[n] state, per-env rows -> [n, n_points, 4] world coordinates (left x, left y, right x, right y)."""
+        s = np.asarray(dist_from_start, np.float64)[:, None] + self.span(speed)[:, None] * self.fractions
+        u = s / spacing[:, None]
+        cell = np.floor(u)
+        frac = (u - cell).astype(np.float32)[..., None]
+        row = offset[:, None] + np.mod(cell.astype(np.int64), cells[:, None])  # wraps, whatever the sign of s
+        a = self.table[row]
+        return a + frac * (self.table[row + 1] - a)
+
+    def car_frame(self, x: np.ndarray, y: np.ndarray, yaw: np.ndarray, world: np.ndarray) -> np.ndarray:
+        """[n] pose, [n, n_points, 4] world -> [n, n_points, 4] car frame (left x, left y, right x, right y), metres."""
+        c, s = np.cos(yaw)[:, None, None], np.sin(yaw)[:, None, None]
+        dx = world[..., ::2] - x[:, None, None]
+        dy = world[..., 1::2] - y[:, None, None]
+        out = np.empty_like(world)
+        out[..., ::2] = c * dx + s * dy
+        out[..., 1::2] = c * dy - s * dx
+        return out

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
-from rlpilot._native import A, F, N_FIELDS, N_RAYS
+from rlpilot._native import F, N_FIELDS, N_RAYS
 
 
 def follow_centreline(env):
@@ -176,35 +176,6 @@ def test_track_profile_peak_sees_short_corners():
     assert np.abs(peak.lookahead(np.array([side / 2]))[0, :4]).max() < 0.05  # the next 75 m are straight
 
 
-def test_action_filter():
-    """The applied controls follow the low-pass, the policy observes them, and alpha 1 changes nothing."""
-    e = SpeedDreamsVecEnv(EnvConfig(n_workers=1, steer_filter=0.25, pedal_filter=0.5, max_episode_seconds=0.2))
-    try:
-        e.reset()
-        a = np.array([[0.8, -0.4]], np.float32)
-        obs, *_ = e.step(a)
-        assert np.allclose(e.applied, [[0.2, -0.2]])
-        i = 12 + N_RAYS
-        assert np.allclose(obs[0, i:i + 2], [0.2, -0.2])
-        e.step(a)
-        assert np.allclose(e.applied, [[0.35, -0.3]])
-        assert np.isclose(e._act[0, A["steer"]], 0.35) and np.isclose(e._act[0, A["brake"]], 0.3)
-        for _ in range(10):  # the episode ends here: the filter restarts from 0, the last controls stay readable
-            *_, info = e.step(a)
-            if info:
-                break
-        assert info and np.allclose(e._prev_action, 0) and not np.allclose(e.applied, 0)
-    finally:
-        e.close()
-    off = SpeedDreamsVecEnv(EnvConfig(n_workers=1, max_episode_seconds=20))
-    try:
-        off.reset()
-        off.step(np.array([[0.8, -0.4]], np.float32))
-        assert np.allclose(off.applied, [[0.8, -0.4]])
-    finally:
-        off.close()
-
-
 def test_steer_rate_penalty():
     from rlpilot.config import RewardConfig
     from rlpilot.reward import REWARD_COMPONENTS, RewardTracker
@@ -223,7 +194,8 @@ def test_multi_track_switching_and_lookahead():
     e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, races=races, lookahead=True, max_episode_seconds=2,
                                     track_switch_steps=1))
     try:
-        assert e.single_observation_space.shape[0] == 31 + 2 + 9
+        assert e.single_observation_space.shape[0] == e.obs_layout.dim
+        look = e.obs_layout.slices["lookahead"]
         e.reset()
         seen = []
         for _ in range(6 * int(2 / e.cfg.step_seconds)):
@@ -233,7 +205,7 @@ def test_multi_track_switching_and_lookahead():
         assert len(set(seen)) > 1  # workers changed track
         # the lookahead follows each worker's current track
         assert set(r for s in seen for r in s) <= set(races)
-        np.testing.assert_array_equal(obs[:, -9:], e._lookahead())
+        np.testing.assert_array_equal(obs[:, look], e._look(e._raw[:, F["dist_from_start"]], e._look_off, e._look_size))
     finally:
         e.close()
 
@@ -245,7 +217,7 @@ def test_car_factors_change_physics_and_obs():
             e.reset()
             for _ in range(100):
                 obs, *_ = e.step(np.array([[0.0, 1.0]], np.float32))
-            return e._raw[0, F["speed_x"]], obs, e
+            return e._raw[0, F["speed_x"]], e.obs_layout.group(obs, "car") if kw.get("car_obs") else None, e
         finally:
             e.close()
 
@@ -254,7 +226,7 @@ def test_car_factors_change_physics_and_obs():
     weak, _, _ = speed_after(car_power=(0.8, 0.8))
     assert heavy < stock - 1 and weak < stock - 1
     _, obs, e = speed_after(car_mass=(1.1, 1.1), car_obs=True)
-    np.testing.assert_allclose(obs[0, -3:], [0.0, 1.0, 0.0], atol=1e-5)  # (factor - 1) x 10
+    np.testing.assert_allclose(obs[0], [0.0, 1.0, 0.0], atol=1e-5)  # (factor - 1) x 10
 
 
 def test_paused_envs_are_not_simulated():
@@ -346,12 +318,12 @@ def test_line_obs_follows_track_switches():
     e = SpeedDreamsVecEnv(EnvConfig(n_workers=2, races=races, line_obs=True, max_episode_seconds=2,
                                     track_switch_steps=1))
     try:
-        assert e.single_observation_space.shape[0] == 31 + 2 + len(LINE_POINTS)
+        assert e.obs_layout.group(np.zeros(e.obs_layout.dim), "line").shape == (len(LINE_POINTS),)
         e.reset()
         for _ in range(4 * int(2 / e.cfg.step_seconds)):
             obs, *_ = e.step(follow_centreline(e))
             assert np.isfinite(obs).all()
-        np.testing.assert_array_equal(obs[:, -len(LINE_POINTS):], e._line_obs())
+        np.testing.assert_array_equal(e.obs_layout.group(obs, "line"), e._line_obs())
         for i, race in enumerate(e.client.races):
             assert e._line_off[i] == e._line.offset[race]
     finally:

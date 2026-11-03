@@ -31,14 +31,14 @@ N × rlpilot-worker (pure C++, one solo race each)
 | `native/robot/rlpilot.cpp` | Robot shim. Without a host (the normal game) it drives a centreline follower. |
 | `native/client/client.c`, `native/bench/bench.c` | Client library and a C-only benchmark. |
 | `data/raceman/rlpilot.xml`, `rlref.xml`, `data/drivers/rlpilot/` | Master race configs (agent / bot reference) and driver config, copied into each worker's `-lc` dir. |
-| `python/rlpilot/` | `config.py`, `vec_env.py`, `features.py`, `reward.py`, `sb3.py`, `workdirs.py`; tracking: `tracking.py`, `evaluate.py`, `reference.py`, `plots.py` |
-| `scripts/` | `bench_env.py`, `train_sb3.py` |
+| `python/rlpilot/` | `config.py`, `vec_env.py`, `features.py` (the observation layout), `track.py`, `splits.py`, `reward.py`, `sb3.py`, `workdirs.py`; tracking: `tracking.py`, `evaluate.py`, `reference.py`, `plots.py` |
+| `scripts/` | `train_sb3.py`, `bench_env.py`, `plot_obs.py` (renders what the policy sees), `eval_test_tracks.py` (test split, once, on a final `best/`) |
 
 ## Build and run
 
 ```sh
 ./build-macos.sh        # engine, then native/ (cmake build + install into sd-install/), then the uv venv
-.venv/bin/python -m pytest tests                  # determinism, rays, autoreset, lap_done, bot reference
+.venv/bin/python -m pytest tests                  # test_obs.py: observations, steering and penalties against known answers and the engine
 .venv/bin/python scripts/bench_env.py --workers 1 5
 .venv/bin/python scripts/train_sb3.py --workers 5 --timesteps 2000000 --eval-every 100000
 .venv/bin/mlflow ui --backend-store-uri sqlite:///mlflow.db
@@ -67,14 +67,14 @@ Everything else SB3 logs is under `sb3/`.
 
 **pilot-1** (old defaults: `ent_coef=0`, 512 steps x 5 envs, minibatch 1024, constant lr 3e-4) peaked at 1-4M steps (3 laps completed in most evals, best lap 112.6 s vs the bot's 107.4 s) and then degraded: mean eval completion by 10M-step block was 0.62, 0.42, 0.35, 0.22. PPO health explains it: action std 0.19 -> 0.016, approx KL 0.018 -> 0.044, clip fraction 0.19 -> 0.30. The policy became near-deterministic and brittle.
 
-Current defaults (`scripts/train_sb3.py`): `ent_coef=0.003`, `target_kl=0.02`, linear lr decay to 10% (`--lr-schedule`), 2048 steps x workers per update with minibatch 2048, 8 eval episodes. The best eval so far is saved to `best/` (score: see "Action filter and checkpoint score"; up to proto-6 it was -(median lap time, 150 s if none + 10 s x (1 - completion rate) + 10 s x missing laps of progress), i.e. pace first); the tag `best_step` says when.
+Current defaults (`scripts/train_sb3.py`): `ent_coef=0.003`, `target_kl=0.02`, linear lr decay to 10% (`--lr-schedule`), 2048 steps x workers per update with minibatch 2048, 8 eval episodes. The best eval so far is saved to `best/` (score: see "Resume and checkpoint score"; up to proto-6 it was -(median lap time, 150 s if none + 10 s x (1 - completion rate) + 10 s x missing laps of progress), i.e. pace first); the tag `best_step` says when.
 
 Where the gap to the bot is: at 3M steps the agent matches the bot's corner speeds and braking points, and loses ~6.7 s per lap evenly in acceleration zones (203 vs 231 km/h on the main straight). Hypotheses, untested: the automatic gearbox (shift points and shift time), wheel spin without traction control, 25 Hz vs the bot's 50 Hz control.
 
 ## Multiple tracks and the curvature lookahead
 
 - **Tracks.** Track `t` is raced with `data/raceman/rlpilot-<t>.xml` (Jarama: `rlpilot.xml`) and has its bot reference in `rlref-<t>.xml`. Both are the Jarama files with only the track name and category changed. The downloaded tracks live in `sd-local/tracks/`.
-- **Training on several tracks** (`--tracks a b c`, `EnvConfig.races`): each worker starts on a track and, at its first reset after `track_switch_steps` steps on it (default 200k, ~2 h 15 min of driving; a respawn costs ~380 ms of the whole batch, ~2% of the run at this default), respawns on a random one (~0.3 s, blocking the batch, hence not counted in resets). Workers can be on different tracks within the same batch.
+- **Training on several tracks** (`--tracks a b c`, `--split proto7`, `EnvConfig.races`): worker i drives track i modulo the number of tracks, and keeps it, also when recycled. `n_workers` must be a multiple of the number of tracks, so that every update holds every track equally (`tracks/*` metrics measure it). `--track-switch-steps N` brings back proto-3..6's behaviour: at its first reset after N steps on a track (they used 200k), a worker respawns on a random one (~0.3 s, blocking the batch).
 - **Evaluation** (`--heldout-tracks x y`): every eval runs the training tracks to evaluate (`--eval-train-tracks`, default all) plus the held-out ones (never trained on), all at once in one env kept for the whole run (`--eval-episodes` workers per track, worker i on track i % n_tracks; finished episodes are paused with `step(active=...)`). With proto-4's 10 tracks x 8 episodes this took 21 s instead of 57 s for one fresh env per track in turn (measured while a training run used the cores), plus ~22 s to spawn the 80 workers once. The first training track keeps the `eval/*` metrics and artifacts. Others log `eval_track/<t>/*`, and the averages go to `eval_train/*` and `eval_heldout/*`. `flying_gap_pct` is the median flying lap vs the bot's best, in %. With several tracks the best-checkpoint score is averaged over the evaluated training and held-out tracks (held-out tracks joined after proto-4, whose best/ stayed at 40M while held-out kept improving). This is selection, not training, but it makes the held-out numbers of `best/` optimistic.
 - **Lookahead** (`--lookahead`, `EnvConfig.lookahead`): 9 extra observations, the centreline curvature over windows 0-10, 10-25, ..., 250-300 m ahead (x25, + = left, clipped to ±3). `--lookahead-stat peak` (the default since proto-5) gives each window's signed peak (10 m smoothed); `mean` (proto-3/4) gives its mean, which dilutes short tight corners: Spa's Bus Stop read -0.82/+1.08 instead of -1.34/+1.65. It's computed in Python from the bot reference's border samples (`track.py`), with each track precomputed on a 1 m grid (~2 µs per vector step). Its distance-from-start matches the engine's to ~1 m (Imola: up to 5.5 m). It's 2D only, with no elevation.
 - **Why** (2026-10-07): Jarama-only checkpoints crashed at the first heavy braking zone on every other track, braking 40-60 m late. A probe showed the braking onset doesn't depend on speed at all: telling the policy it was 40% faster before a braking point made it brake in only 3% of cases. Shrinking the forward rays did trigger it. On one track the speed at each point is nearly constant, so the policy learned "brake when the road looks like this".
@@ -129,15 +129,56 @@ Simplix computes its own racing line (clothoid-smoothed, `unitclothoid.cpp`). `t
 - **The engine eliminates non-human robots whose lap exceeds `84.5 + trackLen/10` s** (≈425 s on Jarama). Keep `max_episode_seconds` below that.
 - **The engine rewrites race configs when it loads them**, so `workdirs.py` re-copies them from `data/` on every launch.
 
-- **Memory grows ~0.14 MB per in-process restart** (measured with `footprint`; flat reset time, no file growth). `leaks` finds almost nothing unreachable, so the engine keeps something reachable across restarts. Workaround: `EnvConfig.recycle_resets` (default 2000) replaces a worker process after that many resets, which caps each worker near 300 MB. A respawned worker gives exactly the same episodes as a reset (tested).
+- **Memory grows ~0.14 MB per in-process restart** (measured with `footprint`, 0.1425 again on 2026-11-03; flat reset time, no file growth). `leaks` finds almost nothing unreachable, so the engine keeps something reachable across restarts. Workaround: `--recycle-resets` (`EnvConfig.recycle_resets`, default 2000; proto-7 uses 1000) replaces a worker process after that many resets, which caps each worker near 45 MB + 0.14 MB x that. A respawned worker gives exactly the same episodes as a reset, on the same track (tested).
 
-## Action filter and checkpoint score
+## Resume and checkpoint score
 
-Experiment notes and plans live in [research-notes.md](research-notes.md).
+Experiment notes and plans live in [research-notes-proto7.md](research-notes-proto7.md).
 
-- **Action filter** (`--steer-filter`, `--pedal-filter`, `EnvConfig.steer_filter/pedal_filter`, off at 1.0): `applied = alpha x action + (1 - alpha) x previous applied`. The policy observes the applied value as its previous action, and `steer_delta`, `pedal_delta` and the steer penalty use it.
 - **Resume** (`--resume <dir>`, PPO): continues from `model.zip` + `vecnormalize.pkl`, steps restart at 0 and step 0 is evaluated. `target_kl` still applies, so a lower LR alone doesn't make smaller policy steps (SB3 stops an update's epochs above 1.5 x `target_kl`).
 - **Score** (`tracking.track_score`, replaces the pace-first score, so `best/score` isn't comparable with earlier runs): per track, the share of eval laps finished minus 0.02 x the flying-lap gap to the bot in %, capped at +-10% (a track without a flying lap counts as +10%). 5% of pace is worth 0.1 of completion.
+
+## Observations (proto-7)
+
+`features.ObsLayout` is the single source of truth: ordered named groups, from which all names, sizes and offsets derive. Read observations through it (`layout.group(obs, "rays")`, `layout.get(obs, "speed_x")`, `features.decode_edges`), never with a hardcoded index. `env._observe(idx)` is the one code path behind reset, step, autoreset, training and eval. `features.assemble` refuses a missing, extra or wrong-width group. With the new groups off, the layout is proto-3..6's, so their checkpoints still load.
+
+| Group | Size | Scale, frame and signs |
+|---|---:|---|
+| `speed` | 3 | car frame: x / 50 m/s (+ = forward), y / 10, z / 10 |
+| `yaw_rate` | 1 | rad/s / 2 |
+| `angle` | 1 | track tangent minus car yaw, rad / pi, + = the road points left of the car |
+| `to_middle` | 1 | offset from the centreline / half width, + = left |
+| `rpm`, `gear` | 1, 1 | / redline, / 6 |
+| `wheel_spin` | 4 | rad/s x 0.33 / 50 |
+| `rays` | 19 | m / 200, -90 to +90 deg, + = left |
+| `prev_action` | 2-4 | previous controls, 0 at an episode's start. `prev_steer` is the steering command, 1 = 45 deg of wheel, + = left |
+| `lookahead` (`--lookahead`) | 9 | see above, + = turning left, clipped to +-3 |
+| `line` (`--line-obs`) | 8 | the bot's line: off in proto-7 |
+| `car` (`--car-obs`) | 3 | (factor - 1) x 10 |
+| `steer_history` (`--steer-history 3`) | 3 | last applied changes, most recent first, / `steer_limit` (so in [-1, 1]), + = towards the left, 0 at an episode's start |
+| `edge_left_x`, `edge_left_y`, `edge_right_x`, `edge_right_y` (`--edge-points 30`) | 30 each | points on the road's edges in the car's frame: x m / 100 (+ = ahead), y m / 50 (+ = left), not clipped |
+
+- **Edge points** (`track.TrackEdges`, `EdgeTable`). At lap distance s + span x k / 29, k = 0..29, with span = max(6 s x horizontal speed, 60 m): k = 0 is abreast of the car, and a corner reaches a given index earlier the faster the car goes. Indexed by lap distance, never by nearest point, which would jump branches on a figure-eight (Karwada). Python only, 2D, from the border samples in `reference/*_track.csv` (`reference.load_track`, which never reads the bot's laps; so does the curvature lookahead now). On a 1 m grid, closed at the start line, so it wraps without special cases, including from the small negative distance a car reports in Imola's seam.
+- **Conventions, checked empirically in `tests/test_obs.py`:** `pos_x`, `pos_y`, `yaw` are a right-handed world frame: the car moves along (cos yaw, sin yaw), and + yaw is to the left. Positive steering turns left.
+- **Agreement with the engine:** nearest edge points vs `to_left`/`to_right`: 3 cm at p99, 0.8 m at worst (Imola's seam). Lap distance on all 41 tracks: under 0.5 m at p99, 3 m at worst (the same seam). Polylines through the points vs the engine's rays: 0.2 m at p99. All rays under 60 m end at a border of the map. Beyond that, rays grazing an edge are coarser than this doc used to claim, up to ~6 m at 150-200 m: the ray tracer's step grows with distance.
+- **Nothing in the policy input depends on where the bot drove.** Scrambling the bot's line table changes no observation or reward (tested); the bot's line stays as the `line_dev` metric, and its lap time still sets eval's time limits (70% of its pace), which aren't an input.
+- **Check it by eye:** `scripts/plot_obs.py` renders the observation in the car's frame over the true road ([images](img/proto-7-obs/)).
+
+**Spa's Bus Stop (chicane at 6640-6730 m, tightest centreline radius 15 m).** Table and images: [research-notes-proto7.md](research-notes-proto7.md).
+
+
+Yes, 30 points resolve it: from the bot's braking point at 229 km/h, 7 points fall in the chicane, with all three direction changes visible, and the shape error is 1.8 m on a ~12 m wide road. That error halves by 80 m out and is 0.3 m at the entry. 60 points would cut it about 3.5x, at 240 inputs instead of 120. They'd matter more for a precise line through it than for seeing it in time, so keep 30 unless a run shows otherwise.
+
+## Steering and penalties (proto-7)
+
+- **Increments** (`--steer-limit 0.0625`): `steer_t = clip(steer_t-1 + action x limit, -1, 1)`, from 0 in each episode. The hard limit is 70 deg/s, under the sim's own wheel slew cap (0.107 per 40 ms), so the wheels follow the command within a step. The worker holds steering at 0 during the countdown. A paused env's steering doesn't change.
+- **Penalties** (`--steer-change`, `--steer-reversal`, `--steer-deadband`; components `reward/steer_change`, `reward/steer_reversal`): `-w1 x |applied change|`, and `-w2` when two consecutive changes reverse sign with both strictly above the dead-band. The first change of an episode can't be a reversal. The old `--steer-rate` (x change squared) is negligible at this scale; proto-7 sets it to 0.
+- **Metrics:** `behavior/steer_delta` (applied change), `behavior/steer_requested` (what the policy asked for; they differ at the lock), `steer_reversal_frac`, `steer_limit_frac` (action saturated), `steer_lock_frac`, `steer_abs`, also under `eval/behavior/`. `tracks/{covered,n_tracks,min_samples_per_update,max_samples_per_update}` and the artifacts `tracks/assignment_{start,end}.json`. `obs/<group>/{min,max,abs_mean,std}` and `obs/{nonfinite,dead_slots}`, from the rollout buffer every 1M steps: what the policy really received.
+- **Progress ignores lap-sized jumps.** The engine's `dist_raced` jumps a lap when a car crosses the start line backwards, and a policy learned to farm that. See [research-notes-proto7.md](research-notes-proto7.md).
+
+## Splits
+
+`splits.py`: 29 train / 6 validation (select checkpoints) / 6 test. `--split proto7` sets the track flags and can't be combined with them. `scripts/eval_test_tracks.py <run id>` runs a run's final `best/` on the test tracks, with the config rebuilt from its logged params, logs `test/*` to the run and refuses a second run; `--dry-run-tracks` checks the script without spending the test set.
 
 ## Next steps
 

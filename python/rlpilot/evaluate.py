@@ -8,19 +8,34 @@ measure robustness rather than repeating one sample.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
 
 from ._native import F
+from .config import EnvConfig
 from .reference import Reference, lap_slice, lap_times_from_trace
 from .reward import END_GROUPS, TERM_REASONS
-from .vec_env import SpeedDreamsVecEnv
+from .vec_env import BEHAVIOR_STATS, SpeedDreamsVecEnv
 
 TRACE_FIELDS = {"time": "time", "laps": "laps", "dist_from_start": "dist_from_start", "dist_raced": "dist_raced",
                 "speed_x": "speed_x", "x": "pos_x", "y": "pos_y", "last_lap_time": "last_lap_time",
                 "wheels_off": "wheels_off", "gear": "gear", "rpm": "rpm"}
+
+
+def eval_config(cfg: EnvConfig, races: tuple[str, ...], episodes: int, laps: int) -> EnvConfig:
+    """The env of an evaluation: `episodes` workers per race, all at once (worker i on race i % n), on the stock car (factor
+    observations, if any, read 0). Workers never change track, and with one reset per eval, recycling isn't needed."""
+    return dataclasses.replace(cfg, n_workers=episodes * len(races), laps_per_episode=laps, run_dir=None, race=races[0],
+                               races=races if len(races) > 1 else (), track_switch_steps=0, recycle_resets=2**62,
+                               car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
+
+
+def eval_time_limits(best_laps: list[float], n_workers: int, laps: int) -> np.ndarray:
+    """Per-worker episode limits: `laps` laps at 70% of the bot's pace, plus the standing start. best_laps: per race."""
+    return np.array([laps * best_laps[i % len(best_laps)] / 0.7 + 20.0 for i in range(n_workers)])
 
 
 @dataclass
@@ -123,7 +138,7 @@ def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], 
         m["eval/bot_lap_time_median"] = reference.median_lap
         if len(all_laps):
             m["eval/gap_to_bot_best"] = m["eval/lap_time_best"] - reference.best_lap
-    for k in ("steer_delta", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
+    for k in BEHAVIOR_STATS:
         m[f"eval/behavior/{k}"] = float(np.mean([s[k] for s in stats]))
     groups = [END_GROUPS[s["end"]] for s in stats]
     for g in sorted(set(END_GROUPS.values())):

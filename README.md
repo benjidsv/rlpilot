@@ -177,7 +177,7 @@ HELDOUT="Imula ardennen-spa brno corkscrew lombaro street-1"
 TRAIN=$(tail -n +2 reference/tracks.csv | cut -d, -f1 | grep -vxF -e Imula -e ardennen-spa -e brno -e corkscrew -e lombaro -e street-1 | tr '\n' ' ')
 .venv/bin/python scripts/train_sb3.py --run-name proto-6 --seed 1 --timesteps 300000000 \
   --tracks $=TRAIN --heldout-tracks $=HELDOUT --eval-train-tracks jarama braga sao-paulo petit --eval-every 8000000 \
-  --gearbox points --lookahead --line-obs --line-shaping 0.1 --car-random 0.1 --car-obs --min-std 0.1 --max-std 0.5
+  --gearbox points --lookahead --line-obs --line-shaping 0.1 --car-random 0.1 --car-obs --min-std 0.1 --max-std 0.5 --track-switch-steps 200000
 ```
 
 To watch a checkpoint in the game (`best/` of a run comes from MLflow's artifacts):
