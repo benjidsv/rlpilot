@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
-from rlpilot._native import F, N_FIELDS, N_RAYS
+from rlpilot._native import A, F, N_FIELDS, N_RAYS
 
 
 def follow_centreline(env):
@@ -174,6 +174,35 @@ def test_track_profile_peak_sees_short_corners():
     assert peak.lookahead(s0)[0, -1] > 0.9 * CURVATURE_SCALE / r
     assert mean.lookahead(s0)[0, -1] < 0.7 * CURVATURE_SCALE / r
     assert np.abs(peak.lookahead(np.array([side / 2]))[0, :4]).max() < 0.05  # the next 75 m are straight
+
+
+def test_action_filter():
+    """The applied controls follow the low-pass, the policy observes them, and alpha 1 changes nothing."""
+    e = SpeedDreamsVecEnv(EnvConfig(n_workers=1, steer_filter=0.25, pedal_filter=0.5, max_episode_seconds=0.2))
+    try:
+        e.reset()
+        a = np.array([[0.8, -0.4]], np.float32)
+        obs, *_ = e.step(a)
+        assert np.allclose(e.applied, [[0.2, -0.2]])
+        i = 12 + N_RAYS
+        assert np.allclose(obs[0, i:i + 2], [0.2, -0.2])
+        e.step(a)
+        assert np.allclose(e.applied, [[0.35, -0.3]])
+        assert np.isclose(e._act[0, A["steer"]], 0.35) and np.isclose(e._act[0, A["brake"]], 0.3)
+        for _ in range(10):  # the episode ends here: the filter restarts from 0, the last controls stay readable
+            *_, info = e.step(a)
+            if info:
+                break
+        assert info and np.allclose(e._prev_action, 0) and not np.allclose(e.applied, 0)
+    finally:
+        e.close()
+    off = SpeedDreamsVecEnv(EnvConfig(n_workers=1, max_episode_seconds=20))
+    try:
+        off.reset()
+        off.step(np.array([[0.8, -0.4]], np.float32))
+        assert np.allclose(off.applied, [[0.8, -0.4]])
+    finally:
+        off.close()
 
 
 def test_steer_rate_penalty():

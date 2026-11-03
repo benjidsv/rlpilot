@@ -74,7 +74,7 @@ def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, 
             for i in np.flatnonzero(active):
                 raw = info["final_raw"][i] if done[i] else env._raw[i]
                 rows[i].append(raw[cols].copy())
-                acts[i].append(np.clip(action[i, :2], -1, 1))
+                acts[i].append(env.applied[i, :2].copy())
                 if done[i]:
                     s = {k: float(v[i]) for k, v in info["stats"].items()}
                     r = int(s.pop("term_reason"))
@@ -123,7 +123,7 @@ def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], 
         m["eval/bot_lap_time_median"] = reference.median_lap
         if len(all_laps):
             m["eval/gap_to_bot_best"] = m["eval/lap_time_best"] - reference.best_lap
-    for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
+    for k in ("steer_delta", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
         m[f"eval/behavior/{k}"] = float(np.mean([s[k] for s in stats]))
     groups = [END_GROUPS[s["end"]] for s in stats]
     for g in sorted(set(END_GROUPS.values())):

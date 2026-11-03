@@ -49,6 +49,11 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.action_names = (("steer", "accel", "brake") if cfg.separate_pedals else ("steer", "pedal")) \
             + GEARBOX_ACTIONS[cfg.gearbox]
         self.act_dim = len(self.action_names)
+        if not (0 < cfg.steer_filter <= 1 and 0 < cfg.pedal_filter <= 1):
+            raise ValueError("steer_filter and pedal_filter must be in (0, 1]")
+        self._alpha = np.ones(self.act_dim, np.float32)  # low-pass per action; 1 = passes the action unchanged
+        self._alpha[0] = cfg.steer_filter
+        self._alpha[1:3 if cfg.separate_pedals else 2] = cfg.pedal_filter
         self._car_ranges = np.array([getattr(cfg, f) for f in CAR_FACTORS], np.float32)  # [3, (lo, hi)]
         self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
         n_extra = ((self._look.n_features if self._look is not None else 0)
@@ -62,7 +67,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._raw = self.client.obs[:, 0]  # [n, OBS_DIM] view on shared memory
         self._act = self.client.act[:, 0]
         self._obs = np.zeros((n, od), np.float32)
-        self._prev_action = np.zeros((n, self.act_dim), np.float32)
+        self._prev_action = np.zeros((n, self.act_dim), np.float32)  # applied controls, 0 at an episode's start
+        self.applied = np.zeros((n, self.act_dim), np.float32)  # controls of the last step, kept across autoreset
         self._cmds = np.full(n, CMD_STEP, np.uint32)
         self._shift_wait = np.zeros(n, np.int64)  # agent steps until the next shift is allowed
         # "points" upshift hold: gear and rpm fraction at the previous step, and the current cap on the down point
@@ -80,6 +86,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._t0 = np.zeros(n, np.float64)
         self._comp = np.zeros((len(REWARD_COMPONENTS), n), np.float64)
         self._dsteer = np.zeros(n, np.float64)
+        self._dpedal = np.zeros(n, np.float64)
         self._linedev = np.zeros(n, np.float64)
         self._absoff = np.zeros(n, np.float64)
         self._off = np.zeros(n, np.int64)
@@ -181,23 +188,25 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._ret[idx] = self._len[idx] = 0
         self._t0[idx] = now
         self._comp[:, idx] = 0
-        self._dsteer[idx] = self._off[idx] = self._speed[idx] = self._full[idx] = 0
+        self._dsteer[idx] = self._dpedal[idx] = self._off[idx] = self._speed[idx] = self._full[idx] = 0
         self._linedev[idx] = self._absoff[idx] = 0
 
     def step(self, actions, active: np.ndarray | None = None):
         """active [n] bool (default all): envs left out are not simulated this step and cannot end; their
         returned obs / reward are meaningless (evaluation pauses envs whose episode is over)."""
         actions = np.clip(np.asarray(actions, np.float32).reshape(self.num_envs, self.act_dim), -1, 1)
-        features.write_actions(actions, self._act, self.cfg.separate_pedals)
+        self.applied[:] = self._alpha * actions + (1 - self._alpha) * self._prev_action
+        features.write_actions(self.applied, self._act, self.cfg.separate_pedals)
         if self.cfg.gearbox == "agent":
             self._write_gear(actions[:, -1])
         elif self.cfg.gearbox == "points":
             self._write_shift_points(actions[:, -2], actions[:, -1])
         self.client.exchange(CMD_STEP if active is None else np.where(active, CMD_STEP, CMD_NONE).astype(np.uint32))
-        d_steer = actions[:, 0] - self._prev_action[:, 0]
+        d_steer = self.applied[:, 0] - self._prev_action[:, 0]
         self._dsteer += np.abs(d_steer)
+        self._dpedal += np.abs(self.applied[:, 1] - self._prev_action[:, 1])
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE
-        self._prev_action[:] = actions
+        self._prev_action[:] = self.applied
 
         raw = self._raw
         line_dev = self._line_dev()
@@ -236,6 +245,7 @@ class SpeedDreamsVecEnv(VectorEnv):
             "damage": at_end(_scatter(final_raw[:, F["damage"]], idx, n)),
             "term_reason": reason.copy(),
             "steer_delta": at_end(self._dsteer / steps),
+            "pedal_delta": at_end(self._dpedal / steps),
             "line_dev": at_end(self._linedev / steps),
             "abs_offset": at_end(self._absoff / steps),
             "offtrack_frac": at_end(self._off / steps),

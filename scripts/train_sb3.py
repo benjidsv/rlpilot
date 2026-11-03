@@ -56,6 +56,12 @@ def main():
                    help="offsets beyond this (m) count as this in the shaping potential")
     p.add_argument("--line-fade", type=float, default=0.5,
                    help="line shaping fades linearly to 0 at this fraction of --timesteps (0: never)")
+    p.add_argument("--steer-filter", type=float, default=1.0,
+                   help="low-pass on the applied steering: alpha x action + (1 - alpha) x previous (1: off)")
+    p.add_argument("--pedal-filter", type=float, default=1.0, help="same for the pedal (1: off)")
+    p.add_argument("--resume", default=None,
+                   help="PPO: continue from a directory with model.zip and vecnormalize.pkl (e.g. mlruns/.../best). "
+                        "Steps restart at 0, --lr and --lr-schedule apply from there, and step 0 is evaluated")
     p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
                    help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
     p.add_argument("--car-random", type=float, default=0.0,
@@ -91,7 +97,7 @@ def main():
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
                     gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
                     track_switch_steps=a.track_switch_steps, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
-                    line_obs=a.line_obs,
+                    line_obs=a.line_obs, steer_filter=a.steer_filter, pedal_filter=a.pedal_filter,
                     reward=RewardConfig(steer_rate=a.steer_rate, line_shaping=a.line_shaping,
                                         line_cap=a.line_cap, gamma=a.gamma),
                     car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
@@ -114,11 +120,23 @@ def main():
     mlflow.set_experiment(a.experiment)
     with mlflow.start_run(run_name=a.run_name):
         log_provenance(cfg, **{f"algo.{k}": v for k, v in logged.items()}, algo=a.algo,
-                       timesteps=a.timesteps, seed=a.seed)
+                       timesteps=a.timesteps, seed=a.seed, resume=a.resume)
         env = SB3VecEnv(SpeedDreamsVecEnv(cfg))
-        venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=a.gamma)
         Model = {"ppo": CpuRolloutPPO, "sac": SAC}[a.algo]
-        model = Model("MlpPolicy", venv, device=a.device, verbose=0, seed=a.seed, **algo_kwargs)
+        if a.resume:
+            if a.algo != "ppo":
+                p.error("--resume is PPO only")
+            venv = VecNormalize.load(str(Path(a.resume) / "vecnormalize.pkl"), env)
+            venv.training = True
+            # custom_objects replaces the saved values before the schedule is rebuilt; the saved one is a closure
+            model = CpuRolloutPPO.load(Path(a.resume) / "model.zip", env=venv, device=a.device,
+                                       custom_objects={"learning_rate": lr, "lr_schedule": None,
+                                                       "clip_range": algo_kwargs["clip_range"]},
+                                       gamma=a.gamma, ent_coef=a.ent_coef, target_kl=a.target_kl or None)
+            model.set_random_seed(a.seed)
+        else:
+            venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=a.gamma)
+            model = Model("MlpPolicy", venv, device=a.device, verbose=0, seed=a.seed, **algo_kwargs)
         model.set_logger(Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout),
                                                              MLflowOutputFormat()]))
         try:
@@ -126,7 +144,8 @@ def main():
                 TrainingMetricsCallback(every=a.log_every),
                 EvalCallback(cfg, every=a.eval_every, episodes=a.eval_episodes, laps=a.eval_laps, verbose=1,
                              heldout=tuple(race_for(t) for t in a.heldout_tracks),
-                             eval_train=tuple(race_for(t) for t in a.eval_train_tracks), smooth=a.eval_smooth),
+                             eval_train=tuple(race_for(t) for t in a.eval_train_tracks), smooth=a.eval_smooth,
+                             at_start=bool(a.resume)),
                 CheckpointCallback(every=a.checkpoint_every),
                 *([LineShapingFadeCallback(a.line_shaping, a.timesteps, a.line_fade)] if a.line_shaping > 0 else []),
                 *([StdClampCallback(env.env.action_names, a.min_std, a.max_std, every=a.log_every)] if a.algo == "ppo" else []),

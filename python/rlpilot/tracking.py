@@ -52,6 +52,19 @@ from .track import RacingLine, reference_for, track_of
 from .vec_env import SpeedDreamsVecEnv
 
 
+SCORE_GAP_WEIGHT = 0.02  # score per % of pace: 5% is worth 0.1 of a track's completion
+SCORE_GAP_CAP = 10.0     # %, also what a track without a flying lap counts as
+
+
+def track_score(m: dict[str, float], bot_lap: float, laps: int) -> float:
+    """Checkpoint score on one track: completion first, pace second. The share of the eval's laps finished (so a
+    crash on lap 2 counts) minus SCORE_GAP_WEIGHT x the capped flying-lap gap to the bot (%)."""
+    finished = min(m["eval/laps_completed"] / laps, 1.0)
+    fly = m.get("eval/flying_lap_time_median")
+    gap = np.clip(100.0 * (fly / bot_lap - 1), -SCORE_GAP_CAP, SCORE_GAP_CAP) if fly is not None else SCORE_GAP_CAP
+    return float(finished - SCORE_GAP_WEIGHT * gap)
+
+
 def _git(*args: str, cwd=workdirs.ROOT) -> str:
     try:
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
@@ -179,7 +192,8 @@ class TrainingMetricsCallback(BaseCallback):
                 m[f"reward/{c}"] = float(np.mean([s[f"reward_{c}"] for s in b]))
                 total += m[f"reward/{c}"]
             m["reward/total"] = total
-            for k in ("steer_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset"):
+            for k in ("steer_delta", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev",
+                      "abs_offset"):
                 m[f"behavior/{k}"] = float(np.mean([s[k] for s in b]))
             self.buf.clear()
         env, sb3env = _base_env(self.training_env)
@@ -212,7 +226,7 @@ class EvalCallback(BaseCallback):
 
     def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 8, laps: int = 3,
                  launch_noise: float = 0.1, verbose: int = 0, heldout: tuple[str, ...] = (),
-                 eval_train: tuple[str, ...] = (), smooth: int = 3):
+                 eval_train: tuple[str, ...] = (), smooth: int = 3, at_start: bool = False):
         super().__init__(verbose)
         # training tracks to evaluate (default: all of them); the first one gets eval/* and the artifacts
         self.train_races = tuple(eval_train) or tuple(cfg.races) or (cfg.race,)
@@ -226,6 +240,7 @@ class EvalCallback(BaseCallback):
                                        track_switch_steps=2**62, recycle_resets=2**62,
                                        car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
         self.every, self.launch_noise, self.smooth = every, launch_noise, max(1, smooth)
+        self.at_start = at_start  # also evaluate at step 0: the baseline of a resumed run
         self._last = 0
         self.best_score = -np.inf
         self._window: list[tuple[int, float, Path]] = []  # (step, score, local model snapshot) of the last evals
@@ -248,6 +263,8 @@ class EvalCallback(BaseCallback):
         self._limits = np.array([self.cfg.laps_per_episode * self.refs[self.races[i % n_tracks]].best_lap / 0.7 + 20.0
                                  for i in range(self.env.num_envs)])
         self._tmp = tempfile.TemporaryDirectory(prefix="rlpilot-eval-")
+        if self.at_start:
+            self.run()
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last >= self.every:
@@ -281,14 +298,9 @@ class EvalCallback(BaseCallback):
         step = self.num_timesteps
         mlflow.log_metrics(res.metrics, step=step)
 
-        # Score: pace first, with a moderate reliability penalty. Minus the median lap time (150 s if no lap
-        # finished) minus 10 s per unit of non-completion (no lap finished) and 10 s per lap of missing progress.
-        # With several tracks: the mean over the evaluated training and held-out tracks, with lap times in % of
-        # the bot's best lap (~1 s per % on Jarama), so long and short tracks weigh the same. Held-out tracks
-        # are never trained on but do select the checkpoint, so their metrics at best/ are optimistic.
-        m = res.metrics
-        short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
-        score = -(m.get("eval/lap_time_median", 150.0) + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short)
+        # Score: track_score, averaged over the evaluated training and held-out tracks with several tracks. Held-out
+        # tracks are never trained on but do select the checkpoint, so their metrics at best/ are optimistic.
+        score = track_score(res.metrics, self.refs[self.train_races[0]].best_lap, self.cfg.laps_per_episode)
         if n_tracks > 1:
             agg, scores = self._track_metrics({r: x.metrics for r, x in results.items()})
             mlflow.log_metrics(agg, step=step)
@@ -343,9 +355,7 @@ class EvalCallback(BaseCallback):
                 t["fail_dist_from_start"] = m["eval/fail_dist_from_start"]
             out |= {f"eval_track/{track_of(race)}/{k}": v for k, v in t.items()}
             groups["eval_train" if race in self.train_races else "eval_heldout"].append(t)
-            short = max(0.0, self.cfg.laps_per_episode - m["eval/progress"])
-            lap_pct = 100.0 * m["eval/lap_time_median"] / bot if "eval/lap_time_median" in m else 140.0
-            scores.append(-(lap_pct + 10.0 * (1 - m["eval/completion_rate"]) + 10.0 * short))
+            scores.append(track_score(m, bot, self.cfg.laps_per_episode))
         for g, ts in groups.items():
             for k in ("progress", "completion_rate", "flying_gap_pct", "line_dev", "abs_offset"):
                 vals = [t[k] for t in ts if k in t]

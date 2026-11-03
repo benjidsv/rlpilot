@@ -66,6 +66,11 @@ class EnvConfig:
     upshift_hold_gap: float | None = 0.05
     shift_deadzone: float = 0.33     # "agent"
     separate_pedals: bool = False    # action = [steer, pedal] (pedal < 0 brakes) or [steer, accel, brake]
+    # Low-pass on the applied controls: applied = alpha x action + (1 - alpha) x previous applied, which is also what
+    # the policy observes as its previous action. 1: off (up to proto-6). On proto-6 without retraining, steer 0.25 +
+    # pedal 0.5 cut the steering change per step 8x and gained 1.2-1.6 points of pace (docs/gym-wrapper.md).
+    steer_filter: float = 1.0
+    pedal_filter: float = 1.0
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")
     deterministic: bool = True       # -nr: no srand(time) in the engine
