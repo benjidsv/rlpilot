@@ -50,6 +50,7 @@ CMD_NONE, CMD_STEP, CMD_RESET, CMD_QUIT = 0, 1, 2, 3
 FLAG_AUTO_GEAR, FLAG_SHIFT_POINTS = 1, 2
 GEARBOX_FLAGS = {"auto": FLAG_AUTO_GEAR, "points": FLAG_SHIFT_POINTS, "agent": 0}
 ST_READY = 1
+MAX_WORKERS = 256  # rlp_exchange (client.c) only commands this many: any others would silently never step
 _ERRORS = {-1: "timeout", -2: "worker error/exited", -3: "system error"}
 
 
@@ -90,6 +91,8 @@ class Client:
     def __init__(self, n_workers: int, n_cars: int = 1, frame_skip: int = 1, gearbox: str = "auto",
                  spin_us: int = 50, race: str | list[str] = "rlpilot", run_dir: str | Path | None = None,
                  deterministic: bool = True, trace_level: int = 1, timeout_ms: int = 30000):
+        if n_workers > MAX_WORKERS:
+            raise ValueError(f"{n_workers} workers: rlp_exchange supports at most {MAX_WORKERS}")
         self.lib = _load_lib()
         self.n_workers, self.n_cars, self.timeout_ms = n_workers, n_cars, timeout_ms
         self.name = f"/rlp{os.getpid()}_{id(self) % 100000}".encode()  # macOS: <= 31 chars

@@ -16,7 +16,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
 from rlpilot.config import RewardConfig
-from rlpilot.sb3 import CpuRolloutPPO, SB3VecEnv
+from rlpilot.sb3 import CpuRolloutPPO, SB3VecEnv, resume_ppo
 from rlpilot.splits import PROTO7_EVAL_TRAIN, PROTO7_TRAIN, PROTO7_VALIDATION
 from rlpilot.track import race_for
 from rlpilot.tracking import (CheckpointCallback, EvalCallback, LineShapingFadeCallback, MLflowOutputFormat,
@@ -78,7 +78,8 @@ def main():
                    help="smallest steering change (command units per step) that counts as a reversal")
     p.add_argument("--resume", default=None,
                    help="PPO: continue from a directory with model.zip and vecnormalize.pkl (e.g. mlruns/.../best). "
-                        "Steps restart at 0, --lr and --lr-schedule apply from there, and step 0 is evaluated")
+                        "Steps restart at 0, the PPO flags here replace the saved values (--lr and --lr-schedule from there), "
+                        "and step 0 is evaluated")
     p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
                    help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
     p.add_argument("--car-random", type=float, default=0.0,
@@ -149,13 +150,8 @@ def main():
         if a.resume:
             if a.algo != "ppo":
                 p.error("--resume is PPO only")
-            venv = VecNormalize.load(str(Path(a.resume) / "vecnormalize.pkl"), env)
-            venv.training = True
-            # custom_objects replaces the saved values before the schedule is rebuilt; the saved one is a closure
-            model = CpuRolloutPPO.load(Path(a.resume) / "model.zip", env=venv, device=a.device,
-                                       custom_objects={"learning_rate": lr, "lr_schedule": None,
-                                                       "clip_range": algo_kwargs["clip_range"]},
-                                       gamma=a.gamma, ent_coef=a.ent_coef, target_kl=a.target_kl or None)
+            model = resume_ppo(a.resume, env, a.device, algo_kwargs)
+            venv = model.get_env()
             model.set_random_seed(a.seed)
         else:
             venv = VecNormalize(env, norm_obs=False, norm_reward=True, gamma=a.gamma)

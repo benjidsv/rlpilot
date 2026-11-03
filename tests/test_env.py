@@ -1,10 +1,18 @@
 """Integration tests: need the native build installed (cmake --install native/build)."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import gymnasium as gym
 import numpy as np
 import pytest
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
-from rlpilot._native import F, N_FIELDS, N_RAYS
+from rlpilot import tracking
+from rlpilot._native import MAX_WORKERS, Client, F, N_FIELDS, N_RAYS
+from rlpilot.sb3 import resume_ppo
 
 
 def follow_centreline(env):
@@ -328,3 +336,94 @@ def test_line_obs_follows_track_switches():
             assert e._line_off[i] == e._line.offset[race]
     finally:
         e.close()
+
+
+def test_client_rejects_more_workers_than_exchange_commands():
+    """rlp_exchange only commands the first 256 workers, and the others would silently never step."""
+    with pytest.raises(ValueError, match="at most 256"):
+        Client(MAX_WORKERS + 1)
+
+
+class _FakeMlflow:
+    def __init__(self):
+        self.best = []  # step of the eval saved to best/, at each save
+
+    def log_artifacts(self, path, artifact_path):
+        assert artifact_path == "best"
+        self.best.append(int(Path(path).name))
+
+    def log_metrics(self, *args, **kwargs):
+        pass
+
+    def set_tag(self, *args):
+        pass
+
+
+def _select(monkeypatch, tmp_path, scores, smooth=3):
+    """The steps saved to best/ over evals with these scores (steps 1, 2, ...), and the callback."""
+    fake = _FakeMlflow()
+    monkeypatch.setattr(tracking, "mlflow", fake)
+    monkeypatch.setattr(tracking, "_save_local", lambda model, d: d.mkdir(parents=True))
+    cb = tracking.EvalCallback(EnvConfig(), smooth=smooth)
+    cb.model, cb._tmp = None, SimpleNamespace(name=str(tmp_path))
+    for step, score in enumerate(scores, 1):
+        cb._select_best(step, score)
+    return fake.best, cb
+
+
+def test_a_lucky_early_eval_cant_hold_best(monkeypatch, tmp_path):
+    # 0.9 alone would be a window of 1 beating every full window; the later plateau has the best full window (0.4)
+    saved, cb = _select(monkeypatch, tmp_path, [0.9, 0.1, 0.1, 0.4, 0.4, 0.4])
+    assert saved == [1, 1, 1, 4]  # provisional, provisional, first full window, plateau
+    assert cb.best_score == pytest.approx(0.4)
+
+
+def test_first_full_window_replaces_a_better_provisional_best(monkeypatch, tmp_path):
+    saved, cb = _select(monkeypatch, tmp_path, [0.2, 0.9, 0.1, 0.1])
+    assert saved == [1, 2, 2]  # the last eval's window (0.37) doesn't beat the first full one (0.4)
+    assert cb.best_score == pytest.approx(1.2 / 3)
+
+
+def test_run_shorter_than_the_window_still_has_a_best(monkeypatch, tmp_path):
+    saved, cb = _select(monkeypatch, tmp_path, [0.2, 0.5])
+    assert saved == [1, 2]
+    assert cb.best_score == -np.inf
+
+
+def test_window_of_one_keeps_every_new_best(monkeypatch, tmp_path):
+    assert _select(monkeypatch, tmp_path, [0.2, 0.1, 0.5], smooth=1)[0] == [1, 3]
+
+
+def _dummy_venv():
+    return DummyVecEnv([lambda: gym.make("Pendulum-v1")])
+
+
+def test_resume_uses_the_settings_it_logs(tmp_path):
+    saved = dict(n_steps=64, batch_size=32, n_epochs=2, gamma=0.995, gae_lambda=0.95, ent_coef=0.003, target_kl=0.02,
+                 learning_rate=3e-4, clip_range=0.2, policy_kwargs=dict(net_arch=[16, 16]))
+    venv = VecNormalize(_dummy_venv(), norm_obs=False, norm_reward=True, gamma=saved["gamma"])
+    PPO("MlpPolicy", venv, **saved).save(tmp_path / "model.zip")
+    venv.save(str(tmp_path / "vecnormalize.pkl"))
+
+    new = saved | dict(n_steps=128, batch_size=64, n_epochs=3, gamma=0.99, gae_lambda=0.9, ent_coef=0.01, target_kl=None,
+                       learning_rate=1e-4, clip_range=0.1)
+    model = resume_ppo(tmp_path, _dummy_venv(), "cpu", new)
+    for k in ("n_steps", "batch_size", "n_epochs", "gamma", "gae_lambda", "ent_coef", "target_kl"):
+        assert getattr(model, k) == new[k], k
+    assert model.rollout_buffer.buffer_size == 128
+    assert model.rollout_buffer.gamma == 0.99
+    assert model.lr_schedule(1.0) == pytest.approx(1e-4)
+    assert model.clip_range(1.0) == pytest.approx(0.1)
+    assert isinstance(model.get_env(), VecNormalize)
+    assert model.get_env().gamma == 0.99
+    assert model.get_env().training
+    model.learn(128)  # the new sizes actually run
+
+
+def test_resume_refuses_a_different_network(tmp_path):
+    settings = dict(n_steps=64, batch_size=32, gamma=0.99, learning_rate=3e-4, clip_range=0.2, policy_kwargs=dict(net_arch=[16, 16]))
+    venv = VecNormalize(_dummy_venv(), norm_obs=False, norm_reward=True, gamma=0.99)
+    PPO("MlpPolicy", venv, **settings).save(tmp_path / "model.zip")
+    venv.save(str(tmp_path / "vecnormalize.pkl"))
+    with pytest.raises(ValueError, match="policy kwargs"):
+        resume_ppo(tmp_path, _dummy_venv(), "cpu", settings | {"policy_kwargs": dict(net_arch=[32, 32])})

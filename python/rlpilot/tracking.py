@@ -274,8 +274,9 @@ class EvalCallback(BaseCallback):
     several tracks, per-track and averaged metrics go to eval_track/, eval_train/, eval_heldout/.
 
     best/ holds the model of the best-scoring eval within the best window of `smooth` consecutive evals (by mean
-    score, logged as eval/score_smoothed), so that one lucky eval does not win. Each eval's model is kept locally
-    until it leaves the window."""
+    score, logged as eval/score_smoothed), so that one lucky eval does not win. Only full windows compete: until the
+    first one, best/ is provisional (the best eval so far, so that a short or killed run still has one) and the first
+    full window replaces it whatever its score. Each eval's model is kept locally until it leaves the window."""
 
     def __init__(self, cfg: EnvConfig, every: int = 100_000, episodes: int = 8, laps: int = 3,
                  launch_noise: float = 0.1, verbose: int = 0, heldout: tuple[str, ...] = (),
@@ -382,8 +383,10 @@ class EvalCallback(BaseCallback):
             shutil.rmtree(self._window.pop(0)[2], ignore_errors=True)
         smoothed = float(np.mean([s for _, s, _ in self._window]))
         mlflow.log_metrics({"eval/score": score, "eval/score_smoothed": smoothed}, step=step)
-        if smoothed > self.best_score:
-            self.best_score = smoothed
+        full = len(self._window) == self.smooth
+        if not full or smoothed > self.best_score:
+            if full:
+                self.best_score = smoothed
             best_step, best, best_snap = max(self._window, key=lambda w: w[1])
             mlflow.log_artifacts(str(best_snap), "best")  # overwrites the previous best in the run's artifacts
             mlflow.log_metrics({"best/score": smoothed, "best/step": best_step, "best/eval_score": best}, step=step)

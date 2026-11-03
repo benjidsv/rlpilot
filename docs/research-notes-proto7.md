@@ -8,7 +8,7 @@ Experiment log and plans. How the code works belongs in [gym-wrapper.md](gym-wra
 
 ## Status (2026-11-03)
 
-proto-6.5 is finished. proto-7 is **implemented and smoke-tested, not yet run or committed**. The launch command is at the end of "proto-7 implementation and smoke runs". The filter from proto-6.5 is gone.
+proto-6.5 is finished. proto-7 is **implemented and smoke-tested, not yet run**. The launch command is at the end of "proto-7 implementation and smoke runs". The filter from proto-6.5 is gone. Deferred code fixes are listed under "Open items from the code review".
 
 ## proto-6 probes and proto-6.5
 
@@ -243,3 +243,14 @@ caffeinate -is .venv/bin/python scripts/train_sb3.py --split proto7 --workers 29
 ```
 
 Then, once only, on the final `best/`: `scripts/eval_test_tracks.py <run id>`.
+
+### Open items from the code review (2026-11-04)
+
+None of these affects the proto-7 launch command. They wait for the change that makes them matter. Fixed in the same review: the 256-worker limit is now an error, only full windows compete for `best/`, and `--resume` applies the PPO flags it logs.
+
+- [ ] **Paused workers keep advancing (`vec_env.py`, `step`).** A paused env keeps its physics, but `_len`, the reward timers and the episode stats still advance, and `applied` and `_prev_action` take the paused env's pedal and shift actions (only steering is restored). Paused for 60 steps with a limit of 50, an env truncated on its first resumed step, after one simulated step. Today's only caller, `rollout`, never resumes before the next reset. **Fix before** anything resumes a paused env, such as mistake-spawn sampling: mask every per-env update with `active`.
+- [ ] **`--seed` doesn't reach the car draws (`vec_env.py`, `reset`; `sb3.py`, `SB3VecEnv.reset`).** Car and track draws use `_rng = default_rng(0)`, so `reset(seed=42)` twice gives different cars (grip 1.02739, then 0.90331), SB3's queued seeds are dropped, and all `--seed` values start the same stream of draws. Runs are still reproducible, and nothing calls `reset` with a seed. **Fix before** drawing conclusions from a multi-seed comparison. Reseed `_rng` only when a seed is given, and forward SB3's `_seeds[0]`. Don't switch to `self.np_random`: unseeded, it should draw from OS entropy, and unseeded runs would stop being reproducible.
+- [ ] **`separate_pedals=True` metrics ignore the brake (`vec_env.py`, `pedal_delta`; `evaluate.py`, traces).** `pedal_delta` and the trace's `pedal` read column 1, which is throttle in this mode. No script or test sets this option, and there is no CLI flag, so no run is affected: the single signed pedal already counts braking. **Fix or delete** the option if it comes back.
+- [ ] **Separate throttle and brake metrics (optional).** Not a bug. Traces have no brake channel in either mode, and proto-7's next suspect is jerky pedals (see "Pedals" above). Reading `_act[:, A["accel"]]` and `_act[:, A["brake"]]` would give both in physical units, in both modes. **Add if** the run comes out smooth in steering and jerky on the pedals.
+- [ ] **Eval docstring (`evaluate.py`, `eval_config`).** It says one reset per eval, but there are two: the autoreset at the end of an episode, and `env.reset()` at the next eval. proto-7 is fine: 38 evals cost ~0.9 GB over the 80 workers. Eval workers are never recycled, so **recheck** if evals get much more frequent.
+- [ ] **Removing the 256-worker limit itself (`client.c`, `rlp_exchange`).** It is only rejected for now, in `Client.__init__`. `scripts/bench_env.py` and anything else going through `Client` are covered, but `bench.c` calls the library directly. **Remove** the fixed `want[256]` if a machine ever runs that many workers.

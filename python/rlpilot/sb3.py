@@ -9,10 +9,12 @@ rollout/ep_rew_mean and ep_len_mean) and our per-episode stats.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import numpy as np
 import torch as th
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
 from .vec_env import SpeedDreamsVecEnv
@@ -88,3 +90,18 @@ class CpuRolloutPPO(PPO):
             return super().collect_rollouts(*args, **kwargs)
         finally:
             th.set_num_threads(threads)
+
+
+def resume_ppo(directory: str | Path, env: VecEnv, device: str, settings: dict) -> CpuRolloutPPO:
+    """Continue from a directory with model.zip and vecnormalize.pkl. `settings` are the keyword arguments of a new PPO:
+    they all replace the saved values, also in VecNormalize (gamma), so what a run logs is what it uses. Only the
+    network comes from the checkpoint, and a different policy_kwargs is refused."""
+    directory = Path(directory)
+    venv = VecNormalize.load(str(directory / "vecnormalize.pkl"), env)
+    venv.training = True
+    venv.gamma = settings["gamma"]
+    # custom_objects replaces the saved values before the schedules are rebuilt; the saved ones are closures
+    replaced = {k: settings[k] for k in ("learning_rate", "clip_range")}
+    rest = {k: v for k, v in settings.items() if k not in replaced}
+    return CpuRolloutPPO.load(directory / "model.zip", env=venv, device=device,
+                              custom_objects={"lr_schedule": None} | replaced, **rest)
