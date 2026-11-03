@@ -394,6 +394,32 @@ def test_window_of_one_keeps_every_new_best(monkeypatch, tmp_path):
     assert _select(monkeypatch, tmp_path, [0.2, 0.1, 0.5], smooth=1)[0] == [1, 3]
 
 
+def test_track_metrics_layout(monkeypatch):
+    monkeypatch.setattr(tracking, "track_of", lambda race: race.split("-")[1])
+    cb = tracking.EvalCallback(EnvConfig(races=("rlpilot-a", "rlpilot-b"), n_workers=2), heldout=("rlpilot-c",))
+    cb.refs = {r: SimpleNamespace(best_lap=100.0) for r in cb.races}
+    base = {"eval/progress": 1.0, "eval/completion_rate": 1.0, "eval/laps_completed": 3.0,
+            "eval/behavior/line_dev": 2.0, "eval/behavior/abs_offset": 0.5}
+    flying = base | {"eval/flying_lap_time_median": 110.0}
+    crashed = base | {"eval/progress": 0.5, "eval/fail_dist_from_start": 42.0}
+    out, scores = cb._track_metrics({"rlpilot-a": flying, "rlpilot-b": crashed, "rlpilot-c": flying})
+    assert out["track_gap_pct/a"] == pytest.approx(10.0) and "track_gap_pct/b" not in out
+    assert out["track_fail_dist/b"] == 42.0 and out["track_progress/b"] == 0.5
+    assert out["dashboard/train_progress"] == pytest.approx(0.75) and out["dashboard/train_gap_pct"] == pytest.approx(10.0)
+    assert out["dashboard/heldout_flying_lap_tracks"] == 1.0 and out["eval/train_flying_lap_tracks"] == 0.5
+    assert out["eval/heldout_line_dev"] == 2.0
+    assert len(scores) == 3
+    assert {k.split("/")[0] for k in out} == {"dashboard", "eval", "track_progress", "track_gap_pct", "track_fail_dist"}
+
+
+def test_sb3_records_are_renamed_or_dropped(monkeypatch):
+    logged = {}
+    monkeypatch.setattr(tracking, "mlflow", SimpleNamespace(log_metrics=lambda m, step: logged.update(m)))
+    tracking.MLflowOutputFormat().write({"train/entropy_loss": -2.0, "train/value_loss": 1.0, "time/fps": 5,
+                                         "rollout/ep_rew_mean": 1.0, "train/loss": 1.0, "train/actor_loss": 3.0}, {})
+    assert logged == {"dashboard/ppo_entropy": 2.0, "ppo/value_loss": 1.0, "sb3/train/actor_loss": 3.0}
+
+
 def _dummy_venv():
     return DummyVecEnv([lambda: gym.make("Pendulum-v1")])
 
