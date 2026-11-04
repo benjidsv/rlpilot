@@ -293,3 +293,17 @@ caffeinate -is .venv/bin/python scripts/train_sb3.py $F --launch-share 0.7 --run
 
 `--seed` doesn't reach the car and launch draws (see the open items), so one seed each is what this comparison has. The share of 0.7 and the speed range are starting points, not tuned. Don't spend the test split on either of them.
 
+
+**Result** (`proto-7-launch` 8b701896..., `proto-7-control` b672c228..., one seed each; all 35 non-test tracks, 2 episodes per track, mean over 5 checkpoints). The control crashed at 21.9M, probably from reads of `mlflow.db` during the run (unconfirmed), so its window is earlier:
+
+| | Control, 4-20M | Launch, 4-20M | Launch, 36-50M |
+|---|---:|---:|---:|
+| Validation completion, 6 tracks | 0.25 | 0.33 | 0.53 |
+| Validation progress, laps of 2 | 0.90 | 1.01 | 1.27 |
+| Train completion, 29 tracks | 0.77 | 0.77 | 0.81 |
+| Train progress, laps of 2 | 1.65 | 1.65 | 1.70 |
+
+- **Criterion fixed before the launch results:** of the 7 tracks the control never completed, at least 3 clearing = clear win, 0-1 = not helping. Result: **2**, Street-1 (0 -> 0.90, validation, never trained on) and Karwada (0 -> 0.80). In between. Kurpfalzring passes its first corner by the last checkpoint and dies ~1000 m later. Imola, Corkscrew and Longjour don't move; Ole-road-1 dies earlier (~2670 vs ~3600 m).
+- **Spa:** 0.20 -> 0.90, and Hidden Valley 0.20 -> 0.60. Spa flipped throughout the control, so read it with care.
+- **Pace unchanged:** -5.54% vs -5.61% on the 24 training tracks with a flying lap in both. **Worse:** Racepark3 0.80 -> 0.40; São Paulo, Inuksuk, e-track-4 and Torino lose 0.2.
+- **What this can't say:** the same-window gain is small, and without a control past 21.9M the later gain can't be split from more fine-tuning. Practice alone didn't clear three training tracks: Longjour, Kurpfalzring and Ole-road-1 are among the top launch-failure spots in `tracks/failures.csv`, under a low learning rate near the KL cutoff.
