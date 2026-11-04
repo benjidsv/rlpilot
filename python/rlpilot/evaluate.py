@@ -14,7 +14,7 @@ from typing import Callable
 
 import numpy as np
 
-from ._native import F
+from ._native import A, F
 from .config import EnvConfig
 from .reference import Reference, lap_slice, lap_times_from_trace
 from .reward import END_GROUPS, TERM_REASONS
@@ -41,7 +41,7 @@ def eval_time_limits(best_laps: list[float], n_workers: int, laps: int) -> np.nd
 @dataclass
 class EvalResult:
     metrics: dict[str, float]
-    traces: list[dict[str, np.ndarray]]   # one per episode: TRACE_FIELDS + steer, pedal
+    traces: list[dict[str, np.ndarray]]   # one per episode: TRACE_FIELDS + steer, pedal, throttle, brake
     lap_times: list[np.ndarray]           # completed laps per episode
     stats: list[dict[str, float]] = field(default_factory=list)
 
@@ -89,7 +89,7 @@ def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, 
             for i in np.flatnonzero(active):
                 raw = info["final_raw"][i] if done[i] else env._raw[i]
                 rows[i].append(raw[cols].copy())
-                acts[i].append(env.applied[i, :2].copy())
+                acts[i].append(np.r_[env.applied[i, :2], env._act[i, A["accel"]], env._act[i, A["brake"]]])
                 if done[i]:
                     s = {k: float(v[i]) for k, v in info["stats"].items()}
                     r = int(s.pop("term_reason"))
@@ -105,7 +105,7 @@ def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, 
     for i in range(n):
         data = np.stack(rows[i])
         a = np.stack(acts[i])
-        tr = {k: data[:, j] for j, k in enumerate(TRACE_FIELDS)} | {"steer": a[:, 0], "pedal": a[:, 1]}
+        tr = {k: data[:, j] for j, k in enumerate(TRACE_FIELDS)} | {"steer": a[:, 0], "pedal": a[:, 1], "throttle": a[:, 2], "brake": a[:, 3]}
         traces.append(tr)
         lap_times.append(lap_times_from_trace(tr))
     return traces, lap_times, stats

@@ -23,10 +23,12 @@ from .track import EdgeTable, LineTable, LookaheadTable
 
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
+BRAKE_ON = 0.1  # behaviour metric: the brake counts as applied from here
 GEARBOX_ACTIONS = {"auto": (), "agent": ("shift",), "points": ("shift_up", "shift_down")}  # extra actions
 # Per-episode behaviour means in info["stats"], logged as behavior/* and eval/behavior/*.
 BEHAVIOR_STATS = ("steer_delta", "steer_requested", "steer_reversal_frac", "steer_limit_frac", "steer_lock_frac",
-                  "steer_abs", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac", "line_dev", "abs_offset")
+                  "steer_abs", "pedal_delta", "throttle_delta", "brake_delta", "brake_frac", "brake_onsets_per_s", "offtrack_frac",
+                  "mean_speed", "full_throttle_frac", "line_dev", "abs_offset")
 
 
 class SpeedDreamsVecEnv(VectorEnv):
@@ -107,6 +109,11 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._at_lock = np.zeros(n, np.int64)
         self._steer_sum = np.zeros(n, np.float64)
         self._dpedal = np.zeros(n, np.float64)
+        self._prev_pedals = np.zeros((n, 2), np.float64)  # throttle, brake, in physical units [0, 1]
+        self._dpedals = np.zeros((n, 2), np.float64)
+        self._braking = np.zeros(n, bool)
+        self._brake_steps = np.zeros(n, np.int64)
+        self._brake_onsets = np.zeros(n, np.int64)
         self._linedev = np.zeros(n, np.float64)
         self._absoff = np.zeros(n, np.float64)
         self._off = np.zeros(n, np.int64)
@@ -243,6 +250,9 @@ class SpeedDreamsVecEnv(VectorEnv):
     def _clear(self, idx, now):
         """Start envs idx's next episode in all per-episode state (controls are 0 on the first observation)."""
         self._prev_action[idx] = 0
+        self._prev_pedals[idx] = self._dpedals[idx] = 0
+        self._braking[idx] = False
+        self._brake_steps[idx] = self._brake_onsets[idx] = 0
         self._steer_hist[idx] = 0
         self._shift_wait[idx] = 0
         self._gear_prev[idx] = self._rpm_prev[idx] = 0
@@ -287,6 +297,13 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._steer_sum += np.abs(self.applied[:, 0])
         self._dpedal += np.abs(self.applied[:, 1] - self._prev_action[:, 1])
         self._full += self._act[:, A["accel"]] >= FULL_THROTTLE
+        pedals = self._act[:, [A["accel"], A["brake"]]].astype(np.float64)
+        self._dpedals += np.abs(pedals - self._prev_pedals)
+        self._prev_pedals[:] = pedals
+        braking = pedals[:, 1] >= BRAKE_ON
+        self._brake_steps += braking
+        self._brake_onsets += braking & ~self._braking
+        self._braking[:] = braking
         self._prev_action[:] = self.applied
 
         raw = self._raw
@@ -341,6 +358,10 @@ class SpeedDreamsVecEnv(VectorEnv):
             "steer_lock_frac": at_end(self._at_lock / steps),     # steering command at +-1
             "steer_abs": at_end(self._steer_sum / steps),
             "pedal_delta": at_end(self._dpedal / steps),
+            "throttle_delta": at_end(self._dpedals[:, 0] / steps),  # physical throttle and brake, in any pedal mode
+            "brake_delta": at_end(self._dpedals[:, 1] / steps),
+            "brake_frac": at_end(self._brake_steps / steps),        # brake at BRAKE_ON or more
+            "brake_onsets_per_s": at_end(self._brake_onsets / (steps * self.cfg.step_seconds)),
             "line_dev": at_end(self._linedev / steps),
             "abs_offset": at_end(self._absoff / steps),
             "offtrack_frac": at_end(self._off / steps),

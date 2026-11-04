@@ -53,7 +53,7 @@ Each run gets the full `EnvConfig` and the algorithm hyperparameters as params, 
 | Section | Metrics |
 |---|---|
 | `dashboard/` | Watch these for the whole run. Evals: `{train,heldout}_{completion,progress,gap_pct}`, `heldout_flying_lap_tracks`, `score_smoothed`. Training: `rollout_{progress,reward,steer_delta,off_track,crashed}`, `ppo_{approx_kl,entropy,explained_variance}`, `steps_per_s` |
-| `driving/` | Training episodes: `steer_{reversal_frac,limit_frac,lock_frac,abs}`, `pedal_delta`, `offtrack_frac`, `mean_speed`, `full_throttle_frac`, `line_dev`, `abs_offset` |
+| `driving/` | Training episodes: `steer_{reversal_frac,limit_frac,lock_frac,abs}`, `pedal_delta`, `throttle_delta`, `brake_delta`, `brake_frac`, `brake_onsets_per_s`, `offtrack_frac`, `mean_speed`, `full_throttle_frac`, `line_dev`, `abs_offset` |
 | `eval/` | First training track: `flying_lap_time_{best,median}`, `driving/*`. All tracks: `{train,heldout}_{line_dev,abs_offset}`, `train_flying_lap_tracks`, `score` |
 | `track_progress/`, `track_gap_pct/`, `track_fail_dist/` | One folder per metric, one chart per track. `gap_pct`: median flying lap vs the bot's best, in %. `fail_dist`: median position along the lap (m) where failed eval episodes ended |
 | `reward/` | Per-episode components with a non-zero weight |
@@ -67,7 +67,7 @@ Runs before this layout used other names (`eval_track/<t>/*`, `eval_train/*`, `e
 - **Evaluation** (`evaluate.py`, `EvalCallback`) uses the deterministic policy, `--eval-episodes` envs, and episodes ending after `--eval-laps` laps. The sim is deterministic, so identical episodes would add nothing. Episode 0 runs clean; the others get small action noise during the first second only, so completion rate and median lap time measure robustness. Lap times include the standing-start lap 1, and so do the bot's.
 - **Bot reference** (`reference.py`): `rlpilot-worker -o <prefix>` (trace mode, no client) runs `data/raceman/rlref.xml`, which is the rlpilot race with simplix driving. It records 3 laps every 20 ms plus the track borders. The result is cached in `reference/`, keyed on the race file content. On Jarama the bot runs 111.6 s, then 107.4 s and 107.4 s. Simplix uses its own car setup; the agent uses the default one.
 - **Termination groups:** `off_track` = all wheels off for 1 s. `stuck_crashed` = stuck, backwards, damage, or race ended by the engine. `timeout` = `max_episode_seconds`. `lap_done` = `laps_per_episode` reached; this counts as terminated and gets no penalty.
-- **Behaviour definitions:** `steer_delta` = mean |Δsteer| per step, in action units. `offtrack_frac` = fraction of steps with ≥ 2 wheels off the road. `full_throttle_frac` = accel ≥ 0.95.
+- **Behaviour definitions:** `steer_delta` = mean |Δsteer| per step, in action units. `offtrack_frac` = fraction of steps with ≥ 2 wheels off the road. `full_throttle_frac` = accel ≥ 0.95. `throttle_delta` and `brake_delta` = mean |change| per step of the physical controls in [0, 1]. `brake_frac` = fraction of steps with brake ≥ 0.1, and `brake_onsets_per_s` counts crossings of it per second. Traces also have `throttle` and `brake`.
 
 ## Training notes
 

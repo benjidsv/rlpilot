@@ -7,6 +7,7 @@ dashboard/         what to watch over a whole run, and only here:
   rollout_{progress,reward,steer_delta,off_track,crashed}   training episodes; off_track, crashed: how they end (fractions)
   ppo_{approx_kl,entropy,explained_variance}, steps_per_s
 driving/           training episodes: {steer_reversal_frac,steer_limit_frac,steer_lock_frac,steer_abs,pedal_delta,
+                   throttle_delta,brake_delta,brake_frac,brake_onsets_per_s,
                    offtrack_frac,mean_speed,full_throttle_frac,line_dev,abs_offset}
                    (line_dev: m from the bot's line; abs_offset: mean |to_middle| / half width, 0 = centre, 1 = edge)
 eval/              {flying_lap_time_best,flying_lap_time_median,driving/*}: the first training track only
@@ -59,11 +60,13 @@ SCORE_GAP_WEIGHT = 0.02  # score per % of pace: 5% is worth 0.1 of a track's com
 SCORE_GAP_CAP = 10.0     # %, also what a track without a flying lap counts as
 
 _REWARD_WEIGHT = {"steer": "steer_rate", "line": "line_shaping"}  # reward component -> RewardConfig field, where they differ
-DRIVING_STATS = ("steer_reversal_frac", "steer_limit_frac", "steer_lock_frac", "steer_abs", "pedal_delta", "offtrack_frac",
+DRIVING_STATS = ("steer_reversal_frac", "steer_limit_frac", "steer_lock_frac", "steer_abs", "pedal_delta", "throttle_delta",
+                 "brake_delta", "brake_frac", "brake_onsets_per_s", "offtrack_frac",
                  "mean_speed", "full_throttle_frac", "line_dev", "abs_offset")
 EARLY_FAILURE_SECONDS = 3.0
 FAILURE_BIN_METRES = 50
-EVAL_DRIVING_STATS = ("steer_delta", "steer_reversal_frac", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac")
+EVAL_DRIVING_STATS = ("steer_delta", "steer_reversal_frac", "pedal_delta", "throttle_delta", "brake_delta", "brake_frac",
+                      "brake_onsets_per_s", "offtrack_frac", "mean_speed", "full_throttle_frac")
 
 
 def track_score(m: dict[str, float], bot_lap: float, laps: int) -> float:

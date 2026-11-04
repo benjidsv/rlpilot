@@ -108,6 +108,9 @@ def main():
     p.add_argument("--gamma", type=float, default=0.995,
                    help="discount per agent step: the horizon is ~1/(1-gamma) steps, e.g. 0.99 at 25 Hz = 4 s, "
                         "0.995 = 8 s (proto-4 braked too late for Spa's Bus Stop, ~4.2 s out at 0.99)")
+    p.add_argument("--gae-lambda", type=float, default=0.95,
+                   help="PPO: GAE lambda. With gamma, advantages look ~1/(1 - gamma x lambda) steps ahead: 0.95 at 0.995 = 0.73 s at 25 Hz, "
+                        "0.98 = 1.6 s, 0.99 = 2.7 s")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decays to 10%% of --lr at the end of training")
@@ -115,6 +118,8 @@ def main():
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--no-report", action="store_true", help="don't run scripts/report.py when training ends (PPO only)")
     a = p.parse_args()
+    if not 0 <= a.gae_lambda <= 1:
+        p.error("--gae-lambda must be in [0, 1]")
 
     if a.split == "proto7":
         if a.tracks != p.get_default("tracks") or a.heldout_tracks or a.eval_train_tracks:
@@ -134,7 +139,7 @@ def main():
                     car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
     lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
     algo_kwargs = {
-        "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=0.95,
+        "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=a.gae_lambda,
                     learning_rate=lr, ent_coef=a.ent_coef, clip_range=0.2, target_kl=a.target_kl or None,
                     policy_kwargs=dict(net_arch=[256, 256])),
         "sac": dict(gamma=a.gamma, buffer_size=1_000_000, batch_size=256, learning_starts=10_000, train_freq=1,

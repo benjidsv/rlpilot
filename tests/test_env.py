@@ -649,3 +649,26 @@ def test_a_launched_episodes_stats_say_so():
         assert s["progress"][0] >= 0
     finally:
         env.close()
+
+
+def test_throttle_and_brake_metrics_match_a_scripted_pedal():
+    env = _launch_env(max_episode_seconds=0.24)  # 6 steps
+    try:
+        env.reset()
+        pedals = [0.5, 0.5, -0.5, -0.05, -0.4, 0.2]
+        for p in pedals:
+            _, _, term, trunc, info = env.step(np.array([[0, p, 0, 0]], np.float32))
+        assert trunc[0] and not term[0]
+        st = info["stats"]
+        n = len(pedals)
+        assert st["throttle_delta"][0] == pytest.approx((0.5 + 0 + 0.5 + 0 + 0 + 0.2) / n)
+        assert st["brake_delta"][0] == pytest.approx((0 + 0 + 0.5 + 0.45 + 0.35 + 0.4) / n)
+        assert st["brake_frac"][0] == pytest.approx(2 / n)                 # -0.05 is below BRAKE_ON
+        assert st["brake_onsets_per_s"][0] == pytest.approx(2 / (n * 0.04))  # applied twice
+        env.reset()  # a new episode starts from clean counters, with the pedals at 0
+        for _ in range(n):
+            _, _, _, _, info = env.step(np.array([[0, 0.25, 0, 0]], np.float32))
+        assert info["stats"]["throttle_delta"][0] == pytest.approx(0.25 / n)
+        assert info["stats"]["brake_frac"][0] == 0 and info["stats"]["brake_onsets_per_s"][0] == 0
+    finally:
+        env.close()

@@ -8,7 +8,7 @@ Experiment log and plans. How the code works belongs in [gym-wrapper.md](gym-wra
 
 ## Status (2026-11-04)
 
-proto-7 is finished (300M). Random launches are **implemented and smoke-tested, not yet compared**: see "Random launches instead of mistake learning" at the end, which has the commands for the two fine-tunes. Deferred code fixes are listed under "Open items from the code review".
+proto-7 is finished (300M), and random launches have been compared in a fine-tune (validation 0.25 -> 0.53, 2 of 7 stuck tracks cleared, in between on the pre-set criterion): see "Random launches instead of mistake learning". Next is proto-8, the full run: proto-7's flags plus `--launch-share 0.7`, with proto-7 as control. The test split is unspent. Deferred code fixes are listed under "Open items from the code review".
 
 ## proto-6 probes and proto-6.5
 
@@ -251,7 +251,7 @@ None of these affects the proto-7 launch command. They wait for the change that 
 - [ ] **Paused workers keep advancing (`vec_env.py`, `step`).** A paused env keeps its physics, but `_len`, the reward timers and the episode stats still advance, and `applied` and `_prev_action` take the paused env's pedal and shift actions (only steering is restored). Paused for 60 steps with a limit of 50, an env truncated on its first resumed step, after one simulated step. Today's only caller, `rollout`, never resumes before the next reset. **Fix before** anything resumes a paused env, such as mistake-spawn sampling: mask every per-env update with `active`.
 - [ ] **`--seed` doesn't reach the car draws (`vec_env.py`, `reset`; `sb3.py`, `SB3VecEnv.reset`).** Car and track draws use `_rng = default_rng(0)`, so `reset(seed=42)` twice gives different cars (grip 1.02739, then 0.90331), SB3's queued seeds are dropped, and all `--seed` values start the same stream of draws. Runs are still reproducible, and nothing calls `reset` with a seed. **Fix before** drawing conclusions from a multi-seed comparison. Reseed `_rng` only when a seed is given, and forward SB3's `_seeds[0]`. Don't switch to `self.np_random`: unseeded, it should draw from OS entropy, and unseeded runs would stop being reproducible.
 - [ ] **`separate_pedals=True` metrics ignore the brake (`vec_env.py`, `pedal_delta`; `evaluate.py`, traces).** `pedal_delta` and the trace's `pedal` read column 1, which is throttle in this mode. No script or test sets this option, and there is no CLI flag, so no run is affected: the single signed pedal already counts braking. **Fix or delete** the option if it comes back.
-- [ ] **Separate throttle and brake metrics (optional).** Not a bug. Traces have no brake channel in either mode, and proto-7's next suspect is jerky pedals (see "Pedals" above). Reading `_act[:, A["accel"]]` and `_act[:, A["brake"]]` would give both in physical units, in both modes. **Add if** the run comes out smooth in steering and jerky on the pedals.
+- [x] **Separate throttle and brake metrics.** Added for proto-8: `throttle_delta`, `brake_delta`, `brake_frac`, `brake_onsets_per_s`, and `throttle` and `brake` in traces, in physical units in both pedal modes.
 - [ ] **Eval docstring (`evaluate.py`, `eval_config`).** It says one reset per eval, but there are two: the autoreset at the end of an episode, and `env.reset()` at the next eval. proto-7 is fine: 38 evals cost ~0.9 GB over the 80 workers. Eval workers are never recycled, so **recheck** if evals get much more frequent.
 - [ ] **Removing the 256-worker limit itself (`client.c`, `rlp_exchange`).** It is only rejected for now, in `Client.__init__`. `scripts/bench_env.py` and anything else going through `Client` are covered, but `bench.c` calls the library directly. **Remove** the fixed `want[256]` if a machine ever runs that many workers.
 
@@ -307,3 +307,42 @@ caffeinate -is .venv/bin/python scripts/train_sb3.py $F --launch-share 0.7 --run
 - **Spa:** 0.20 -> 0.90, and Hidden Valley 0.20 -> 0.60. Spa flipped throughout the control, so read it with care.
 - **Pace unchanged:** -5.54% vs -5.61% on the 24 training tracks with a flying lap in both. **Worse:** Racepark3 0.80 -> 0.40; São Paulo, Inuksuk, e-track-4 and Torino lose 0.2.
 - **What this can't say:** the same-window gain is small, and without a control past 21.9M the later gain can't be split from more fine-tuning. Practice alone didn't clear three training tracks: Longjour, Kurpfalzring and Ole-road-1 are among the top launch-failure spots in `tracks/failures.csv`, under a low learning rate near the KL cutoff.
+
+## Before proto-8: pedals and the critic (2026-11-04)
+
+**Pedals aren't jerky.** `proto-7-launch` final checkpoint, deterministic evals on 35 tracks (2 episodes, 2 laps, crashes included), against the bot's best lap on the same tracks. The bot is logged at 50 Hz and the agent at 25 Hz, so changes are per second; the higher rate may inflate the bot's a little.
+
+| | Agent | Bot |
+|---|---:|---:|
+| Throttle change per s | 0.49 | 2.54 |
+| Brake change per s | 0.31 | 0.62 |
+| Brake applications per s | 0.25 | 0.58 |
+| Share of time braking (brake >= 0.1) | 13% | 24% |
+| Share of time at full throttle | 66% | 54% |
+
+**Does the critic foresee crashes?** `--gae-lambda` is now a flag, default 0.95 as in every run so far. Probe: stochastic policy, 70 workers x 30k steps on 29 train + 6 validation tracks, stock car, on `proto-7-launch` final and proto-7 at 300M and 16M. Lag is measured back from where the car left the road. AUC = how often V is lower on a pass that crashes than on a surviving pass of the same 50 m bin, excluding each episode's first 10 s. Scripts not kept.
+
+Criterion, fixed before results, at 2 and 3 s: adequate = AUC >= 0.75 and within 0.05 of the speed AUC; blind (lambda suspect) = AUC < 0.6 with speed AUC >= 0.7; otherwise in between.
+
+| Checkpoint | Train, 2 s | Train, 3 s | Validation, 2 s | Validation, 3 s |
+|---|---:|---:|---:|---:|
+| proto-7-launch 50M | 0.87 [0.76, 0.93] | 0.80 [0.68, 0.89] | 0.71 [0.20, 0.87] | 0.36 [0.11, 0.60] |
+| proto-7 300M | 0.77 [0.52, 0.95] | 0.74 [0.48, 0.92] | 0.74 [0.50, 0.97] | 0.67 [0.43, 0.92] |
+| proto-7 16M | 0.91 [0.88, 0.96] | 0.64 [0.51, 0.80] | 0.49 [0.26, 0.98] | 0.69 [0.49, 0.97] |
+
+(95% bootstrap over bins. Train: 10-20 tracks. Validation: only 3-4 tracks and 7-12 bins, because nearly every pass dies at the same corners.)
+
+No cell meets "blind". On train the critic sees crashes about 2 s out and is borderline at 3 s. Validation is too thin to call. Speed at the same spot doesn't predict a crash 1-2 s out (AUC 0.03-0.54), so the overspeed measured against the bot isn't overspeed against this policy's own surviving passes.
+
+Mean advantage just before a crash, in units of its std in ordinary driving (train; validation is larger):
+
+| Time before leaving the road | lambda 0.95 | 0.98 | 0.99 |
+|---:|---:|---:|---:|
+| 1 s | -2.2 to -2.5 | -2.8 to -3.1 | -2.8 to -3.3 |
+| 2 s | -2.0 to -2.6 | -3.0 to -3.6 | -3.3 to -3.7 |
+| 3 s | -1.0 to -1.6 | -2.1 to -2.9 | -2.7 to -3.5 |
+| 4 s | -0.9 to -1.5 | -2.1 to -2.3 | -2.8 to -3.0 |
+
+So 0.98 carries about 1.5-2.3x the crash signal at 3-4 s, even after its extra variance. What this can't say: episodes are selected for crashing, these critics were trained at 0.95, and a bigger signal doesn't show that the action taken then caused the crash. It justifies trying 0.98; it doesn't show 0.95 is the limit. Also, V stays ~0.9 above the realized return at 2-3 s (one crash penalty is 0.98), but conditioning on a crash inflates that, so it isn't a calibration measure.
+
+**Plan:** proto-8 with launches only, at lambda 0.95. Then the same run with `--gae-lambda 0.98` if it doesn't settle the lethal corners.
