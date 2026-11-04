@@ -14,13 +14,16 @@ eval/              {flying_lap_time_best,flying_lap_time_median,driving/*}: the 
 obs/               <group>: largest |value| the policy received, nonfinite, dead_slots. Every 1M steps; min, max, abs_mean
                    and std per group are in the artifact obs_stats.csv
 perf/              {env_steps_per_s,reset_share,tracks_covered,min_track_samples} (worst update since the last log)
+launch/            with --launch-share: {share (of samples), episode_seconds, progress (laps), mean_speed, early_failure_frac}
+                   of launched episodes; early: failed within EARLY_FAILURE_SECONDS, which a launch itself may have caused
 ppo/               {clip_fraction,value_loss,policy_gradient_loss,learning_rate,std_<action>}
 reward/<component> per-episode, only the components with a non-zero weight (the total is on the dashboard)
 track_progress/<track>, track_gap_pct/<track>, track_fail_dist/<track>   one folder per metric, one chart per track.
                    fail_dist: median position along the lap (m) where failed eval episodes ended
 Artifacts:
   eval/<timesteps>/{track_map.png,speed_vs_distance.png,traces.npz}, tracks/assignment_{start,end}.json (worker -> race),
-  tracks/bot_abs_offset.json, best/ (model + VecNormalize stats of the best eval in the best window of 3 evals),
+  tracks/bot_abs_offset.json, tracks/failures.csv (failed training episodes per track, start mode and 50 m of lap),
+  best/ (model + VecNormalize stats of the best eval in the best window of 3 evals),
   checkpoints/<timesteps>/
 Nothing here runs per env step. summarize() computes more than is logged: scripts and the score read the rest.
 """
@@ -32,7 +35,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -58,6 +61,8 @@ SCORE_GAP_CAP = 10.0     # %, also what a track without a flying lap counts as
 _REWARD_WEIGHT = {"steer": "steer_rate", "line": "line_shaping"}  # reward component -> RewardConfig field, where they differ
 DRIVING_STATS = ("steer_reversal_frac", "steer_limit_frac", "steer_lock_frac", "steer_abs", "pedal_delta", "offtrack_frac",
                  "mean_speed", "full_throttle_frac", "line_dev", "abs_offset")
+EARLY_FAILURE_SECONDS = 3.0
+FAILURE_BIN_METRES = 50
 EVAL_DRIVING_STATS = ("steer_delta", "steer_reversal_frac", "pedal_delta", "offtrack_frac", "mean_speed", "full_throttle_frac")
 
 
@@ -172,6 +177,9 @@ class TrainingMetricsCallback(BaseCallback):
         super().__init__()
         self.every, self.buf = every, deque(maxlen=window)
         self._last = 0
+        self.launched = deque(maxlen=window)  # the same for launched episodes; buf only has grid starts, as in earlier runs
+        self._failures: Counter[tuple[int, int, int]] = Counter()  # (track index, launched, bin along the lap) -> episodes
+        self._failures_logged = 0
 
     def _on_training_start(self):
         _, self._sb3env = _base_env(self.training_env)
@@ -194,11 +202,21 @@ class TrainingMetricsCallback(BaseCallback):
 
     def _on_training_end(self):
         self._log_assignment(_base_env(self.training_env)[0], "end")
+        self._log_failures()
+
+    def _log_failures(self) -> None:
+        races = _base_env(self.training_env)[0].races
+        rows = [f"{track_of(races[t])},{'launch' if launched else 'grid'},{b * FAILURE_BIN_METRES},{n}"
+                for (t, launched, b), n in sorted(self._failures.items())]
+        mlflow.log_text("\n".join(["track,start,dist_m,episodes", *rows]) + "\n", "tracks/failures.csv")
 
     def _on_step(self) -> bool:
         for info in self.locals["infos"]:
             if "stats" in info:
-                self.buf.append(info["stats"])
+                s = info["stats"]
+                (self.launched if s["launched"] else self.buf).append(s)
+                if END_GROUPS[s["end"]] in ("off_track", "stuck_crashed"):
+                    self._failures[(int(s["track"]), int(s["launched"]), int(s["end_dist"] // FAILURE_BIN_METRES))] += 1
         if self.num_timesteps - self._last >= self.every:
             self._last = self.num_timesteps
             self._log()
@@ -221,6 +239,19 @@ class TrainingMetricsCallback(BaseCallback):
                 m[f"driving/{k}"] = float(np.mean([s[k] for s in b]))
             self.buf.clear()
         env, sb3env = _base_env(self.training_env)
+        if env.cfg.launch_share > 0:
+            m["launch/share"] = float(env._launch_steps.sum() / max(env._mode_steps.sum(), 1))
+            if self.launched:
+                b = list(self.launched)
+                m["launch/episode_seconds"] = float(np.mean([s["seconds"] for s in b]))
+                m["launch/progress"] = float(np.mean([s["progress"] for s in b]))
+                m["launch/mean_speed"] = float(np.mean([s["mean_speed"] for s in b]))
+                m["launch/early_failure_frac"] = float(np.mean(
+                    [END_GROUPS[s["end"]] in ("off_track", "stuck_crashed") and s["seconds"] < EARLY_FAILURE_SECONDS for s in b]))
+                self.launched.clear()
+        if self._failures and self.num_timesteps - self._failures_logged >= 5_000_000:
+            self._failures_logged = self.num_timesteps
+            self._log_failures()
         if self._tracks:
             samples = np.stack(self._tracks)
             self._tracks.clear()

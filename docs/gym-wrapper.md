@@ -191,6 +191,18 @@ Yes, 30 points resolve it: from the bot's braking point at 229 km/h, 7 points fa
 - **Metrics:** `dashboard/rollout_steer_delta` (applied change), `driving/{steer_reversal_frac,steer_limit_frac,steer_lock_frac,steer_abs}` (limit: action saturated), `eval/driving/steer_{delta,reversal_frac}`. `perf/{tracks_covered,min_track_samples}` and the artifacts `tracks/assignment_{start,end}.json`. `obs/<group>`, `obs/{nonfinite,dead_slots}` and the artifact `obs_stats.csv`, from the rollout buffer every 1M steps: what the policy really received.
 - **Progress ignores lap-sized jumps.** The engine's `dist_raced` jumps a lap when a car crosses the start line backwards, and a policy learned to farm that. See [research-notes-proto7.md](research-notes-proto7.md).
 
+## Random launches
+
+`--launch-share x` (`EnvConfig.launch_share`): x of each worker's training samples come from episodes that start anywhere on the lap, the rest from the grid. Evals and the run report always use the grid.
+
+- **Draw:** position uniform along the lap, lateral uniform over the middle 80% of the road, heading within 0.1 rad of the track direction, speed uniform in 0-29 m/s (`launch_lateral`, `launch_yaw`, `launch_speed`, `--launch-max-speed`). Steering starts at 0.
+- **Mode:** each worker picks at reset whichever mode is behind its own target, counted in samples, so every track gets both and long episodes count for what they hold. It converges slowly, because one surviving episode holds up to 7,500 samples: `launch/share` was 0.65 after 3M steps at a target of 0.7.
+- **How it reaches the engine:** four action slots (`RLP_A_LAUNCH_*`, protocol v5, 0 = grid), read when a race starts, like the car factors. A reset restarts the race even if it is fresh when they changed. The fork's `initStartingGrid` asks the worker through `dlsym("rlp_launch")`.
+- **Speed:** the car settles at rest like any other through the engine's 1 s settle and the 2 s pre-start, so the suspension is settled. The simulator applies the speed on the last pre-start tick, rotated into the world frame and with the wheels rolling, and the worker holds a gear for the speed (`launchGear`). The upstream `initial speed` setting only works at yaw 0, because `SimConfig` copies the car-frame velocity into the world-frame one. Don't test for the start with `_raceState`: it is 0 through the settle while `currentTime` is stale.
+- **Reward:** `raced` starts at 0 on a launch, as the engine's `dist_raced` is about minus a lap until the first crossing, and `laps` starts at 0. Lap-sized jumps are still removed, so crossing the line is safe.
+- **Transient:** the engine catches up with the wheels in the first steps, costing ~0.5 m/s at 29 m/s and ~1.5 m/s at 10 m/s, in first gear with wheels briefly dragging. No restored engine state: that is the simplification.
+- **Metrics:** `launch/*`; `dashboard/rollout_*`, `driving/*` and `reward/*` hold grid episodes only, comparable with earlier runs; `tracks/failures.csv` counts failed training episodes per track, start mode and 50 m of lap.
+
 ## Splits
 
 `splits.py`: 29 train / 6 validation (select checkpoints) / 6 test. `--split proto7` sets the track flags and can't be combined with them. `scripts/eval_test_tracks.py <run id>` runs a run's final `best/` on the test tracks, with the config rebuilt from its logged params, logs `test/*` to the run and refuses a second run; `--dry-run-tracks` checks the script without spending the test set.

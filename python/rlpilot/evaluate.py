@@ -29,7 +29,7 @@ def eval_config(cfg: EnvConfig, races: tuple[str, ...], episodes: int, laps: int
     """The env of an evaluation: `episodes` workers per race, all at once (worker i on race i % n), on the stock car (factor
     observations, if any, read 0). Workers never change track, and with one reset per eval, recycling isn't needed."""
     return dataclasses.replace(cfg, n_workers=episodes * len(races), laps_per_episode=laps, run_dir=None, race=races[0],
-                               races=races if len(races) > 1 else (), track_switch_steps=0, recycle_resets=2**62,
+                               races=races if len(races) > 1 else (), track_switch_steps=0, recycle_resets=2**62, launch_share=0.0,
                                car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
 
 

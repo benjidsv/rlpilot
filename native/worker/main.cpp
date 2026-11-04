@@ -67,6 +67,7 @@ struct Host
     double last_tick_time = -1e9;
     double last_shift[RLP_MAX_CARS]; // race time of each slot's last shift (SHIFT_POINTS gearbox)
     float car_factors[RLP_MAX_CARS][3] = {}; // grip, mass, power applied to each slot's car in this race
+    float launch[RLP_MAX_CARS][4] = {};      // RLP_A_LAUNCH_* applied to each slot's car in this race
     uint64_t tick = 0;
     uint64_t sim_t0 = 0;
     FILE *record = nullptr;     // RLP_RECORD_CONTROLS: car controls of the first episode, per robot tick
@@ -176,7 +177,7 @@ void publish()
     rlp_signal(&H.w->done_sync, H.last_cmd_seq);
 }
 
-bool carFactorsChanged();
+bool raceSetupChanged();
 int slotOf(int index);
 
 // Publish observations, then block until a command we must act on arrives.
@@ -198,7 +199,7 @@ void decide()
             H.quit = true;
             break;
         }
-        if (cmd == RLP_CMD_RESET && (!H.fresh || carFactorsChanged())) {
+        if (cmd == RLP_CMD_RESET && (!H.fresh || raceSetupChanged())) {
             H.reset_requested = true;
             H.hold = true;
             break;
@@ -271,6 +272,18 @@ int shiftPointGear(int k, tCarElt *car, float up, float down)
 
 float clampf(float v, float lo, float hi) { return std::isfinite(v) ? std::min(hi, std::max(lo, v)) : 0; }
 
+// The gear for the launch speed: the highest one that doesn't drop the engine below kLaunchRev of the redline, first
+// when even first gear is below it. On the grid (no launch speed) it is first.
+int launchGear(int k, tCarElt *car)
+{
+    const float kLaunchRev = 0.5f;
+    float spin = H.launch[k][3] / car->_wheelRadius(2), red = car->_enginerpmRedLine;
+    int gear = 1;
+    while (gear + car->_gearOffset + 1 < car->_gearNb && spin * car->_gearRatio[gear + car->_gearOffset + 1] >= kLaunchRev * red)
+        gear++;
+    return gear;
+}
+
 void applyAction(int k, tCarElt *car)
 {
     tCarCtrl &c = car->ctrl;
@@ -279,7 +292,7 @@ void applyAction(int k, tCarElt *car)
         c.accelCmd = 0;
         c.brakeCmd = 1;
         c.clutchCmd = 1;
-        c.gear = 1;
+        c.gear = launchGear(k, car);
         return;
     }
     const float *a = rlp_act_at(H.shm, H.wid, k);
@@ -310,12 +323,15 @@ void requestedFactors(uint32_t k, float out[3])
     }
 }
 
-bool carFactorsChanged()
+// Car factors or launch differ from those of the running race: a RESET must restart it, even if it is fresh.
+bool raceSetupChanged()
 {
     for (uint32_t k = 0; k < H.n_slots; k++) {
         float f[3];
         requestedFactors(k, f);
         if (f[0] != H.car_factors[k][0] || f[1] != H.car_factors[k][1] || f[2] != H.car_factors[k][2])
+            return true;
+        if (memcmp(rlp_act_at(H.shm, H.wid, k) + RLP_A_LAUNCH_POS, H.launch[k], sizeof H.launch[k]))
             return true;
     }
     return false;
@@ -515,6 +531,24 @@ int runTrace(const std::string &prefix, int laps)
 }
 
 } // namespace
+
+// Called by the race engine as it places each car (see initStartingGrid, in the engine's raceinit.cpp).
+extern "C" __attribute__((visibility("default"))) bool rlp_launch(const tCarElt *car, float *lapFraction, float *toRightFraction,
+                                                                  float *yawOffset, float *speed)
+{
+    if (!H.shm || car->_driverIndex < 0 || car->_driverIndex >= 256 || H.slot_of[car->_driverIndex] < 0)
+        return false;
+    const int k = H.slot_of[car->_driverIndex];
+    const float *a = rlp_act_at(H.shm, H.wid, k) + RLP_A_LAUNCH_POS;
+    std::copy(a, a + 4, H.launch[k]);
+    if (!(a[0] > 0 && a[0] < 1)) // also not NaN
+        return false;
+    *lapFraction = a[0];
+    *toRightFraction = a[1];
+    *yawOffset = a[2];
+    *speed = a[3];
+    return true;
+}
 
 extern "C" __attribute__((visibility("default"))) rlp_host_api rlp_host = {
     RLP_HOST_API_VERSION, hostNewTrack, hostNewRace, hostDrive, hostEndRace};

@@ -43,7 +43,9 @@ class SpeedDreamsVecEnv(VectorEnv):
             raise ValueError("steer_limit must be in (0, 1]")
         if cfg.steer_history and cfg.steer_limit is None:
             raise ValueError("steer_history needs steer_limit: its values are normalized by the limit")
-        self._rng = np.random.default_rng(0)  # track and car draws (the sim itself is deterministic)
+        if not 0 <= cfg.launch_share <= 1:
+            raise ValueError("launch_share must be in [0, 1]")
+        self._rng = np.random.default_rng(0)  # track, car and launch draws (the sim itself is deterministic)
         self.client = Client(n, n_cars=1, frame_skip=cfg.frame_skip, gearbox=cfg.gearbox, spin_us=cfg.spin_us,
                              race=[self.races[i % len(self.races)] for i in range(n)], run_dir=cfg.run_dir,
                              deterministic=cfg.deterministic)
@@ -65,6 +67,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.act_dim = len(self.action_names)
         self._car_ranges = np.array([getattr(cfg, f) for f in CAR_FACTORS], np.float32)  # [3, (lo, hi)]
         self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
+        self._launched = np.zeros(n, bool)  # the current episode started from a random launch
+        self._launch_steps = np.zeros(n, np.int64)  # agent steps driven in launched episodes, per worker
+        self._mode_steps = np.zeros(n, np.int64)    # and in all episodes, while launches are on
         self.obs_layout = features.make_layout(self.action_names, self._look.n_features if self._look is not None else 0,
                                                len(self._line.points) if cfg.line_obs else 0, cfg.car_obs,
                                                cfg.steer_history, cfg.edge_points)
@@ -111,8 +116,9 @@ class SpeedDreamsVecEnv(VectorEnv):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)  # the sim is deterministic; seed only feeds self.np_random
         self._draw_car(np.arange(self.num_envs))
+        self._draw_start(np.arange(self.num_envs))
         self.client.exchange(CMD_RESET)
-        self._rew.reset(self._raw, line_dev=self._line_dev())
+        self._start_rewards(slice(None))
         self._clear(slice(None), time.perf_counter())
         return self._observe(), {}
 
@@ -122,6 +128,29 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._car[idx] = self._rng.uniform(lo, hi, (len(idx), len(lo))) if (hi > lo).any() else lo
         a = A[CAR_FACTORS[0]]
         self._act[idx, a:a + len(CAR_FACTORS)] = self._car[idx]
+
+    def _draw_start(self, idx: np.ndarray) -> None:
+        """Where envs idx start their next episode; the workers apply it when these envs' races restart. Each env picks
+        the mode behind its target share of samples: per env, because envs ending on the same step would otherwise all
+        pick the same one, and by samples, because an episode that survives holds far more of them than one that crashes."""
+        cfg = self.cfg
+        if cfg.launch_share <= 0:
+            return
+        unstarted = self._mode_steps[idx] == 0  # no history yet: drawn, so that the envs don't all begin the same way
+        launch = np.where(unstarted, self._rng.random(len(idx)) < cfg.launch_share,
+                          self._launch_steps[idx] <= cfg.launch_share * self._mode_steps[idx])
+        self._launched[idx] = launch
+        k = len(idx)
+        half_range = 0.5 * cfg.launch_lateral
+        slots = np.stack([self._rng.uniform(1e-4, 1 - 1e-4, k), self._rng.uniform(0.5 - half_range, 0.5 + half_range, k),
+                          self._rng.uniform(-cfg.launch_yaw, cfg.launch_yaw, k), self._rng.uniform(*cfg.launch_speed, k)], 1)
+        self._act[idx, A["launch_pos"]:A["launch_speed"] + 1] = np.where(launch[:, None], slots, 0).astype(np.float32)
+
+    def _start_rewards(self, idx) -> None:
+        """Reward state of envs idx at their first observation. A launched car's distance raced counts from where it
+        starts: the engine's dist_raced there is about minus a lap, as it hasn't crossed the start line."""
+        self._rew.reset(self._raw, idx, self._line_dev(None if isinstance(idx, slice) else idx))
+        self._rew.raced[idx] = np.where(self._launched[idx], 0.0, self._rew.raced[idx])
 
     def set_time_limits(self, seconds: np.ndarray | None) -> None:
         """Per-env episode time limits (sim seconds, [n]); None restores cfg.max_episode_seconds for all."""
@@ -272,6 +301,10 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._ret += reward
         self._len += 1
         self._steps_on_track += 1
+        if self.cfg.launch_share > 0:
+            moving = 1 if active is None else active
+            self._mode_steps += moving
+            self._launch_steps += self._launched * moving
         truncated = (self._len >= self._max_steps) & ~terminated
         if active is not None:
             terminated &= active
@@ -297,6 +330,10 @@ class SpeedDreamsVecEnv(VectorEnv):
             "best_lap_time": at_end(_scatter(final_raw[:, F["best_lap_time"]], idx, n)),
             "damage": at_end(_scatter(final_raw[:, F["damage"]], idx, n)),
             "term_reason": reason.copy(),
+            "launched": at_end(self._launched.astype(np.float64)),
+            "track": at_end(self._race_index),                     # index in self.races
+            "end_dist": at_end(_scatter(final_raw[:, F["dist_from_start"]], idx, n)),  # m along the lap
+            "seconds": at_end(self._len * self.cfg.step_seconds),
             "steer_delta": at_end(self._dsteer / steps),          # applied change of the steering command, per step
             "steer_requested": at_end(self._dsteer_req / steps),  # what the policy asked for; differs at full lock
             "steer_reversal_frac": at_end(self._reversals / steps),
@@ -329,7 +366,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         recycle = idx[(since >= self.cfg.recycle_resets) | switch[idx]]
         self._cmds[:] = CMD_NONE
         self._cmds[idx] = CMD_RESET
-        self._draw_car(idx)  # before the reset / respawn, which applies them
+        self._draw_car(idx)  # before the reset / respawn, which apply them
+        self._draw_start(idx)
         self._cmds[recycle] = CMD_NONE
         if len(recycle) < len(idx):
             self.client.exchange(self._cmds)
@@ -340,7 +378,7 @@ class SpeedDreamsVecEnv(VectorEnv):
             self._assign_track(int(i), race)
             if switch[i]:
                 self._steps_on_track[i] = 0
-        self._rew.reset(self._raw, idx, self._line_dev(idx))
+        self._start_rewards(idx)
         self._clear(idx, now)
         obs[idx] = self._observe(idx)
         return obs, reward, terminated, truncated, info

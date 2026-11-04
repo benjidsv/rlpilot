@@ -6,9 +6,9 @@ Experiment log and plans. How the code works belongs in [gym-wrapper.md](gym-wra
 
 **True generalization.** Held-out completion comes first and pace second. Beating the bot is not the goal in itself, so per-track fine-tuning is out. Opponents wait until the car is fast and doesn't crash alone.
 
-## Status (2026-11-03)
+## Status (2026-11-04)
 
-proto-6.5 is finished. proto-7 is **implemented and smoke-tested, not yet run**. The launch command is at the end of "proto-7 implementation and smoke runs". The filter from proto-6.5 is gone. Deferred code fixes are listed under "Open items from the code review".
+proto-7 is finished (300M). Random launches are **implemented and smoke-tested, not yet compared**: see "Random launches instead of mistake learning" at the end, which has the commands for the two fine-tunes. Deferred code fixes are listed under "Open items from the code review".
 
 ## proto-6 probes and proto-6.5
 
@@ -254,3 +254,42 @@ None of these affects the proto-7 launch command. They wait for the change that 
 - [ ] **Separate throttle and brake metrics (optional).** Not a bug. Traces have no brake channel in either mode, and proto-7's next suspect is jerky pedals (see "Pedals" above). Reading `_act[:, A["accel"]]` and `_act[:, A["brake"]]` would give both in physical units, in both modes. **Add if** the run comes out smooth in steering and jerky on the pedals.
 - [ ] **Eval docstring (`evaluate.py`, `eval_config`).** It says one reset per eval, but there are two: the autoreset at the end of an episode, and `env.reset()` at the next eval. proto-7 is fine: 38 evals cost ~0.9 GB over the 80 workers. Eval workers are never recycled, so **recheck** if evals get much more frequent.
 - [ ] **Removing the 256-worker limit itself (`client.c`, `rlp_exchange`).** It is only rejected for now, in `Client.__init__`. `scripts/bench_env.py` and anything else going through `Client` are covered, but `bench.c` calls the library directly. **Remove** the fixed `want[256]` if a machine ever runs that many workers.
+
+## Random launches instead of mistake learning (2026-11-04)
+
+**Why.** proto-7's `best/` dies on lap 1 at fixed corners, on 9 of the 29 tracks it trains on, after ~10M samples each. A reset goes back to the grid, so corners late in a lap get few attempts and road past a lethal corner gets almost none. How it works: [gym-wrapper.md](gym-wrapper.md), "Random launches".
+
+**Decided with the user:** random launches and fixed shares first, without restoring snapshots of agent states, which are more complex and bug-prone. No evidence yet says mistakes add nothing: Nature used them at high-speed Sarthe and never isolates their effect, and Sony's later vision papers report random starts. If lethal corners stay, launch more often upstream of `tracks/failures.csv` clusters, which reuses this code; snapshots only after that.
+
+**Decisions on the design:**
+
+- **300 s episodes stay.** 150 s (Sony's) rules out flying laps from a standing start on the longer tracks: the median bot lap is 107 s, Longjour's 271 s.
+- **Speed isn't tied to the bot.** proto-7 is above the bot at 88% of corner apexes (median +13%, +12 km/h), so bot speed would cap below its normal driving. It doesn't need a model either, because launch speed washes out.
+
+**What was measured** (the proto-7 policies, which have never seen a launch):
+
+| Launch speed | Metres to within 10 km/h of its own flying-lap speed, held for 1 s (median, p95) | Crashed before that |
+|---:|---:|---:|
+| 0 m/s | 243, 740 | 0.7% |
+| 15 m/s | 231, 725 | 0.4% |
+| 29 m/s | 185, 723 | 5.0% |
+
+(`best/`, 280 launches per speed, on the 20 training tracks with a flying lap.) With launch speed uniform over 0-29 m/s, the final checkpoint on all 29 tracks: 1.8% of 112 episodes failed within 3 s, 3.6% within 10 s; 65% failed at some point, median episode 83 s.
+
+**Checks:** an exact fingerprint of grid-start physics (scripted controls, four tracks, positions, rewards and observations) is byte-identical before and after the engine and worker changes, and `test_env.py` checks placement, signs, determinism, grid after launches, line crossing, shares and recycling.
+
+**Smoke run** (`launch-smoke`, 3M steps, resumed from the final checkpoint, share 0.7, not a result): 11.4k steps/s, reset share 0.09%, workers peaked at 3.2 GB including the 80 for evals, no non-finite observation, 0.14% of launched episodes failed within 3 s. `tracks/failures.csv` already shows known corners (Karwada 5450 m, Kurpfalzring 3300 m, Braga 1800 m, Longjour 6150 m), and one no eval has reached: Longjour 13500 m.
+
+**Next: two fine-tunes, one after the other** (two at once would need ~18 GB), from proto-7's final checkpoint. Same settings; the second adds launches. Compare them on the same corners, and with the report's heatmap. ~1.5 h each.
+
+```sh
+C=mlruns/1/0d567d903d9e44509034d0c9b87d100a/artifacts/checkpoints/0300002100
+F="--split proto7 --workers 29 --n-steps 353 --gearbox points --lookahead --car-random 0.1 --car-obs --min-std 0.1 --max-std 0.5 --seed 1 \
+  --steer-limit 0.0625 --steer-history 3 --steer-rate 0 --steer-change 0.3 --steer-reversal 0.02 --edge-points 30 --recycle-resets 1000 \
+  --timesteps 50000000 --eval-every 4000000 --resume $C --lr 3e-5 --lr-schedule constant --target-kl 0.01"
+caffeinate -is .venv/bin/python scripts/train_sb3.py $F --run-name proto-7-control
+caffeinate -is .venv/bin/python scripts/train_sb3.py $F --launch-share 0.7 --run-name proto-7-launch
+```
+
+`--seed` doesn't reach the car and launch draws (see the open items), so one seed each is what this comparison has. The share of 0.7 and the speed range are starting points, not tuned. Don't spend the test split on either of them.
+

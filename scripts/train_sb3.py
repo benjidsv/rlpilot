@@ -83,6 +83,9 @@ def main():
                         "and step 0 is evaluated")
     p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
                    help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
+    p.add_argument("--launch-share", type=float, default=EnvConfig.launch_share,
+                   help="share of each worker's samples from episodes starting anywhere on the lap (0: grid only; eval: grid)")
+    p.add_argument("--launch-max-speed", type=float, default=EnvConfig.launch_speed[1], help="m/s, launch speed drawn from 0 to this")
     p.add_argument("--car-random", type=float, default=0.0,
                    help="per episode, draw tyre grip, mass and engine power factors in [1 - x, 1 + x] (eval: stock car)")
     p.add_argument("--car-obs", action="store_true", help="observe the car factors (else the policy must be robust)")
@@ -121,6 +124,7 @@ def main():
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
                     gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
                     track_switch_steps=a.track_switch_steps, recycle_resets=a.recycle_resets, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
+                    launch_share=a.launch_share, launch_speed=(0.0, a.launch_max_speed),
                     line_obs=a.line_obs, edge_points=a.edge_points, edge_horizon=a.edge_horizon, edge_floor=a.edge_floor,
                     steer_limit=a.steer_limit, steer_history=a.steer_history,
                     reward=RewardConfig(steer_rate=a.steer_rate, steer_change=a.steer_change,

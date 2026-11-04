@@ -85,6 +85,13 @@ class EnvConfig:
     # = 70 deg/s, which the bot exceeds on 0.77% of its steps; the sim's own wheel slew cap is 0.107 per step.
     steer_limit: float | None = None
     steer_history: int = 0           # observe the last N steering changes (needs steer_limit), most recent first
+    # Random launches: this share of a worker's training samples comes from episodes that start anywhere on the lap, the
+    # rest from the grid. Each worker picks at every reset whichever of the two is behind, so every track gets both. A
+    # launched car faces down the road, in a gear for its speed. 0: grid only, and no random draws are made for it.
+    launch_share: float = 0.0
+    launch_speed: tuple[float, float] = (0.0, 29.0)  # m/s, uniform (29 m/s = 105 km/h, the range of Sony's 2024 vision paper)
+    launch_lateral: float = 0.8      # uniform over this share of the road's width, around its middle
+    launch_yaw: float = 0.1          # rad, uniform within +- this of the track direction
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")
     deterministic: bool = True       # -nr: no srand(time) in the engine

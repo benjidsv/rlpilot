@@ -11,7 +11,8 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
 from rlpilot import tracking
-from rlpilot._native import MAX_WORKERS, Client, F, N_FIELDS, N_RAYS
+from rlpilot._native import A, MAX_WORKERS, Client, F, N_FIELDS, N_RAYS
+from rlpilot.evaluate import eval_config
 from rlpilot.sb3 import resume_ppo
 
 
@@ -453,3 +454,198 @@ def test_resume_refuses_a_different_network(tmp_path):
     venv.save(str(tmp_path / "vecnormalize.pkl"))
     with pytest.raises(ValueError, match="policy kwargs"):
         resume_ppo(tmp_path, _dummy_venv(), "cpu", settings | {"policy_kwargs": dict(net_arch=[32, 32])})
+
+
+# ---- random launches ----
+
+LAUNCH_SLOTS = [A[f"launch_{k}"] for k in ("pos", "lateral", "yaw", "speed")]
+
+
+def _launch_env(**kw):
+    return SpeedDreamsVecEnv(EnvConfig(**{"n_workers": 1, "race": "rlpilot-braga", "gearbox": "points", "steer_limit": 0.0625,
+                                          "recycle_resets": 2**62} | kw))
+
+
+def _trace(env, steps, pedal=0.5):
+    """Scripted controls: the same fingerprint for any env that starts from the same state."""
+    rows = []
+    for _ in range(steps):
+        a = np.zeros((env.num_envs, env.act_dim), np.float32)
+        a[:, 1] = pedal
+        _, r, *_ = env.step(a)
+        rows.append(np.concatenate([env._raw[:, [F[k] for k in ("pos_x", "pos_y", "speed_x", "gear")]], r[:, None]], 1).copy())
+    return np.stack(rows)
+
+
+def test_launch_places_the_car():
+    env = _launch_env(n_workers=2, races=("rlpilot-braga", "rlpilot-brno"), race="rlpilot-braga")
+    try:
+        length = env._raw[:, F["track_length"]].copy()
+        env._act[:, LAUNCH_SLOTS] = [[0.3, 0.75, 0.05, 25.0], [0.6, 0.25, -0.05, 15.0]]
+        env.reset()
+        raw = env._raw
+        assert abs(raw[0, F["dist_from_start"]] - 0.3 * length[0]) < 2 and abs(raw[1, F["dist_from_start"]] - 0.6 * length[1]) < 2
+        assert 24 < raw[0, F["speed_x"]] <= 25 and 14 < raw[1, F["speed_x"]] <= 15
+        assert np.abs(raw[:, F["speed_y"]]).max() < 0.1
+        width = raw[:, F["track_width"]]  # to_middle: + = left; lateral counts from the right edge
+        assert abs(raw[0, F["to_middle"]] - 0.25 * width[0]) < 0.5 and abs(raw[1, F["to_middle"]] + 0.25 * width[1]) < 0.5
+        assert raw[0, F["gear"]] > 1  # a gear for the speed, not first
+        assert raw[:, F["race_over"]].max() == 0
+    finally:
+        env.close()
+
+
+def test_launch_angle_sign_matches_the_yaw_slot():
+    env = _launch_env(n_workers=2)
+    try:
+        env._act[:, LAUNCH_SLOTS] = [[0.5, 0.5, 0.05, 0.0], [0.5, 0.5, -0.05, 0.0]]
+        env.reset()
+        # angle = track tangent - yaw: a car turned left of the road sees the road to its right
+        assert env._raw[0, F["angle"]] == pytest.approx(-0.05, abs=0.01)
+        assert env._raw[1, F["angle"]] == pytest.approx(0.05, abs=0.01)
+    finally:
+        env.close()
+
+
+def test_grid_is_exact_after_launches():
+    env = _launch_env()
+    try:
+        env.reset()
+        first = _trace(env, 200)
+        env._act[0, LAUNCH_SLOTS] = [0.4, 0.5, 0.0, 20.0]
+        env.reset()
+        assert env._raw[0, F["speed_x"]] > 15
+        _trace(env, 50)
+        env._act[0, LAUNCH_SLOTS] = 0
+        env.reset()
+        assert np.array_equal(_trace(env, 200), first)  # nothing of the launch survives the restart
+    finally:
+        env.close()
+
+
+def test_launch_is_deterministic_and_changes_a_fresh_race():
+    env = _launch_env()
+    try:
+        env.reset()
+        grid_dist = env._raw[0, F["dist_from_start"]]
+        env._act[0, LAUNCH_SLOTS] = [0.4, 0.5, 0.0, 20.0]
+        env.reset()  # no step since the last start: a reset still has to restart, as the launch changed
+        assert env._raw[0, F["dist_from_start"]] != grid_dist
+        a = _trace(env, 100)
+        env.reset()
+        assert np.array_equal(_trace(env, 100), a)
+    finally:
+        env.close()
+
+
+def test_launch_progress_counts_from_the_start_and_across_the_line():
+    env = _launch_env()
+    try:
+        length = float(env._raw[0, F["track_length"]])
+        env._act[0, LAUNCH_SLOTS] = [1 - 60 / length, 0.5, 0.0, 25.0]  # 60 m before the line, facing it
+        env._launched[0] = True  # share 0, so that reset keeps these slots
+        env.reset()
+        assert env._rew.raced[0] == 0
+        assert env._raw[0, F["laps"]] == 0
+        total, laps = 0.0, []
+        for _ in range(100):
+            a = np.zeros((1, env.act_dim), np.float32)
+            a[:, 1] = 0.5
+            _, r, *_ = env.step(a)
+            assert 0 <= env._rew.components[0, 0] < 0.5  # at most 12 m per step: no lap-sized jump at the line
+            total += env._rew.components[0, 0]
+            laps.append(env._raw[0, F["laps"]])
+        assert laps[-1] == 1  # crossed it
+        assert total == pytest.approx(0.1 * env._rew.raced[0], rel=1e-3)
+        assert 60 < env._rew.raced[0] < 150
+    finally:
+        env.close()
+
+
+def test_launch_share_follows_samples_per_worker():
+    env = _launch_env(n_workers=4, races=("rlpilot-braga", "rlpilot-brno"), race="rlpilot-braga", launch_share=0.7,
+                      max_episode_seconds=4.0)
+    try:
+        env.reset()
+        starts = []
+        for _ in range(3000):
+            a = np.zeros((4, env.act_dim), np.float32)
+            a[:, 1] = 0.3
+            _, _, term, trunc, info = env.step(a)
+            if info:
+                starts += list(info["stats"]["launched"][term | trunc])
+        share = env._launch_steps / env._mode_steps
+        assert np.abs(share - 0.7).max() < 0.05  # every worker, so every track
+        assert 0 < np.mean(starts) < 1
+    finally:
+        env.close()
+
+
+def test_launch_share_zero_draws_nothing():
+    env = _launch_env()
+    try:
+        before = env._rng.bit_generator.state
+        env.reset()
+        _trace(env, 10)
+        assert env._rng.bit_generator.state == before
+        assert (env._act[0, LAUNCH_SLOTS] == 0).all()
+    finally:
+        env.close()
+
+
+def test_launch_share_one_is_never_the_grid_and_ranges_hold():
+    env = _launch_env(n_workers=4, launch_share=1.0, launch_speed=(5.0, 20.0), max_episode_seconds=1.0)
+    try:
+        length = float(env._raw[0, F["track_length"]])
+        env.reset()
+        seen = []
+        for _ in range(100):
+            a = np.zeros((4, env.act_dim), np.float32)
+            obs, *_, info = env.step(a)
+            assert np.isfinite(obs).all()
+            if info:
+                assert (info["stats"]["launched"][info["_stats"]] == 1).all()
+            seen.append(env._act[:, LAUNCH_SLOTS].copy())
+        slots = np.concatenate(seen)
+        assert (slots[:, 0] > 0).all() and (slots[:, 0] < 1).all()
+        assert slots[:, 1].min() >= 0.1 and slots[:, 1].max() <= 0.9
+        assert np.abs(slots[:, 2]).max() <= 0.1
+        assert slots[:, 3].min() >= 5 and slots[:, 3].max() <= 20
+        assert len(np.unique(slots[:, 0])) > 4 and length > 0
+    finally:
+        env.close()
+
+
+def test_recycling_a_launched_worker_is_equivalent_to_a_reset():
+    env = _launch_env()
+    try:
+        env._act[0, LAUNCH_SLOTS] = [0.4, 0.5, 0.02, 20.0]
+        env.reset()
+        a = _trace(env, 100)
+        env.client.respawn(0)
+        env._start_rewards(np.array([0]))
+        env._clear(np.array([0]), 0.0)
+        assert np.array_equal(_trace(env, 100), a)
+    finally:
+        env.close()
+
+
+def test_eval_never_launches():
+    cfg = EnvConfig(launch_share=0.7)
+    assert eval_config(cfg, ("rlpilot", ), 2, 2).launch_share == 0
+
+
+def test_a_launched_episodes_stats_say_so():
+    env = _launch_env(launch_share=1.0, max_episode_seconds=1.0)
+    try:
+        env.reset()
+        info = {}
+        while not info:
+            *_, info = env.step(np.zeros((1, env.act_dim), np.float32))
+        s = info["stats"]
+        assert s["launched"][0] == 1 and s["track"][0] == 0
+        assert s["seconds"][0] == pytest.approx(1.0)
+        assert 0 <= s["end_dist"][0] < env._raw[0, F["track_length"]]
+        assert s["progress"][0] >= 0
+    finally:
+        env.close()

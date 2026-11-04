@@ -19,7 +19,7 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 4
+#define RLP_VERSION 5
 #define RLP_MAX_CARS 8
 #define RLP_N_RAYS 19
 #define RLP_RAY_RANGE 200.0f
@@ -81,6 +81,11 @@ enum rlp_action {
     RLP_A_CAR_GRIP,   /* x tyre friction (mu) */
     RLP_A_CAR_MASS,   /* x car mass */
     RLP_A_CAR_POWER,  /* x engine torque curve */
+    /* Where the race (re)start puts the car (a RESET restarts it if they changed). LAUNCH_POS 0 = on the grid. */
+    RLP_A_LAUNCH_POS,     /* fraction of the lap from the start line, in (0, 1) */
+    RLP_A_LAUNCH_LATERAL, /* fraction of the road's width from its right edge */
+    RLP_A_LAUNCH_YAW,     /* rad from the track direction, + = left */
+    RLP_A_LAUNCH_SPEED,   /* m/s, along the car */
     RLP_ACT_DIM
 };
 
