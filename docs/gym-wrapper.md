@@ -137,6 +137,15 @@ Simplix computes its own racing line (clothoid-smoothed, `unitclothoid.cpp`). `t
 
 - **Memory grows ~0.14 MB per in-process restart** (measured with `footprint`, 0.1425 again on 2026-11-03; flat reset time, no file growth). `leaks` finds almost nothing unreachable, so the engine keeps something reachable across restarts. Workaround: `--recycle-resets` (`EnvConfig.recycle_resets`, default 2000; proto-7 uses 1000) replaces a worker process after that many resets, which caps each worker near 45 MB + 0.14 MB x that. A respawned worker gives exactly the same episodes as a reset, on the same track (tested).
 
+## Run report
+
+`scripts/report.py [run name or id]` writes `reports/<run name>-<run id>/index.html`, and `train_sb3.py` runs it when training ends by itself (`--no-report` to skip). It re-drives saved checkpoints, so it needs no logging during training and works on old PPO runs, and it takes about 10 minutes for proto-7:
+
+- **Heatmap:** tracks x checkpoints, coloured by the share of the eval laps driven (2 episodes per cell, one without launch noise). Lap 1 crashes therefore read at most 50% on a 2-lap eval. Only the run's training and validation tracks are driven, never a test split.
+- **Crash spots at `best/`** (8 episodes per track): a track map, a table and a top-down GIF against the bot. "Off at" is where the car left the road for good, or its furthest point if it stopped on the road. Spots closer than 100 m are merged.
+
+Simulation results are cached in the report's `data/`, so re-rendering takes under a minute. Delete `img/` to redraw figures, or pass `--resweep` to simulate again.
+
 ## Resume and checkpoint score
 
 Experiment notes and plans live in [research-notes-proto7.md](research-notes-proto7.md).

@@ -10,6 +10,7 @@ native/build/
 mlflow.db
 reference/
 replay/
+reports/
 *.mov
 
 .claude

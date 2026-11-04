@@ -202,7 +202,7 @@ Full notes: [design, tracking, training findings and gotchas](docs/gym-wrapper.m
 | `native/client/client.c`, `native/bench/bench.c` | Client library and a C-only benchmark |
 | `data/raceman/`, `data/drivers/rlpilot/` | Race configs per track (agent: `rlpilot-*`, bot reference: `rlref-*`) and driver config |
 | `python/rlpilot/` | `vec_env.py`, `config.py`, `reward.py`, `features.py`, `track.py`, `sb3.py`, `workdirs.py`; tracking: `tracking.py`, `evaluate.py`, `reference.py`, `plots.py` |
-| `scripts/` | `train_sb3.py`, `bench_env.py`, `record_lap.py`, `make_replay_video.py`, `download_tracks.py`, `setup_tracks.py`, `sweep_shift.py`, `make_readme_figures.py` |
+| `scripts/` | `train_sb3.py`, `report.py`, `bench_env.py`, `record_lap.py`, `make_replay_video.py`, `download_tracks.py`, `setup_tracks.py`, `sweep_shift.py`, `make_readme_figures.py` |
 | `tests/test_env.py` | Determinism, rays, autoreset, lap handling, bot reference, gearbox, shaping |
 | `speed-dreams-code/` | Submodule: [my fork](https://github.com/benjidsv/speed-dreams-code) of [Speed Dreams](https://forge.a-lec.org/speed-dreams/speed-dreams-code), branch `rlpilot` = upstream plus macOS build fixes |
 

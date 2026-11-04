@@ -6,6 +6,7 @@
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -109,6 +110,7 @@ def main():
                    help="linear: decays to 10%% of --lr at the end of training")
     p.add_argument("--n-steps", type=int, default=512, help="rollout length per env (x workers per update)")
     p.add_argument("--batch-size", type=int, default=2048)
+    p.add_argument("--no-report", action="store_true", help="don't run scripts/report.py when training ends (PPO only)")
     a = p.parse_args()
 
     if a.split == "proto7":
@@ -142,7 +144,7 @@ def main():
         os.chdir(root)
         mlflow.set_tracking_uri(f"sqlite:///{root / 'mlflow.db'}")
     mlflow.set_experiment(a.experiment)
-    with mlflow.start_run(run_name=a.run_name):
+    with mlflow.start_run(run_name=a.run_name) as run:
         log_provenance(cfg, **{f"algo.{k}": v for k, v in logged.items()}, algo=a.algo,
                        timesteps=a.timesteps, seed=a.seed, resume=a.resume)
         env = SB3VecEnv(SpeedDreamsVecEnv(cfg))
@@ -173,6 +175,8 @@ def main():
         finally:
             save_model(model, "model")  # also on Ctrl-C or a worker error
             venv.close()
+    if a.algo == "ppo" and not a.no_report:  # only reached when training ended by itself. Its own process: it can't harm the run
+        subprocess.run([sys.executable, str(Path(__file__).with_name("report.py")), run.info.run_id])
 
 
 if __name__ == "__main__":
