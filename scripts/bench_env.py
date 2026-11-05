@@ -11,6 +11,7 @@ track with steering increments and road edges. Memory: the sum of the workers' r
 import argparse
 import re
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -51,6 +52,8 @@ def rss_gb(env: SpeedDreamsVecEnv) -> float:
 
 def footprint_gb(env: SpeedDreamsVecEnv) -> float:
     """Sum of the workers' physical footprints, from the macOS `footprint` tool, one process at a time."""
+    if sys.platform != "darwin":
+        return float("nan")
     units = {"B": 1e-9, "KB": 1e-6, "MB": 1e-3, "GB": 1.0}
     total = 0.0
     for p in env.client.procs:

@@ -1,4 +1,4 @@
-# Out-of-tree build of the rlpilot native pieces against an installed Speed Dreams (./build-macos.sh).
+# Out-of-tree build of the rlpilot native pieces against an installed Speed Dreams (./build-macos.sh, ./build-linux.sh).
 #   cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release && cmake --build native/build -j && cmake --install native/build
 cmake_minimum_required(VERSION 3.20)
 project(rlpilot C CXX)
@@ -31,9 +31,15 @@ endforeach()
 
 add_executable(rlpilot-worker worker/main.cpp)
 target_compile_definitions(rlpilot-worker PRIVATE ${SD_DEFINES})
-target_include_directories(rlpilot-worker PRIVATE ${SD_INCLUDES} /opt/homebrew/include/SDL2)
+target_include_directories(rlpilot-worker PRIVATE ${SD_INCLUDES})
+if(APPLE)
+  target_include_directories(rlpilot-worker PRIVATE /opt/homebrew/include/SDL2)
+else()
+  target_include_directories(rlpilot-worker PRIVATE /usr/include/SDL2)
+endif()
 target_link_libraries(rlpilot-worker PRIVATE ${SD_tgfdata} ${SD_tgfclient} ${SD_robottools} ${SD_tgf} ${SD_portability})
-set_target_properties(rlpilot-worker PROPERTIES INSTALL_RPATH "${SD_LIBDIR};${SD_PREFIX}/lib")
+# ENABLE_EXPORTS: the robot module finds rlp_host with dlsym(RTLD_DEFAULT), which needs -rdynamic on Linux.
+set_target_properties(rlpilot-worker PROPERTIES INSTALL_RPATH "${SD_LIBDIR};${SD_PREFIX}/lib" ENABLE_EXPORTS ON)
 
 add_library(rlpilot MODULE robot/rlpilot.cpp)
 set_target_properties(rlpilot PROPERTIES PREFIX "" SUFFIX ".so")

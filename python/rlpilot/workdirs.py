@@ -19,7 +19,7 @@ TEMPLATE = ROOT / "sd-local"
 DATA = ROOT / "data"
 INSTALL_RACEMAN = ROOT / "sd-install/share/games/speed-dreams-2/config/raceman"
 WORKER_BIN = ROOT / "sd-install/games/rlpilot-worker"
-CLIENT_LIB = ROOT / "sd-install/lib/librlpilot_client.dylib"
+CLIENT_LIB = ROOT / f"sd-install/lib/librlpilot_client.{'dylib' if sys.platform == 'darwin' else 'so'}"
 
 
 def prepare(run_dir: Path, n_workers: int, race: str = "rlpilot", only: int | None = None) -> list[Path]:
