@@ -59,7 +59,8 @@ def crash_index(trace: dict[str, np.ndarray]) -> int:
 
 
 def summarize_episode(trace: dict[str, np.ndarray], stats: dict, laps: int) -> dict:
-    out = {"end": stats["end"], "driven": 1.0 if stats["end"] == FINISHED else min(stats["progress"] / laps, 1.0)}
+    out = {"end": stats["end"], "driven": 1.0 if stats["end"] == FINISHED else min(stats["progress"] / laps, 1.0),
+           "finished_strict": stats["end"] == FINISHED and stats.get("strict_end") is None}
     if stats["end"] != FINISHED:
         i = crash_index(trace)
         out |= {"crash_i": i, "crash_m": float(trace["dist_from_start"][i]), "lap": max(int(trace["laps"][i]), 1)}
@@ -284,6 +285,8 @@ def render(out: Path, run_name: str, run_id: str, best_step: str | None, tracks_
             plt.close(fig)
         tracks.append({"race": race, "track": name, "split": split, "crashes": rows, "map": map_path, "episodes": len(best[race]),
                        "finished": sum(e["end"] == FINISHED for e in best[race]),
+                       # results cached before this field existed came from the strict rules
+                       "finished_strict": sum(e.get("finished_strict", e["end"] == FINISHED) for e in best[race]),
                        "driven": float(np.mean([e["driven"] for e in best[race]]))})
     tracks.sort(key=lambda t: (t["split"] != "train", t["driven"], t["track"]))
 
@@ -293,6 +296,11 @@ def render(out: Path, run_name: str, run_id: str, best_step: str | None, tracks_
 
     stats = "".join(f'<div><b>{_pct(finished(s)[0])}</b><span>{s} episodes finished at best/ ({finished(s)[1]} tracks)</span></div>'
                     for s in ("train", "validation") if finished(s)[1])
+    if any(t["finished_strict"] != t["finished"] for t in tracks):
+        for s in ("train", "validation"):
+            group = [t for t in tracks if t["split"] == s]
+            share = sum(t["finished_strict"] for t in group) / max(sum(t["episodes"] for t in group), 1)
+            stats += f'<div><b>{_pct(share)}</b><span>{s} under the 1 s rules of the runs up to proto-8</span></div>'
     n_spots = sum(len(t["crashes"]) for t in tracks)
     stats += f'<div><b>{n_spots}</b><span>crash spots at best/</span></div>'
     legend = "".join(f'<span class="k"><i class="c{i}"></i>{label}</span>'

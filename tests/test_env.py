@@ -399,9 +399,9 @@ def test_track_metrics_layout(monkeypatch):
     monkeypatch.setattr(tracking, "track_of", lambda race: race.split("-")[1])
     cb = tracking.EvalCallback(EnvConfig(races=("rlpilot-a", "rlpilot-b"), n_workers=2), heldout=("rlpilot-c",))
     cb.refs = {r: SimpleNamespace(best_lap=100.0) for r in cb.races}
-    base = {"eval/progress": 1.0, "eval/completion_rate": 1.0, "eval/laps_completed": 3.0,
-            "eval/behavior/line_dev": 2.0, "eval/behavior/abs_offset": 0.5}
-    flying = base | {"eval/flying_lap_time_median": 110.0}
+    base = {"eval/progress": 1.0, "eval/completion_rate": 1.0, "eval/laps_completed": 3.0, "eval/completion_strict": 1.0,
+            "eval/laps_completed_strict": 3.0, "eval/behavior/line_dev": 2.0, "eval/behavior/abs_offset": 0.5}
+    flying = base | {"eval/flying_lap_time_median": 110.0, "eval/flying_lap_time_median_strict": 110.0}
     crashed = base | {"eval/progress": 0.5, "eval/fail_dist_from_start": 42.0}
     out, scores = cb._track_metrics({"rlpilot-a": flying, "rlpilot-b": crashed, "rlpilot-c": flying})
     assert out["track_gap_pct/a"] == pytest.approx(10.0) and "track_gap_pct/b" not in out
@@ -409,7 +409,8 @@ def test_track_metrics_layout(monkeypatch):
     assert out["dashboard/train_progress"] == pytest.approx(0.75) and out["dashboard/train_gap_pct"] == pytest.approx(10.0)
     assert out["dashboard/heldout_flying_lap_tracks"] == 1.0 and out["eval/train_flying_lap_tracks"] == 0.5
     assert out["eval/heldout_line_dev"] == 2.0
-    assert len(scores) == 3
+    assert out["dashboard/train_completion_strict"] == 1.0
+    assert len(scores["train"]) == 2 and len(scores["heldout"]) == 1
     assert {k.split("/")[0] for k in out} == {"dashboard", "eval", "track_progress", "track_gap_pct", "track_fail_dist"}
 
 
@@ -724,3 +725,11 @@ def test_autoreset_recovers_from_a_non_finite_launch():
 
 def test_launches_stay_clear_of_the_failing_edge():
     assert EnvConfig().launch_lateral == 0.7
+
+
+def test_loose_rules_cant_raise_the_score():
+    from rlpilot.tracking import track_score
+    clean = {"eval/laps_completed_strict": 2.0, "eval/flying_lap_time_median_strict": 100.0}
+    # finished both laps, but past an excursion the strict rules would have ended on lap 1
+    loose = {"eval/laps_completed": 2.0, "eval/flying_lap_time_median": 100.0, "eval/laps_completed_strict": 0.0}
+    assert track_score(loose, 100.0, 2) < track_score(clean, 100.0, 2)

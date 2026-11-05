@@ -24,6 +24,9 @@ CAR_OBS_SCALE = 10.0  # observation = (factor - 1) x this
 # the lateral shape of the road is the signal: a 10 m bend reads 0.2.
 EDGE_X_SCALE = 100.0
 EDGE_Y_SCALE = 50.0
+# Observation = metres / this. On the train and validation tracks at 60 m/s (6 s = 360 m ahead), the road differs by at most
+# 50 m from the car's height, so inputs stay within about 5, like the edges.
+HEIGHT_SCALE = 10.0
 EDGE_GROUPS = ("edge_left_x", "edge_left_y", "edge_right_x", "edge_right_y")  # in the order of EdgeTable.car_frame
 
 
@@ -67,7 +70,7 @@ class ObsLayout:
 
 
 def make_layout(action_names: tuple[str, ...], n_lookahead: int = 0, n_line: int = 0, car_obs: bool = False,
-                steer_history: int = 0, edge_points: int = 0) -> ObsLayout:
+                steer_history: int = 0, edge_points: int = 0, height_points: int = 0) -> ObsLayout:
     named = lambda prefix, n: tuple(f"{prefix}{i}" for i in range(n))
     groups = [
         ObsGroup("speed", ("speed_x", "speed_y", "speed_z"), "car frame, m/s: x / 50 (+ = forward), y / 10, z / 10"),
@@ -101,6 +104,10 @@ def make_layout(action_names: tuple[str, ...], n_lookahead: int = 0, n_line: int
                                    f"abreast of the car (index 0), car frame, m / {EDGE_X_SCALE:g}, + = ahead, not clipped"))
             groups.append(ObsGroup(f"edge_{side}_y", named(f"edge_{side}_y", edge_points),
                                    f"same points, m / {EDGE_Y_SCALE:g}, + = left of the car, not clipped"))
+    if height_points:
+        groups.append(ObsGroup("height", named("height", height_points),
+                               f"road height ahead minus at the car, along the centreline, over the edges' span, m / {HEIGHT_SCALE:g}, "
+                               "+ = above, not clipped"))
     return ObsLayout(tuple(groups))
 
 

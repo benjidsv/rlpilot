@@ -86,6 +86,22 @@ def load_track(race: str = "rlref", laps: int = 3) -> TrackGeometry:
     return TrackGeometry(track[:, 0:2], track[:, 2:4], length)
 
 
+def load_heights(race: str = "rlref", laps: int = 3) -> np.ndarray:
+    """Road height (m) at the track map's points, row for row: [m, 2] left, right. In a file of its own, written on first
+    use from the engine's geometry, so that no bot laps have to run again."""
+    path = Path(f"{_cached(race, laps)}_height.csv")
+    if not path.exists():
+        with tempfile.TemporaryDirectory(prefix="rlpilot-ref-") as tmp:
+            (d,) = workdirs.prepare(Path(tmp), 1, race)
+            log = d / "worker.log"
+            with open(log, "wb") as out:
+                rc = subprocess.run([str(workdirs.WORKER_BIN), "-lc", f"{d}/", "-s", race, "-z", str(path), "-nr", "-tl", "1"],
+                                    stdout=out, stderr=subprocess.STDOUT, timeout=120).returncode
+            if rc != 0 or not path.exists():
+                raise RuntimeError(f"heights run failed (rc={rc}):\n{log.read_text(errors='replace')[-2000:]}")
+    return np.loadtxt(path, ndmin=2)
+
+
 def load(race: str = "rlref", laps: int = 3) -> Reference:
     geometry = load_track(race, laps)
     data = np.loadtxt(f"{_cached(race, laps)}_laps.csv", ndmin=2)

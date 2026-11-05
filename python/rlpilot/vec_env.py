@@ -19,7 +19,7 @@ from ._native import CMD_NONE, CMD_RESET, CMD_STEP, A, Client, F
 from .config import EnvConfig
 from .reward import REWARD_COMPONENTS, TERM_REASONS, RewardTracker
 from .features import CAR_FACTORS, CAR_OBS_SCALE
-from .track import EdgeTable, LineTable, LookaheadTable
+from .track import EdgeTable, HeightTable, LineTable, LookaheadTable
 
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
@@ -56,11 +56,14 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._look = LookaheadTable(self.races, cfg.lookahead_stat) if cfg.lookahead else None
         self._line = LineTable(self.races)  # the line_dev metric; a policy input only with line_obs
         self._edges = EdgeTable(self.races, cfg.edge_points, cfg.edge_horizon, cfg.edge_floor) if cfg.edge_points else None
+        self._height = HeightTable(self.races, cfg.height_points, cfg.edge_horizon, cfg.edge_floor) if cfg.height_points else None
         if self._look is not None:
             self._look_off, self._look_size = self._look.rows(self.client.races)
         self._line_off, self._line_size = self._line.rows(self.client.races)
         if self._edges is not None:
             self._edge_rows = self._edges.rows(self.client.races)
+        if self._height is not None:
+            self._height_rows = self._height.rows(self.client.races)
         self._race_index = np.array([self.races.index(r) for r in self.client.races], np.int64)
         self.track_steps = np.zeros(len(self.races), np.int64)  # agent steps driven per race (self.races order)
         if cfg.gearbox not in GEARBOX_ACTIONS:
@@ -76,7 +79,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._mode_steps = np.zeros(n, np.int64)    # and in all episodes, while launches are on
         self.obs_layout = features.make_layout(self.action_names, self._look.n_features if self._look is not None else 0,
                                                len(self._line.points) if cfg.line_obs else 0, cfg.car_obs,
-                                               cfg.steer_history, cfg.edge_points)
+                                               cfg.steer_history, cfg.edge_points, cfg.height_points)
         od = self.obs_layout.dim
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
@@ -211,6 +214,9 @@ class SpeedDreamsVecEnv(VectorEnv):
                                       *(r[sel] for r in self._edge_rows))
             parts |= features.edge_parts(self._edges.car_frame(raw[:, F["pos_x"]], raw[:, F["pos_y"]], raw[:, F["yaw"]],
                                                                world))
+        if self._height is not None:
+            parts["height"] = self._height(raw[:, F["dist_from_start"]], np.hypot(raw[:, F["speed_x"]], raw[:, F["speed_y"]]),
+                                           *(r[sel] for r in self._height_rows)) / features.HEIGHT_SCALE
         return features.assemble(self.obs_layout, parts)
 
     def _assign_track(self, i: int, race: str) -> None:
@@ -222,6 +228,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         if self._edges is not None:
             off, cells, spacing = self._edge_rows
             off[i], cells[i], spacing[i] = self._edges.offset[race], self._edges.cells[race], self._edges.spacing[race]
+        if self._height is not None:
+            off, cells, spacing = self._height_rows
+            off[i], cells[i], spacing[i] = self._height.offset[race], self._height.cells[race], self._height.spacing[race]
 
     def _line_at(self, idx: np.ndarray | None, ahead) -> np.ndarray:
         """The racing line's offset (m) at `ahead` metres from each env's position: [n or len(idx), len(ahead)]."""

@@ -12,4 +12,4 @@ PROTO7_TRAIN = ("Summer-Olsen", "aalborg", "allondaz", "braga", "bueno", "charme
                 "espie", "hidden-valley", "inuksuk", "jarama", "karwada", "kurpfalzring", "longjour", "migrants",
                 "ole-road-1", "peters", "petit", "pinabashi", "prenzlau", "racepark", "racepark3", "ruudskogen", "salty",
                 "sao-paulo", "torino", "tuna")
-PROTO7_EVAL_TRAIN = ("jarama", "braga", "sao-paulo", "petit")  # the training tracks evaluated, as in proto-4/5/6
+PROTO7_EVAL_TRAIN = ("jarama", "braga", "sao-paulo", "petit")  # the training tracks evaluated up to proto-8, as in proto-4/5/6

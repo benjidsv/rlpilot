@@ -21,6 +21,26 @@ END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "s
 REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line", "steer_change", "steer_reversal")
 
 
+# The rules every run up to proto-8 was judged by (s). Later runs may allow more, so evals also score episodes by these:
+# completion under looser rules isn't comparable with earlier runs.
+STRICT_OFFTRACK_S, STRICT_BACKWARDS_S, STRICT_STUCK_S = 1.0, 1.0, 4.0
+
+
+def strict_failure(wheels_off: np.ndarray, speed_x: np.ndarray, angle: np.ndarray, dt: float, stuck_speed: float = 1.0
+                   ) -> tuple[int, str | None]:
+    """First step of an episode's trace where the strict rules would have ended it, and which one: (-1, None) if none."""
+    rules = (("offtrack", wheels_off >= 4, STRICT_OFFTRACK_S), ("stuck", speed_x < stuck_speed, STRICT_STUCK_S),
+             ("backwards", np.cos(angle) < 0, STRICT_BACKWARDS_S))
+    first, why = -1, None
+    for name, cond, seconds in rules:
+        steps = int(round(seconds / dt))
+        if len(cond) >= steps:
+            full = np.flatnonzero(np.convolve(cond.astype(np.int64), np.ones(steps, np.int64), "valid") == steps)
+            if len(full) and (first < 0 or full[0] + steps - 1 < first):
+                first, why = int(full[0]) + steps - 1, name
+    return first, why
+
+
 class RewardTracker:
     def __init__(self, n: int, cfg: RewardConfig, step_seconds: float, laps_per_episode: int = 0):
         self.cfg, self.dt, self.laps_per_episode = cfg, step_seconds, laps_per_episode
@@ -84,7 +104,7 @@ class RewardTracker:
         failed = terminated & (reason != LAP_DONE)
 
         comp = self.components
-        comp[0] = c.progress * progress
+        comp[0] = c.progress * np.where((wheels_off >= 4) & (progress > 0), progress * c.offtrack_progress, progress)
         comp[1] = -c.offtrack * wheels_off / 4
         comp[2] = -c.damage * d_damage
         comp[3] = -c.terminal * failed

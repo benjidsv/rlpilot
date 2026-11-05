@@ -1,8 +1,46 @@
 # proto-9 plan
 
-Draft, written 2026-11-04 while proto-8 runs. Nothing here is built yet, and proto-8's result can change the order. The evidence behind section 2 is in [research-notes-proto7.md](research-notes-proto7.md), "Before proto-8: pedals and the critic".
+Written 2026-11-04 while proto-8 ran, updated 2026-11-05 with its result. **proto-9 is built and smoke-tested, and not yet run.** Sections 1 and 2 and the off-track rules are in the code; section 3's tests are not done. The evidence behind section 2 is in [research-notes-proto7.md](research-notes-proto7.md), "Before proto-8: pedals and the critic".
 
-**Wait for proto-8 to finish before changing code.** Workers respawn from the installed binary during the run, and `report.py` imports `python/rlpilot` when it ends, so a rebuild or an edit there could affect the run. Docs are safe.
+## proto-8 result
+
+`proto-8` crashed at 130.9M and `proto-8-cont` resumed it, stopped by hand at 372M. Report: `reports/proto-8-cont-b60db21f/`. Completion over all 35 tracks, 2 episodes per checkpoint, one seed per run:
+
+| Steps | proto-7, 29 train | proto-8, 29 train | proto-7, 6 validation | proto-8, 6 validation |
+|---|---|---|---|---|
+| 250-300M | 0.67 | 0.68 | 0.33 | 0.35 |
+| 300-340M | 0.76 (300M only) | 0.70 | 0.17 (300M only) | 0.43 |
+| 340-372M | no data | 0.75 | no data | 0.28 |
+
+`best/`, 8 episodes per track: 0.65 -> 0.73 on train, 0.48 -> 0.48 on validation.
+
+- **Launches didn't clearly change the result.** The fine-tune's validation 0.53 didn't carry over to a full run. They did no visible harm, so they stay in the baseline.
+- **The live dashboard misled.** Its 4 train tracks read 1.00 while all 29 averaged about 0.72.
+- **Flipping didn't fall with the learning rate:** 7-9 of 35 tracks per checkpoint (about 6M apart) throughout, including at 3e-5.
+- **Lethal corners remain, on trained tracks too.** At `best/`, Kurpfalzring, Ole-road-1, Salty, Hidden-valley, Tuna, Torino, Allondaz, Imula and Corkscrew finish 0 of 8, nearly always at one spot per track.
+- **Most of those crashes look like late braking.** On 10 of the 12 crash corners checked, the car was 20%+ above the bot's speed 100 m out (Corkscrew 186 vs 103 km/h, Kurpfalzring 167 vs 96, Imula 211 vs 154 with no braking). Not measured: how often it passes corners at similar overspeed.
+- **Same checkpoint, different outcome.** Re-recording `best/` alone flipped the result on Lombaro, Street-1 and Summer-Olsen against the report's first episode. The cause isn't traced.
+
+### Correction: many of those corners aren't lethal
+
+`best/` on all 35 tracks, 4 episodes each, with the off-track and backwards limits raised from 1 s to 20 s and no retraining. The policy has never trained in these situations and can't reverse, so these are lower bounds. Of 140 episodes, 41 would have failed under the 1 s rules:
+
+| What happened next | Episodes | Tracks |
+|---|---|---|
+| Came back and finished 2 laps | 18 | Tuna, Kurpfalzring, Torino (4 each), Allondaz (3), Summer-Olsen (2), Street-1 (1) |
+| Came back, then failed later | 6 | Imula (4), Hidden-valley, Ole-road-1 (1 each) |
+| Didn't come back, heavy damage (468-1056) | 9 | Corkscrew, Salty (4 each), Lombaro (1) |
+| Didn't come back, little damage | 8 | Hidden-valley, Ole-road-1 (3 each), Street-1 (2) |
+
+Completion, strict -> 20 s limits: train 0.75 -> 0.90, validation 0.50 -> 0.54.
+
+In one clean episode per track, the excursions on Tuna, Kurpfalzring, Torino and Summer-Olsen lasted 1.4-5.4 s, 3-5 m from the road, at 60-95 km/h on entry. Path length matched track progress within about 7%, so they aren't shortcuts, and those laps finished 6-8% quicker than twice the bot's best lap. Imula's first excursion gained 12% more progress than its path, the only hint of cutting.
+
+So the 1 s rule itself accounts for a large share of the "lethal" train corners. The late-braking finding still fits Corkscrew, Salty and Imula, but not these excursions.
+
+### Imula's first corner
+
+The chicane is in the observations before the bot's braking point (s ~ 440 m): at s = 424 m both the edge points and the lookahead windows show it. The mean pedal output falls from +3.1 at 250 m out to +1.1 at 125 m, but it stays positive, so the car stays at full throttle. The critic's value barely moves until the car is leaving the road. So this isn't a visibility problem: the policy reacts and doesn't react enough. It never trains on Imula, so this can't separate lambda from generalisation.
 
 ## 1. Road height in the observations
 
@@ -12,6 +50,8 @@ Draft, written 2026-11-04 while proto-8 runs. Nothing here is built yet, and pro
 
 **Why it could matter.** A descent lengthens braking distances, and a crest takes load off the tyres just as the car turns. Neither can be anticipated from a flat map.
 
+**What the exact heights show (2026-11-05):** best/ leaves Corkscrew at 2459 m, just past the top of the hill (49 m at 2410 m), as the road starts dropping at up to 12.6%. Training has steeper descents and sharper crests (Inuksuk -20.6%, Petit -16.2%, Allondaz -16.0%, Torino -15.8%), so it can learn what hills mean. Step 3 below wasn't done, since height is going into the run regardless.
+
 **Evidence so far, not all of it in favour:**
 
 - proto-7's check of elevation against deaths found no signal, but it was crude: mesh heights, with a median match error of 6 m.
@@ -20,11 +60,11 @@ Draft, written 2026-11-04 while proto-8 runs. Nothing here is built yet, and pro
 
 **Design:**
 
-- **Input:** road height relative to the car's position on the road, at the same points as the edges (30 points, 6 s of travel at current speed, 60 m floor). This reuses the edge table's indexing, and the observation grows from 170 to 200.
-- **Source:** the engine's `RtTrackHeightL`, in the worker's track map (`writeTrack`, `native/worker/main.cpp`). Python then looks heights up, like the edges, so no protocol change is needed at each step.
-- **Scale:** measure it first over the 35 tracks and on the bot's laps, as for the edges. Don't guess it.
-- **Cache:** reference files are keyed by the race file only, so a changed map format won't regenerate them. Write heights to a separate file, so that 41 tracks of bot laps don't need rerunning.
-- **Flag:** off by default, e.g. `--height-points 30`. A checkpoint can't resume with a different observation size, so this needs a full run.
+- **Input:** centreline road height relative to the road at the car, at the same points as the edges except the one abreast of the car, which always reads 0 (`--height-points 29`, 6 s of travel at current speed, 60 m floor). The observation grows from 170 to 199.
+- **Source:** the engine's `RtTrackHeightL`, from `rlpilot-worker -z <file>` (`writeHeights`, `native/worker/main.cpp`). Python then looks heights up, like the edges, so no protocol change is needed at each step.
+- **Scale:** metres / 10. At 60 m/s the worst value on the 35 tracks is 4.97, like the edges.
+- **Cache:** `reference/<race>-<key>_height.csv`, beside the track map, so no bot laps had to run again.
+- **Flag:** off by default. A checkpoint can't resume with a different observation size, so this needs a full run.
 
 **Steps:**
 
@@ -73,21 +113,26 @@ So 0.98 is worth trying, but 0.95 isn't shown to be the limit. Those numbers com
 
 **Do section 3's tests first:** they need no full run and they set how the later runs get read.
 
-Then, recommended: **one change per run, height first.**
+Before the next run, also **evaluate all 35 tracks live**, since the 10-track dashboard misled on this run. Done: `--split proto7` now evaluates all 35, 2 episodes each, and `best/` is selected on the strict score, averaged per group so the 29 training tracks don't outvote the 6 validation tracks.
 
-| Run | Change | Compared with |
-|---|---|---|
-| proto-9 | proto-8 + height | proto-8 |
-| proto-9b | proto-9 + `--gae-lambda 0.98`, or proto-8 + it if height doesn't help | The run it starts from |
+Then, agreed on 2026-11-05: **one full run with three changes.** No fine-tunes, since the launch fine-tune's gain didn't carry over.
 
-Each run takes about 10 h. Changing both at once saves a run, but wouldn't show which one worked. Height goes first because it adds information the policy can't get any other way, while lambda only changes how it learns from what it already sees.
+| Change | What |
+|---|---|
+| Road height | Section 1 |
+| `--gae-lambda 0.98` | Section 2 |
+| Off-track rules | No progress reward with all 4 wheels off, off-track limit up from 1 s to about 5 s, terminal penalty raised to about 50 |
 
-If proto-8 already clears the lethal corners, rethink this plan before building anything.
+Reverse stays out of this run. It needs the gearbox action and changes to the stuck, backwards and progress rules, and it's most relevant to the 9 heavy-impact episodes.
+
+Each run takes about 10 h, and 300M is enough: 300-372M added little. Changing three things loses attribution, which is accepted here to save runs. A later run can remove one if the result needs explaining.
+
+**How to read proto-9:** on all 35 tracks, in the report, under both rules: the old strict 1 s rule, which keeps comparison with proto-7 and proto-8 fair, and the new limits. Also the speed against the bot 100 m before Corkscrew, Salty and Imula's first corner, and whether those corners clear. Not only mean completion, which swings too much.
 
 ## Parked
 
-Raised earlier, and not part of proto-9 unless proto-8 calls for them:
+Raised earlier, and not part of proto-9 unless results call for them:
 
-- **Launch more often upstream of crash spots,** using `tracks/failures.csv`. It reuses the launch code, and it's the next step if lethal corners stay.
+- **Launch at racing speed upstream of crash spots,** using `tracks/failures.csv`. Launches already cover these corners and they stay lethal, but launches top out at 105 km/h, while the crashes come from arriving at 160-210. So match the speed too, rather than only launching more often.
 - **Fix `--seed`** so it reaches the car and launch draws. Needed before any multi-seed comparison.
 - **Test split.** Still unspent. Run it once, on a final candidate.

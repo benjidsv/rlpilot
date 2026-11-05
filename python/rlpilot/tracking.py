@@ -1,7 +1,8 @@
 """MLflow integration. The UI makes one flat section per first path segment, sorted by name, so the prefix is the folder:
 
 dashboard/         what to watch over a whole run, and only here:
-  {train,heldout}_{completion,progress,gap_pct}, heldout_flying_lap_tracks   evals, averaged per track group. gap_pct:
+  {train,heldout}_{completion,completion_strict,progress,gap_pct}, heldout_flying_lap_tracks   evals, averaged per track group.
+                   completion_strict: under the 1 s rules of the runs up to proto-8, the one to compare across runs. gap_pct:
                    median flying lap vs the bot's best, in %, over the tracks that have a flying lap
   score_smoothed   what selects best/ (tag best_step)
   rollout_{progress,reward,steer_delta,off_track,crashed}   training episodes; off_track, crashed: how they end (fractions)
@@ -71,9 +72,10 @@ EVAL_DRIVING_STATS = ("steer_delta", "steer_reversal_frac", "pedal_delta", "thro
 
 def track_score(m: dict[str, float], bot_lap: float, laps: int) -> float:
     """Checkpoint score on one track: completion first, pace second. The share of the eval's laps finished (so a
-    crash on lap 2 counts) minus SCORE_GAP_WEIGHT x the capped flying-lap gap to the bot (%)."""
-    finished = min(m["eval/laps_completed"] / laps, 1.0)
-    fly = m.get("eval/flying_lap_time_median")
+    crash on lap 2 counts) minus SCORE_GAP_WEIGHT x the capped flying-lap gap to the bot (%). Under the strict rules, so that
+    loosening the training rules can't raise the score by itself."""
+    finished = min(m["eval/laps_completed_strict"] / laps, 1.0)
+    fly = m.get("eval/flying_lap_time_median_strict")
     gap = np.clip(100.0 * (fly / bot_lap - 1), -SCORE_GAP_CAP, SCORE_GAP_CAP) if fly is not None else SCORE_GAP_CAP
     return float(finished - SCORE_GAP_WEIGHT * gap)
 
@@ -387,11 +389,11 @@ class EvalCallback(BaseCallback):
         first |= {f"eval/driving/{k}": res.metrics[f"eval/behavior/{k}"] for k in EVAL_DRIVING_STATS}
         mlflow.log_metrics(first, step=step)
 
-        # Score: track_score, averaged over the evaluated training and held-out tracks. Held-out tracks are never
-        # trained on but do select the checkpoint, so their metrics at best/ are optimistic.
+        # Score: track_score, averaged per group and then over the groups, so that 29 training tracks don't outvote 6 held-out
+        # ones. Held-out tracks are never trained on but do select the checkpoint, so their metrics at best/ are optimistic.
         agg, scores = self._track_metrics({r: x.metrics for r, x in results.items()})
         mlflow.log_metrics(agg, step=step)
-        self._select_best(step, float(np.mean(scores)))
+        self._select_best(step, float(np.mean([np.mean(s) for s in scores.values() if s])))
 
         lap_trace, lap = res.best_lap_trace(0)
         # compare like with like: lap 1 starts from the grid, later laps are flying laps
@@ -430,11 +432,12 @@ class EvalCallback(BaseCallback):
             mlflow.log_artifacts(str(best_snap), "best")  # overwrites the previous best in the run's artifacts
             mlflow.set_tag("best_step", str(best_step))
 
-    def _track_metrics(self, per_track: dict[str, dict[str, float]]) -> tuple[dict[str, float], list[float]]:
-        out, groups, scores = {}, {"train": [], "heldout": []}, []
+    def _track_metrics(self, per_track: dict[str, dict[str, float]]) -> tuple[dict[str, float], dict[str, list[float]]]:
+        out, groups, scores = {}, {"train": [], "heldout": []}, {"train": [], "heldout": []}
         for race, m in per_track.items():
             bot, name = self.refs[race].best_lap, track_of(race)
             t = {"progress": m["eval/progress"], "completion": m["eval/completion_rate"],
+                 "completion_strict": m["eval/completion_strict"],
                  "line_dev": m["eval/behavior/line_dev"], "abs_offset": m["eval/behavior/abs_offset"]}
             out[f"track_progress/{name}"] = t["progress"]
             if "eval/flying_lap_time_median" in m:
@@ -442,12 +445,14 @@ class EvalCallback(BaseCallback):
                 out[f"track_gap_pct/{name}"] = t["gap_pct"]
             if "eval/fail_dist_from_start" in m:
                 out[f"track_fail_dist/{name}"] = m["eval/fail_dist_from_start"]
-            groups["train" if race in self.train_races else "heldout"].append(t)
-            scores.append(track_score(m, bot, self.cfg.laps_per_episode))
+            group = "train" if race in self.train_races else "heldout"
+            groups[group].append(t)
+            scores[group].append(track_score(m, bot, self.cfg.laps_per_episode))
         for g, ts in groups.items():
             if not ts:
                 continue
-            for k, folder in (("progress", "dashboard"), ("completion", "dashboard"), ("gap_pct", "dashboard"),
+            for k, folder in (("progress", "dashboard"), ("completion", "dashboard"), ("completion_strict", "dashboard"),
+                              ("gap_pct", "dashboard"),
                               ("line_dev", "eval"), ("abs_offset", "eval")):
                 vals = [t[k] for t in ts if k in t]
                 if vals:

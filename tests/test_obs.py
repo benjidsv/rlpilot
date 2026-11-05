@@ -16,10 +16,10 @@ import pytest
 
 from rlpilot import EnvConfig, RewardConfig, SpeedDreamsVecEnv, reference, workdirs
 from rlpilot._native import A, F, N_FIELDS, N_RAYS
-from rlpilot.features import EDGE_GROUPS, EDGE_X_SCALE, EDGE_Y_SCALE, ObsGroup, ObsLayout, assemble, decode_edges, make_layout
-from rlpilot.reward import REWARD_COMPONENTS, RewardTracker
+from rlpilot.features import EDGE_GROUPS, EDGE_X_SCALE, EDGE_Y_SCALE, HEIGHT_SCALE, ObsGroup, ObsLayout, assemble, decode_edges, make_layout
+from rlpilot.reward import REWARD_COMPONENTS, RewardTracker, strict_failure
 from rlpilot.splits import PROTO7_EVAL_TRAIN, PROTO7_TEST, PROTO7_TRAIN, PROTO7_VALIDATION
-from rlpilot.track import EdgeTable, LookaheadTable, TrackEdges, TrackProfile, race_for, reference_for
+from rlpilot.track import EdgeTable, HeightTable, LookaheadTable, _on_lap_grid, TrackEdges, TrackProfile, race_for, reference_for
 
 LIMIT = 0.0625  # dyadic: steering sums of multiples of it are exact in float32
 POINTS = 30
@@ -1088,3 +1088,187 @@ def test_a_split_refuses_explicit_track_flags(flags):
     script = workdirs.ROOT / "scripts" / "train_sb3.py"
     r = subprocess.run([sys.executable, str(script), "--split", "proto7", *flags], capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and "can't be combined" in r.stderr
+
+
+# ---------------------------------------------------------------- road height
+
+
+def synthetic_heights(height_of_s, n_points=29, horizon=6.0, floor=60.0):
+    """A HeightTable over a stadium track whose road height is height_of_s(s), with no reference files involved."""
+    left, right, length = stadium_track()
+    mid = 0.5 * (left + right)
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(mid, axis=0).T))]
+    grid, cells, spacing = _on_lap_grid(left, right, length, height_of_s(s)[:, None])
+    t = HeightTable.__new__(HeightTable)
+    t.horizon, t.floor = horizon, floor
+    t.fractions = np.arange(1, n_points + 1, dtype=np.float64)[None, :] / n_points
+    t.table = grid[:, 0]
+    return t, (np.zeros(1, np.int64), np.array([cells], np.int64), np.array([spacing], np.float64)), length
+
+
+def test_height_on_a_slope_is_exact_and_rises_ahead():
+    t, rows, _ = synthetic_heights(lambda s: 0.1 * s)
+    got = t(np.array([100.0]), np.array([20.0], np.float32), *rows)[0]  # span 120 m
+    np.testing.assert_allclose(got, 0.1 * 120.0 * np.arange(1, 30) / 29, atol=1e-3)
+    t, rows, _ = synthetic_heights(lambda s: -0.1 * s)
+    assert (t(np.array([100.0]), np.array([20.0], np.float32), *rows)[0] < 0).all()
+
+
+def test_height_span_follows_speed_with_the_edges_floor():
+    t, rows, _ = synthetic_heights(lambda s: 0.1 * s)
+    slow = t(np.array([100.0]), np.array([1.0], np.float32), *rows)[0]
+    fast = t(np.array([100.0]), np.array([40.0], np.float32), *rows)[0]
+    assert slow[-1] == pytest.approx(6.0, abs=1e-3) and fast[-1] == pytest.approx(24.0, abs=1e-3)  # 60 m floor, 240 m
+
+
+def test_height_wraps_at_the_start_line():
+    t, rows, length = synthetic_heights(lambda s: 5.0 * np.sin(2 * np.pi * s / s[-1]))
+    s0 = length - 10.0
+    got = t(np.array([s0]), np.array([20.0], np.float32), *rows)[0]
+    want = 5.0 * (np.sin(2 * np.pi * (s0 + 120.0 * np.arange(1, 30) / 29) / length) - np.sin(2 * np.pi * s0 / length))
+    np.testing.assert_allclose(got, want, atol=0.02)
+
+
+def test_height_points_line_up_with_the_edge_points():
+    edges, _ = synthetic_edges(*stadium_track(), n_points=30)
+    t, _, _ = synthetic_heights(lambda s: 0 * s, n_points=29)
+    np.testing.assert_allclose(t.fractions[0], edges.fractions[0, 1:])
+
+
+def test_height_scale_keeps_every_track_within_its_documented_range():
+    worst = 0.0
+    for track in PROTO7_TRAIN + PROTO7_VALIDATION:
+        t = HeightTable((race_for(track),), 29, 6.0, 60.0)
+        rows = t.rows((race_for(track),))
+        s = np.arange(0.0, t.cells[race_for(track)], 5.0)
+        got = t(s, np.full_like(s, 60.0, dtype=np.float32), *(np.repeat(r, len(s)) for r in rows))
+        assert np.isfinite(got).all()
+        worst = max(worst, float(np.abs(got).max()))
+    assert 2.0 < worst / HEIGHT_SCALE < 5.5  # 60 m/s: a useful range, without any input far beyond the others
+
+
+def test_height_observation_matches_the_table_on_the_engine_and_final_obs():
+    race = race_for("corkscrew")
+    env = SpeedDreamsVecEnv(EnvConfig(n_workers=1, race=race, gearbox="points", lookahead=True, edge_points=30, height_points=29,
+                                      steer_limit=0.0625, spin_us=50, max_episode_seconds=20.0))
+    t = HeightTable((race,), 29, 6.0, 60.0)
+    rows = t.rows((race,))
+    try:
+        obs, _ = env.reset()
+        L = env.obs_layout
+        assert L.group(obs, "height").shape == (1, 29)
+
+        def want(raw):
+            return t(np.array([raw[F["dist_from_start"]]]), np.array([np.hypot(raw[F["speed_x"]], raw[F["speed_y"]])], np.float32), *rows)[0]
+
+        np.testing.assert_allclose(L.group(obs, "height")[0] * HEIGHT_SCALE, want(env._raw[0]), atol=1e-4)  # the first observation
+        ended = False
+        for _ in range(600):
+            a = np.zeros((1, env.act_dim), np.float32)
+            a[0, 1] = 1.0
+            obs, _, term, trunc, info = env.step(a)
+            if (term | trunc)[0]:
+                np.testing.assert_allclose(L.group(info["final_obs"][0], "height") * HEIGHT_SCALE, want(info["final_raw"][0]), atol=1e-4)
+                ended = True
+                break
+            np.testing.assert_allclose(L.group(obs, "height")[0] * HEIGHT_SCALE, want(env._raw[0]), atol=1e-4)
+        assert ended
+    finally:
+        env.close()
+
+
+def test_no_height_input_unless_asked():
+    layout = make_layout(("steer", "pedal"), edge_points=30)
+    assert "height" not in layout
+    with_height = make_layout(("steer", "pedal"), edge_points=30, height_points=29)
+    assert with_height.dim == layout.dim + 29 and with_height.names[:layout.dim] == layout.names  # older checkpoints keep their slots
+
+
+def test_corkscrew_heights_show_the_drop():
+    race = reference_for(race_for("corkscrew"))
+    g, z = reference.load_track(race, 3), reference.load_heights(race, 3)
+    assert len(z) == len(g.left)
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(0.5 * (g.left + g.right), axis=0).T))]
+    h = z.mean(1)
+    assert 2300 < s[np.argmax(h[s < 3000])] < 2500  # the top
+    assert np.interp(2410, s, h) - np.interp(2760, s, h) > 25.0  # and at least 25 m down in 350 m
+
+
+# ---------------------------------------------------------------- off-track rules
+
+
+def test_no_progress_is_paid_with_all_four_wheels_off():
+    t, raw = _tracker(offtrack_progress=0.0, max_damage=1e9)
+    progress_i = REWARD_COMPONENTS.index("progress")
+
+    def step(metres, wheels):
+        raw[:, F["dist_raced"]] += metres
+        raw[:, F["wheels_off"]] = wheels
+        t.step(raw)
+        return float(t.components[progress_i][0])
+
+    assert step(1.0, 0) == pytest.approx(0.1)
+    assert step(1.0, 3) == pytest.approx(0.1)  # still partly on the road
+    assert step(1.0, 4) == 0.0
+    assert step(-1.0, 4) == pytest.approx(-0.1)  # driving back on the grass still costs
+    assert float(t.raced[0]) == pytest.approx(2.0)  # distance itself still counts
+
+
+def test_offtrack_progress_defaults_to_the_old_reward():
+    t, raw = _tracker(max_damage=1e9)
+    raw[:, F["dist_raced"]] += 1.0
+    raw[:, F["wheels_off"]] = 4
+    t.step(raw)
+    assert float(t.components[REWARD_COMPONENTS.index("progress")][0]) == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("patience, ends", [(1.0, True), (5.0, False)])
+def test_offtrack_patience(patience, ends):
+    t, raw = _tracker(offtrack_patience=patience)
+    raw[:, F["wheels_off"]] = 4
+    results = [t.step(raw) for _ in range(26)]
+    assert any(r[1][0] for r in results) == ends
+
+
+def test_strict_failure_known_answers():
+    n = 200
+    wheels, speed, angle = np.zeros(n), np.full(n, 20.0), np.zeros(n)
+    assert strict_failure(wheels, speed, angle, 0.04) == (-1, None)
+    w = wheels.copy()
+    w[50:74] = 4  # 24 steps: not quite 1 s
+    assert strict_failure(w, speed, angle, 0.04) == (-1, None)
+    w[50:75] = 4  # 25 steps
+    assert strict_failure(w, speed, angle, 0.04) == (74, "offtrack")
+    a = angle.copy()
+    a[60:90] = np.pi
+    assert strict_failure(wheels, speed, a, 0.04) == (84, "backwards")
+    v = speed.copy()
+    v[100:] = 0.0
+    assert strict_failure(wheels, v, angle, 0.04) == (199, "stuck")
+    assert strict_failure(w, v, a, 0.04) == (74, "offtrack")  # the earliest one
+    assert strict_failure(np.zeros(3), np.zeros(3), np.zeros(3), 0.04) == (-1, None)  # shorter than any rule
+
+
+def test_strict_failure_agrees_with_the_env_under_the_strict_rules():
+    """A car driven off the road under the default rules ends where strict_failure says, and with looser rules is still seen."""
+    from rlpilot.evaluate import rollout
+    race = race_for("jarama")
+
+    def steer_off(_obs):
+        return np.array([[1.0, 0.6, 0.0, 0.0]], np.float32)
+
+    def run(patience):
+        reward = RewardConfig(offtrack_patience=patience, backwards_patience=patience)
+        env = SpeedDreamsVecEnv(EnvConfig(n_workers=1, race=race, gearbox="points", steer_limit=0.0625, spin_us=50, max_episode_seconds=40.0, reward=reward))
+        try:
+            return rollout(steer_off, env)
+        finally:
+            env.close()
+
+    traces, _, stats = run(1.0)
+    assert stats[0]["end"] in ("offtrack", "backwards", "stuck")
+    assert stats[0]["strict_end"] == stats[0]["end"]
+    step, _ = strict_failure(traces[0]["wheels_off"], traces[0]["speed_x"], traces[0]["angle"], 0.04)
+    assert abs(step - (len(traces[0]["time"]) - 1)) <= 1
+    traces, _, stats = run(10.0)
+    assert stats[0]["strict_end"] is not None and stats[0]["strict_laps"] == 0

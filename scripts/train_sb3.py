@@ -24,6 +24,9 @@ from rlpilot.tracking import (CheckpointCallback, EvalCallback, LineShapingFadeC
                               ObsStatsCallback, StdClampCallback, TrainingMetricsCallback, log_provenance, save_model)
 
 
+MAX_EVAL_WORKERS = 70
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--algo", choices=["ppo", "sac"], default="ppo")
@@ -68,6 +71,16 @@ def main():
                    help="observe this many points per road edge ahead, in the car's frame, from the track map (0: off)")
     p.add_argument("--edge-horizon", type=float, default=EnvConfig.edge_horizon, help="s of travel the edge points span")
     p.add_argument("--edge-floor", type=float, default=EnvConfig.edge_floor, help="m, what they span near standstill")
+    p.add_argument("--height-points", type=int, default=0,
+                   help="observe the road height at this many points ahead, over the edge points' span (0: off; "
+                        "--edge-points - 1 puts them at the same places)")
+    p.add_argument("--offtrack-patience", type=float, default=RewardConfig.offtrack_patience,
+                   help="s with all four wheels off the road before an episode ends")
+    p.add_argument("--backwards-patience", type=float, default=RewardConfig.backwards_patience,
+                   help="s facing backwards before an episode ends")
+    p.add_argument("--offtrack-progress", type=float, default=RewardConfig.offtrack_progress,
+                   help="share of forward progress paid with all four wheels off the road (0: none)")
+    p.add_argument("--terminal", type=float, default=RewardConfig.terminal, help="penalty when an episode fails")
     p.add_argument("--steer-limit", type=float, default=None,
                    help="the steer action becomes a change of steering, up to this per step (0.0625 per 40 ms = 70 deg/s)")
     p.add_argument("--steer-history", type=int, default=0, help="observe the last N steering changes (needs --steer-limit)")
@@ -93,8 +106,9 @@ def main():
                    help="per episode, draw tyre grip, mass and engine power factors in [1 - x, 1 + x] (eval: stock car)")
     p.add_argument("--car-obs", action="store_true", help="observe the car factors (else the policy must be robust)")
     p.add_argument("--eval-every", type=int, default=100_000, help="timesteps between evaluations")
-    p.add_argument("--eval-episodes", type=int, default=8,
-                   help="eval envs per evaluated track, all tracks in parallel (completion rate has 1/N steps)")
+    p.add_argument("--eval-episodes", type=int, default=2,
+                   help="eval envs per evaluated track, all tracks in parallel (completion rate has 1/N steps); more than "
+                        f"{MAX_EVAL_WORKERS} envs in all time out at startup")
     p.add_argument("--eval-laps", type=int, default=2,
                    help="laps per eval episode (2: one standing-start lap + one flying lap; proto-4 used 3)")
     p.add_argument("--eval-smooth", type=int, default=3,
@@ -134,17 +148,25 @@ def main():
     if a.split == "proto7":
         if a.tracks != p.get_default("tracks") or a.heldout_tracks or a.eval_train_tracks:
             p.error("--split sets the tracks: it can't be combined with --tracks, --heldout-tracks or --eval-train-tracks")
-        a.tracks, a.heldout_tracks, a.eval_train_tracks = PROTO7_TRAIN, PROTO7_VALIDATION, PROTO7_EVAL_TRAIN
+        # all of them: proto-8's dashboard read 1.00 on its 4 evaluated tracks while all 29 averaged about 0.72
+        a.tracks, a.heldout_tracks = PROTO7_TRAIN, PROTO7_VALIDATION
+        a.eval_train_tracks = PROTO7_EVAL_TRAIN + tuple(t for t in PROTO7_TRAIN if t not in PROTO7_EVAL_TRAIN)
+    n_eval = (len(a.eval_train_tracks) or len(a.tracks)) + len(a.heldout_tracks)
+    if n_eval * a.eval_episodes > MAX_EVAL_WORKERS:
+        p.error(f"{n_eval} evaluated tracks x {a.eval_episodes} episodes is more than {MAX_EVAL_WORKERS} eval envs")
     races = tuple(race_for(t) for t in a.tracks)
     cfg = EnvConfig(n_workers=a.workers, frame_skip=a.frame_skip, laps_per_episode=a.laps_per_episode,
                     gearbox=a.gearbox, race=races[0], spin_us=a.spin_us, races=races if len(races) > 1 else (),
                     track_switch_steps=a.track_switch_steps, recycle_resets=a.recycle_resets, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
                     launch_share=a.launch_share, launch_speed=(0.0, a.launch_max_speed),
                     line_obs=a.line_obs, edge_points=a.edge_points, edge_horizon=a.edge_horizon, edge_floor=a.edge_floor,
+                    height_points=a.height_points,
                     steer_limit=a.steer_limit, steer_history=a.steer_history,
                     reward=RewardConfig(steer_rate=a.steer_rate, steer_change=a.steer_change,
                                         steer_reversal=a.steer_reversal, steer_deadband=a.steer_deadband,
-                                        line_shaping=a.line_shaping, line_cap=a.line_cap, gamma=a.gamma),
+                                        line_shaping=a.line_shaping, line_cap=a.line_cap, gamma=a.gamma,
+                                        offtrack_patience=a.offtrack_patience, backwards_patience=a.backwards_patience,
+                                        offtrack_progress=a.offtrack_progress, terminal=a.terminal),
                     car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
                     car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
     decay = a.lr_decay_steps or a.timesteps

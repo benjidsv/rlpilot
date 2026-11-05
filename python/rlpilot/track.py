@@ -187,6 +187,23 @@ class LineTable:
         return self.table[offset[:, None] + m]
 
 
+def _on_lap_grid(left: np.ndarray, right: np.ndarray, length: float, columns: np.ndarray) -> tuple[np.ndarray, int, float]:
+    """Values at the border samples [m, k] -> on a uniform grid of centreline distance from the start line, closed: row
+    `cells` is the start line again. Returns the table [cells + 1, k], cells and the grid's spacing."""
+    mid = 0.5 * (left + right)
+    ds = np.hypot(*np.diff(mid, axis=0).T)
+    keep = np.concatenate([[True], ds > 1e-6])  # no duplicate abscissa for np.interp
+    s = np.concatenate([[0.0], np.cumsum(ds)])[keep]
+    if s[-1] >= length:
+        raise ValueError(f"track map ({s[-1]:.1f} m before closing) is longer than the lap ({length:.1f} m)")
+    cells = int(np.ceil(length))
+    spacing = float(length) / cells  # just under 1 m
+    grid = np.arange(cells + 1) * spacing
+    s_closed = np.concatenate([s, [length]])
+    closed = np.vstack([columns[keep], columns[:1]])
+    return np.stack([np.interp(grid, s_closed, c) for c in closed.T], 1).astype(np.float32), cells, spacing
+
+
 class TrackEdges:
     """One track's left and right borders on a uniform grid of centreline distance from the start line, closed: row
     `cells` is the start line again, so interpolating across the line needs no special case.
@@ -198,26 +215,53 @@ class TrackEdges:
     0.18 m (p99) when it stays in the last cell. Geometry only: nothing here knows where any car drove."""
 
     def __init__(self, left: np.ndarray, right: np.ndarray, length: float):
-        mid = 0.5 * (left + right)
-        ds = np.hypot(*np.diff(mid, axis=0).T)
-        keep = np.concatenate([[True], ds > 1e-6])  # no duplicate abscissa for np.interp
-        s = np.concatenate([[0.0], np.cumsum(ds)])[keep]
-        if s[-1] >= length:
-            raise ValueError(f"track map ({s[-1]:.1f} m before closing) is longer than the lap ({length:.1f} m)")
         self.length = float(length)
-        self.cells = int(np.ceil(length))
-        self.spacing = self.length / self.cells  # just under 1 m
-        grid = np.arange(self.cells + 1) * self.spacing
-        s_closed = np.concatenate([s, [length]])
-        columns = np.hstack([left[keep], right[keep]])
-        columns = np.vstack([columns, columns[:1]])
-        self.table = np.stack([np.interp(grid, s_closed, c) for c in columns.T], 1).astype(np.float32)  # lx ly rx ry
+        self.table, self.cells, self.spacing = _on_lap_grid(left, right, length, np.hstack([left, right]))  # lx ly rx ry
 
     @classmethod
     @functools.cache
     def for_race(cls, race: str) -> "TrackEdges":
         track = reference.load_track(reference_for(race), laps=3)
         return cls(track.left, track.right, track.length)
+
+
+class HeightTable:
+    """All races' centreline road height stacked, on the same grid as TrackEdges, so a vector step is one gather like
+    EdgeTable. Points k = 1..n are at s + span x k / n, with EdgeTable's span. Indexed by the distance along the lap, so a
+    figure-eight's crossing can't mix up its two levels."""
+
+    def __init__(self, races, n_points: int, horizon: float, floor: float):
+        self.horizon, self.floor = float(horizon), float(floor)
+        self.fractions = np.arange(1, n_points + 1, dtype=np.float64)[None, :] / n_points
+        self.races = list(dict.fromkeys(races))
+        tracks = [reference.load_track(reference_for(r), laps=3) for r in self.races]
+        grids = [_on_lap_grid(t.left, t.right, t.length, reference.load_heights(reference_for(r), laps=3).mean(1, keepdims=True))
+                 for r, t in zip(self.races, tracks)]
+        self.table = np.concatenate([g[0][:, 0] for g in grids])
+        sizes = [len(g[0]) for g in grids]
+        self.offset = dict(zip(self.races, np.cumsum([0] + sizes[:-1]).tolist()))
+        self.cells = {r: g[1] for r, g in zip(self.races, grids)}
+        self.spacing = {r: g[2] for r, g in zip(self.races, grids)}
+
+    def rows(self, races) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-env (offset, cells, spacing) arrays for the given per-env races."""
+        return (np.array([self.offset[r] for r in races], np.int64), np.array([self.cells[r] for r in races], np.int64),
+                np.array([self.spacing[r] for r in races], np.float64))
+
+    def _at(self, s: np.ndarray, offset: np.ndarray, cells: np.ndarray, spacing: np.ndarray) -> np.ndarray:
+        u = s / spacing
+        cell = np.floor(u)
+        row = offset + np.mod(cell.astype(np.int64), cells)  # wraps, whatever the sign of s
+        a = self.table[row]
+        return a + (u - cell).astype(np.float32) * (self.table[row + 1] - a)
+
+    def __call__(self, dist_from_start: np.ndarray, speed: np.ndarray, offset: np.ndarray, cells: np.ndarray,
+                 spacing: np.ndarray) -> np.ndarray:
+        """[n] state, per-env rows -> [n, n_points] road height ahead minus at the car (m)."""
+        s = np.asarray(dist_from_start, np.float64)[:, None]
+        span = np.maximum(self.horizon * np.abs(speed), self.floor)[:, None]
+        o, c, sp = offset[:, None], cells[:, None], spacing[:, None]
+        return self._at(s + span * self.fractions, o, c, sp) - self._at(s, o, c, sp)
 
 
 class EdgeTable:

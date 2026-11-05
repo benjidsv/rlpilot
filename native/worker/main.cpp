@@ -503,6 +503,31 @@ void writeTrack(const std::string &path, tTrack *track)
     fclose(f);
 }
 
+// Road height at the same points as writeTrack, row for row. A file of its own, so that a new input needs no new bot laps.
+void writeHeights(const std::string &path, tTrack *track)
+{
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        fatal("cannot write the heights file");
+    fprintf(f, "# left_z right_z\n");
+    tTrackSeg *seg = track->seg->next; // track->seg is the last segment
+    for (int i = 0; i < track->nseg; i++, seg = seg->next) {
+        float span = seg->type == TR_STR ? seg->length : seg->arc;
+        int n = std::max(1, (int)ceilf(seg->length / 2.0f));
+        for (int j = 0; j < n; j++) {
+            tTrkLocPos p = {};
+            p.seg = seg;
+            p.toStart = span * j / n;
+            p.toRight = 0;
+            float rz = RtTrackHeightL(&p);
+            p.toRight = seg->startWidth + (seg->endWidth - seg->startWidth) * j / n;
+            float lz = RtTrackHeightL(&p);
+            fprintf(f, "%.3f %.3f\n", lz, rz);
+        }
+    }
+    fclose(f);
+}
+
 int runTrace(const std::string &prefix, int laps)
 {
     tRmInfo *re = H.engine->inData();
@@ -564,15 +589,17 @@ int main(int argc, char *argv[])
     app->registerOption("w", "worker", true);
     app->registerOption("o", "trace", true);
     app->registerOption("n", "tracelaps", true);
+    app->registerOption("z", "heights", true);
     if (!app->parseOptions())
         return 1;
 
-    std::string race, shmName, worker, tracePrefix, traceLaps = "3";
-    bool trace = app->hasOption("trace", tracePrefix);
+    std::string race, shmName, worker, tracePrefix, traceLaps = "3", heightsPath;
+    bool heights = app->hasOption("heights", heightsPath);
+    bool trace = heights || app->hasOption("trace", tracePrefix);
     app->hasOption("tracelaps", traceLaps);
     if (!app->hasOption("startrace", race) ||
         (!trace && (!app->hasOption("shm", shmName) || !app->hasOption("worker", worker)))) {
-        fprintf(stderr, "usage: rlpilot-worker -lc <dir>/ -s <race> (-m <shm name> -w <index> | -o <prefix> [-n <laps>])\n");
+        fprintf(stderr, "usage: rlpilot-worker -lc <dir>/ -s <race> (-m <shm name> -w <index> | -o <prefix> [-n <laps>] | -z <heights file>)\n");
         return 1;
     }
     std::fill(std::begin(H.slot_of), std::end(H.slot_of), -1);
@@ -613,6 +640,11 @@ int main(int argc, char *argv[])
     H.engine->configureRace(/*bInteractive=*/false);
     H.engine->race()->forceResultsOnly();
     H.engine->startNewRace();
+    if (heights) {
+        writeHeights(heightsPath, H.engine->inData()->track);
+        GfTraceShutdown();
+        std::_Exit(0);
+    }
     if (trace)
         return runTrace(tracePrefix, std::stoi(traceLaps));
     H.sim_t0 = rlp_now_ns();

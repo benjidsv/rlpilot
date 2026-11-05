@@ -17,12 +17,12 @@ import numpy as np
 from ._native import A, F
 from .config import EnvConfig
 from .reference import Reference, lap_slice, lap_times_from_trace
-from .reward import END_GROUPS, TERM_REASONS
+from .reward import END_GROUPS, TERM_REASONS, strict_failure
 from .vec_env import BEHAVIOR_STATS, SpeedDreamsVecEnv
 
 TRACE_FIELDS = {"time": "time", "laps": "laps", "dist_from_start": "dist_from_start", "dist_raced": "dist_raced",
                 "speed_x": "speed_x", "x": "pos_x", "y": "pos_y", "last_lap_time": "last_lap_time",
-                "wheels_off": "wheels_off", "gear": "gear", "rpm": "rpm"}
+                "wheels_off": "wheels_off", "gear": "gear", "rpm": "rpm", "angle": "angle"}
 
 
 def eval_config(cfg: EnvConfig, races: tuple[str, ...], episodes: int, laps: int) -> EnvConfig:
@@ -108,6 +108,10 @@ def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, 
         tr = {k: data[:, j] for j, k in enumerate(TRACE_FIELDS)} | {"steer": a[:, 0], "pedal": a[:, 1], "throttle": a[:, 2], "brake": a[:, 3]}
         traces.append(tr)
         lap_times.append(lap_times_from_trace(tr))
+        step, why = strict_failure(tr["wheels_off"], tr["speed_x"], tr["angle"], env.cfg.step_seconds, env.cfg.reward.stuck_speed)
+        stats[i]["strict_end"] = why
+        # laps finished before that point: `laps` counts start-line crossings, the first one from the grid
+        stats[i]["strict_laps"] = len(lap_times[i]) if why is None else min(max(int(tr["laps"][step]) - 1, 0), len(lap_times[i]))
     return traces, lap_times, stats
 
 
@@ -138,6 +142,13 @@ def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], 
         m["eval/bot_lap_time_median"] = reference.median_lap
         if len(all_laps):
             m["eval/gap_to_bot_best"] = m["eval/lap_time_best"] - reference.best_lap
+    # The same under the strict rules (see reward.py): what's comparable with earlier runs, and what selects best/.
+    strict = [x[:int(s["strict_laps"])] for x, s in zip(lap_times, stats)] if all("strict_laps" in s for s in stats) else lap_times
+    m["eval/completion_strict"] = float(np.mean([len(x) >= 1 for x in strict]))
+    m["eval/laps_completed_strict"] = float(np.mean([len(x) for x in strict]))
+    flying_strict = np.concatenate([x[1:] for x in strict])
+    if len(flying_strict):
+        m["eval/flying_lap_time_median_strict"] = float(np.median(flying_strict))
     for k in BEHAVIOR_STATS:
         m[f"eval/behavior/{k}"] = float(np.mean([s[k] for s in stats]))
     groups = [END_GROUPS[s["end"]] for s in stats]

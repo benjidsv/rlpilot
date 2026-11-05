@@ -13,6 +13,8 @@ REMOVED_SETTINGS_OFF = {"steer_filter": "1.0", "pedal_filter": "1.0"}  # logged 
 @dataclass(frozen=True)
 class RewardConfig:
     progress: float = 0.1          # per metre of distance raced
+    offtrack_progress: float = 1.0  # share of forward progress paid with all four wheels off the road. 0: an excursion
+                                    # costs what it drives, and cutting across the grass earns nothing
     offtrack: float = 0.05         # per step, scaled by the fraction of wheels off the road
     damage: float = 0.001          # per damage point
     terminal: float = 10.0         # penalty when an episode fails (terminated other than by lap_done)
@@ -59,6 +61,9 @@ class EnvConfig:
                                      # one abreast of the car and the last one at max(horizon x speed, floor)
     edge_horizon: float = 6.0        # s of travel at the current speed
     edge_floor: float = 60.0         # m, the span near standstill (= 6 s at 36 km/h)
+    # Road height ahead, relative to the road at the car, from the track map only. Over the same span as the edges (and at
+    # the same places when this is edge_points - 1); the point abreast of the car is left out, since it always reads 0.
+    height_points: int = 0
     lookahead_stat: str = "peak"     # per window: "peak" (signed max |curvature|) or "mean" (proto-3/4; dilutes
                                      # short tight corners, e.g. Spa's Bus Stop read -0.82 for a -1.34 peak)
     # Car randomization: factors drawn uniformly per episode (applied when the race restarts, ~ms).

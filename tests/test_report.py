@@ -39,9 +39,10 @@ def test_summary():
     trace = {"wheels_off": np.array([0, 0, 4.0]), "dist_raced": np.array([0, 1, 2.0]), "dist_from_start": np.array([9, 10, 11.0]),
              "laps": np.array([1, 1, 1.0])}
     done = summarize_episode(trace, {"end": "lap_done", "progress": 2.0}, 2)
-    assert done == {"end": "lap_done", "driven": 1.0}
+    assert done == {"end": "lap_done", "driven": 1.0, "finished_strict": True}
+    assert not summarize_episode(trace, {"end": "lap_done", "progress": 2.0, "strict_end": "offtrack"}, 2)["finished_strict"]
     crash = summarize_episode(trace, {"end": "offtrack", "progress": 0.5}, 2)
-    assert crash == {"end": "offtrack", "driven": 0.25, "crash_i": 2, "crash_m": 11.0, "lap": 1}
+    assert crash == {"end": "offtrack", "driven": 0.25, "finished_strict": False, "crash_i": 2, "crash_m": 11.0, "lap": 1}
 
 
 def test_cluster_positions():
