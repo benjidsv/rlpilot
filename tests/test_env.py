@@ -11,7 +11,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from rlpilot import EnvConfig, SpeedDreamsVecEnv
 from rlpilot import tracking
-from rlpilot._native import A, MAX_WORKERS, Client, F, N_FIELDS, N_RAYS
+from rlpilot._native import CMD_STEP, A, MAX_WORKERS, Client, F, N_FIELDS, N_RAYS
 from rlpilot.evaluate import eval_config
 from rlpilot.sb3 import resume_ppo
 
@@ -733,3 +733,58 @@ def test_loose_rules_cant_raise_the_score():
     # finished both laps, but past an excursion the strict rules would have ended on lap 1
     loose = {"eval/laps_completed": 2.0, "eval/flying_lap_time_median": 100.0, "eval/laps_completed_strict": 0.0}
     assert track_score(loose, 100.0, 2) < track_score(clean, 100.0, 2)
+
+
+def _nan_after(env, step_no, worker=0):
+    """The engine state of `worker` turns NaN on the step_no-th step after this call, as proto-9's at 104.9M."""
+    exchange, count = env.client.exchange, [0]
+
+    def patched(cmds):
+        exchange(cmds)
+        if not np.isscalar(cmds) or cmds == CMD_STEP:
+            count[0] += 1
+            if count[0] == step_no:
+                env._raw[worker, F["pos_x"]] = np.nan
+                env._raw[worker, F["dist_from_start"]] = np.nan
+    env.client.exchange = patched
+
+
+def test_a_non_finite_state_mid_episode_ends_only_that_episode():
+    env = _launch_env(n_workers=2, race="rlpilot-racepark3", recycle_resets=1000)
+    try:
+        env.reset()
+        for _ in range(5):
+            env.step(np.zeros((2, 4), np.float32))
+        pid, kept = env.client.procs[0].pid, env._raw[0].copy()
+        _nan_after(env, 1)
+        obs, reward, term, trunc, info = env.step(np.zeros((2, 4), np.float32))
+        assert term[0] and not term[1] and not trunc.any()
+        assert env.term_reasons[info["stats"]["term_reason"][0]] == "sim_error"
+        assert reward[0] == 0.0 and np.isfinite(reward).all() and np.isfinite(obs).all()
+        assert np.isfinite(info["final_obs"][0]).all() and np.isfinite(info["final_raw"][0]).all()
+        assert info["final_raw"][0][F["pos_x"]] == kept[F["pos_x"]]  # the last finite state
+        assert all(np.isfinite(v[0]) for k, v in info["stats"].items())
+        assert env.client.procs[0].pid != pid and env._raw[0, F["time"]] < 0.1  # a fresh worker, a new episode
+        (record,) = env.sim_errors
+        assert record["worker"] == 0 and set(record["nonfinite_fields"]) == {"pos_x", "dist_from_start"}
+        assert record["episode_steps"] == 5 and record["last_finite"]["pos_x"] == float(kept[F["pos_x"]])
+        for _ in range(3):
+            obs, reward, *_ = env.step(np.zeros((2, 4), np.float32))
+            assert np.isfinite(obs).all() and np.isfinite(reward).all()
+    finally:
+        env.close()
+
+
+def test_vecnormalize_stays_finite_through_a_non_finite_state():
+    env = _launch_env(n_workers=2, race="rlpilot-racepark3", recycle_resets=1000)
+    try:
+        from rlpilot.sb3 import SB3VecEnv
+        venv = VecNormalize(SB3VecEnv(env), norm_obs=False, norm_reward=True, gamma=0.995)
+        venv.reset()
+        _nan_after(env, 3, worker=1)
+        for _ in range(6):
+            _, reward, done, infos = venv.step(np.zeros((2, 4), np.float32))
+            assert np.isfinite(reward).all()
+        assert np.isfinite(venv.ret_rms.mean) and np.isfinite(venv.ret_rms.var) and len(env.sim_errors) == 1
+    finally:
+        env.close()

@@ -182,6 +182,7 @@ class TrainingMetricsCallback(BaseCallback):
         super().__init__()
         self.every, self.buf = every, deque(maxlen=window)
         self._last = 0
+        self._sim_errors_logged = 0
         self.launched = deque(maxlen=window)  # the same for launched episodes; buf only has grid starts, as in earlier runs
         self._failures: Counter[tuple[int, int, int]] = Counter()  # (track index, launched, bin along the lap) -> episodes
         self._failures_logged = 0
@@ -244,6 +245,10 @@ class TrainingMetricsCallback(BaseCallback):
                 m[f"driving/{k}"] = float(np.mean([s[k] for s in b]))
             self.buf.clear()
         env, sb3env = _base_env(self.training_env)
+        m["env/sim_errors"] = len(env.sim_errors)  # episodes ended by a non-finite engine state, since the run began
+        if len(env.sim_errors) != self._sim_errors_logged:
+            self._sim_errors_logged = len(env.sim_errors)
+            mlflow.log_dict(env.sim_errors, "diagnostics/sim_errors.json")
         if env.cfg.launch_share > 0:
             m["launch/share"] = float(env._launch_steps.sum() / max(env._mode_steps.sum(), 1))
             m["launch/start_retries"] = env.start_retries  # since the run began

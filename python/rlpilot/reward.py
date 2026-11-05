@@ -12,12 +12,14 @@ from ._native import F
 from .config import RewardConfig
 
 # Termination reasons (index = code in info["stats"]["term_reason"]; -1 = time limit / truncation).
-TERM_REASONS = ("offtrack", "stuck", "backwards", "damage", "race_over", "lap_done")
+# sim_error: the engine returned a non-finite state mid-episode (set by the env, not by RewardTracker)
+TERM_REASONS = ("offtrack", "stuck", "backwards", "damage", "race_over", "lap_done", "sim_error")
 LAP_DONE = TERM_REASONS.index("lap_done")
+SIM_ERROR = TERM_REASONS.index("sim_error")
 # Coarse groups for the dashboard.
 END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "stuck_crashed",
               "damage": "stuck_crashed", "race_over": "stuck_crashed", "lap_done": "lap_done",
-              "time_limit": "timeout"}
+              "time_limit": "timeout", "sim_error": "sim_error"}
 REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line", "steer_change", "steer_reversal")
 
 

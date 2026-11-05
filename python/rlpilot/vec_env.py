@@ -17,7 +17,7 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from . import features
 from ._native import CMD_NONE, CMD_RESET, CMD_STEP, A, Client, F
 from .config import EnvConfig
-from .reward import REWARD_COMPONENTS, TERM_REASONS, RewardTracker
+from .reward import REWARD_COMPONENTS, SIM_ERROR, TERM_REASONS, RewardTracker
 from .features import CAR_FACTORS, CAR_OBS_SCALE
 from .track import EdgeTable, HeightTable, LineTable, LookaheadTable
 
@@ -75,6 +75,9 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
         self._launched = np.zeros(n, bool)  # the current episode started from a random launch
         self.start_retries = 0  # launches restarted because their first observation wasn't finite
+        # Mid-episode non-finite engine states (see _sim_error): their diagnostics, and each env's last finite state
+        self.sim_errors: list[dict] = []
+        self._sim_failed = np.zeros(n, bool)
         self._launch_steps = np.zeros(n, np.int64)  # agent steps driven in launched episodes, per worker
         self._mode_steps = np.zeros(n, np.int64)    # and in all episodes, while launches are on
         self.obs_layout = features.make_layout(self.action_names, self._look.n_features if self._look is not None else 0,
@@ -87,6 +90,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self.action_space = gym.vector.utils.batch_space(self.single_action_space, n)
 
         self._raw = self.client.obs[:, 0]  # [n, OBS_DIM] view on shared memory
+        self._last_raw = np.zeros_like(self._raw)  # each env's last finite state (see _sim_error)
         self._act = self.client.act[:, 0]
         self._prev_action = np.zeros((n, self.act_dim), np.float32)  # applied controls, 0 at an episode's start
         self.applied = np.zeros((n, self.act_dim), np.float32)  # controls of the last step, kept across autoreset
@@ -133,6 +137,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._retry_bad_starts(np.arange(self.num_envs))
         self._start_rewards(slice(None))
         self._clear(slice(None), time.perf_counter())
+        self._last_raw[:] = self._raw
         return self._observe(), {}
 
     def _draw_car(self, idx: np.ndarray) -> None:
@@ -314,6 +319,11 @@ class SpeedDreamsVecEnv(VectorEnv):
         elif self.cfg.gearbox == "points":
             self._write_shift_points(actions[:, -2], actions[:, -1])
         self.client.exchange(CMD_STEP if active is None else np.where(active, CMD_STEP, CMD_NONE).astype(np.uint32))
+        bad = ~np.isfinite(self._raw).all(axis=1)
+        if active is not None:
+            bad &= active
+        if bad.any():
+            self._sim_error(np.flatnonzero(bad))
         d_steer = self.applied[:, 0] - prev_steer
         if self.cfg.steer_history:
             hist = self._steer_hist
@@ -340,6 +350,13 @@ class SpeedDreamsVecEnv(VectorEnv):
         raw = self._raw
         line_dev = self._line_dev()
         reward, terminated, reason = self._rew.step(raw, d_steer, line_dev)
+        if self._sim_failed.any():  # no reward, no penalty: the episode just ends, on its last finite state
+            f = self._sim_failed
+            reward[f] = 0.0
+            self._rew.components[:, f] = 0.0
+            terminated |= f
+            reason[f] = SIM_ERROR
+            self._sim_failed[:] = False
         self._reversals += self._rew.reversed
         self._linedev += line_dev
         self._absoff += np.abs(raw[:, F["to_middle"]]) / (np.maximum(raw[:, F["track_width"]], 1.0) * 0.5)
@@ -360,6 +377,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         obs = self._observe()
         done = terminated | truncated
         if not done.any():
+            self._last_raw[:] = raw
             return obs, reward, terminated, truncated, {}
 
         idx = np.flatnonzero(done)
@@ -434,7 +452,36 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._start_rewards(idx)
         self._clear(idx, now)
         obs[idx] = self._observe(idx)
+        self._last_raw[:] = raw
         return obs, reward, terminated, truncated, info
+
+    def _sim_error(self, idx: np.ndarray) -> None:
+        """Envs idx came back from a step with a non-finite state (proto-9 at 104.9M: a NaN position mid-episode on
+        Ole-road-1). Reading it would put NaN in the observation, the reward and so VecNormalize's statistics. Instead the
+        episode ends on its last finite state with no reward (see step), the worker is replaced at the reset, and the
+        details go to self.sim_errors."""
+        for i in idx:
+            i = int(i)
+            log = self.client.dirs[i] / "worker.log"
+            try:
+                tail = log.read_bytes()[-4000:].decode(errors="replace")
+            except OSError as e:
+                tail = f"unreadable: {e}"
+            record = {
+                "race": self.client.races[i], "worker": i, "episode_steps": int(self._len[i]),
+                "launched": bool(self._launched[i]), "car": self._car[i].tolist(), "action": self.applied[i].tolist(),
+                "nonfinite_fields": [k for k, j in F.items() if not np.isfinite(self._raw[i, j])],
+                "nonfinite_values": int((~np.isfinite(self._raw[i])).sum()),
+                "last_finite": {k: float(self._last_raw[i, j]) for k, j in F.items()},
+                "worker_log_tail": tail,
+            }
+            if len(self.sim_errors) < 100:
+                self.sim_errors.append(record)
+            print(f"rlpilot: non-finite engine state, env {i} on {record['race']} after {record['episode_steps']} steps "
+                  f"(fields {record['nonfinite_fields'][:8]}): episode ended, worker replaced", flush=True)
+        self._raw[idx] = self._last_raw[idx]
+        self._sim_failed[idx] = True
+        self.client.resets_since_spawn[idx] = max(self.cfg.recycle_resets, 1)  # respawn at the coming reset
 
     def close_extras(self, **kwargs):
         self.client.close()
