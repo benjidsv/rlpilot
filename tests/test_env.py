@@ -672,3 +672,55 @@ def test_throttle_and_brake_metrics_match_a_scripted_pedal():
         assert info["stats"]["brake_frac"][0] == 0 and info["stats"]["brake_onsets_per_s"][0] == 0
     finally:
         env.close()
+
+
+BAD_LAUNCH = [0.989797, 0.100086, -0.094747, 2.55208]  # proto-8's crash at 130.9M: Racepark3, any speed
+
+
+def _bad_launches(env, n):
+    """The next n draws of env are the launch that comes back non-finite; then the normal draws."""
+    draw, left = env._draw_start, [n]
+
+    def patched(idx):
+        if left[0] > 0:
+            left[0] -= 1
+            env._launched[idx] = True
+            env._act[idx, A["launch_pos"]:A["launch_speed"] + 1] = BAD_LAUNCH
+        else:
+            draw(idx)
+    env._draw_start = patched
+
+
+@pytest.mark.parametrize("bad_draws, launched", [(1, True), (99, False)])
+def test_a_non_finite_launch_is_redrawn_then_falls_back_to_the_grid(bad_draws, launched):
+    env = _launch_env(race="rlpilot-racepark3", launch_share=1.0)
+    try:
+        assert env.reset()[0].shape  # a normal draw first, with a worker that has run
+        env.start_retries = 0
+        _bad_launches(env, bad_draws)
+        obs, _ = env.reset()
+        assert np.isfinite(obs).all() and np.isfinite(env._raw).all()
+        assert env.start_retries == (1 if bad_draws == 1 else 5)
+        assert env._launched[0] == launched
+        obs, reward, *_ = env.step(np.zeros((1, 4), np.float32))
+        assert np.isfinite(obs).all() and np.isfinite(reward).all()
+    finally:
+        env.close()
+
+
+def test_autoreset_recovers_from_a_non_finite_launch():
+    env = _launch_env(race="rlpilot-racepark3", launch_share=1.0, max_episode_seconds=0.08)
+    try:
+        env.reset()
+        env.start_retries = 0
+        _bad_launches(env, 1)
+        env.step(np.zeros((1, 4), np.float32))
+        obs, _, _, trunc, _ = env.step(np.zeros((1, 4), np.float32))
+        assert trunc[0] and env.start_retries == 1 and np.isfinite(obs).all() and np.isfinite(env._raw).all()
+        assert env._raw[0, F["time"]] < 0.1  # the new episode, on a fresh draw
+    finally:
+        env.close()
+
+
+def test_launches_stay_clear_of_the_failing_edge():
+    assert EnvConfig().launch_lateral == 0.7

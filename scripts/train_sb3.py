@@ -81,6 +81,9 @@ def main():
                    help="PPO: continue from a directory with model.zip and vecnormalize.pkl (e.g. mlruns/.../best). "
                         "Steps restart at 0, the PPO flags here replace the saved values (--lr and --lr-schedule from there), "
                         "and step 0 is evaluated")
+    p.add_argument("--keep-steps", action="store_true",
+                   help="with --resume: continue the checkpoint's step count, so metrics line up with the first run, and "
+                        "--timesteps is the total to reach")
     p.add_argument("--steer-rate", type=float, default=RewardConfig.steer_rate,
                    help="reward penalty per step on (change of steer)^2, against steer chatter (0: off)")
     p.add_argument("--launch-share", type=float, default=EnvConfig.launch_share,
@@ -114,10 +117,17 @@ def main():
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
                    help="linear: decays to 10%% of --lr at the end of training")
+    p.add_argument("--lr-decay-steps", type=int, default=None,
+                   help="linear schedule: reach 10%% of --lr at this step and stay there (default: --timesteps). With --keep-steps, "
+                        "the same --lr and this keep the first run's schedule")
     p.add_argument("--n-steps", type=int, default=512, help="rollout length per env (x workers per update)")
     p.add_argument("--batch-size", type=int, default=2048)
     p.add_argument("--no-report", action="store_true", help="don't run scripts/report.py when training ends (PPO only)")
     a = p.parse_args()
+    if a.keep_steps and not a.resume:
+        p.error("--keep-steps needs --resume")
+    if a.lr_decay_steps is not None and a.lr_schedule != "linear":
+        p.error("--lr-decay-steps needs the linear schedule")
     if not 0 <= a.gae_lambda <= 1:
         p.error("--gae-lambda must be in [0, 1]")
 
@@ -137,7 +147,10 @@ def main():
                                         line_shaping=a.line_shaping, line_cap=a.line_cap, gamma=a.gamma),
                     car_grip=(1 - a.car_random, 1 + a.car_random), car_mass=(1 - a.car_random, 1 + a.car_random),
                     car_power=(1 - a.car_random, 1 + a.car_random), car_obs=a.car_obs)
-    lr = a.lr if a.lr_schedule == "constant" else (lambda progress_remaining: a.lr * (0.1 + 0.9 * progress_remaining))
+    decay = a.lr_decay_steps or a.timesteps
+    # SB3's progress_remaining = 1 - steps / --timesteps, also with --keep-steps
+    lr = a.lr if a.lr_schedule == "constant" else (
+        lambda progress_remaining: a.lr * (0.1 + 0.9 * max(0.0, 1.0 - (1.0 - progress_remaining) * a.timesteps / decay)))
     algo_kwargs = {
         "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=a.gae_lambda,
                     learning_rate=lr, ent_coef=a.ent_coef, clip_range=0.2, target_kl=a.target_kl or None,
@@ -145,7 +158,7 @@ def main():
         "sac": dict(gamma=a.gamma, buffer_size=1_000_000, batch_size=256, learning_starts=10_000, train_freq=1,
                     gradient_steps=1, policy_kwargs=dict(net_arch=[256, 256])),
     }[a.algo]
-    logged = algo_kwargs | {"learning_rate": f"{a.lr} ({a.lr_schedule})", "min_std": a.min_std,
+    logged = algo_kwargs | {"learning_rate": f"{a.lr} ({a.lr_schedule})", "lr_decay_steps": decay, "min_std": a.min_std,
                             "max_std": a.max_std} if a.algo == "ppo" else algo_kwargs
 
     if "MLFLOW_TRACKING_URI" not in os.environ:  # default: local SQLite store, artifacts in ./mlruns
@@ -155,13 +168,17 @@ def main():
     mlflow.set_experiment(a.experiment)
     with mlflow.start_run(run_name=a.run_name) as run:
         log_provenance(cfg, **{f"algo.{k}": v for k, v in logged.items()}, algo=a.algo,
-                       timesteps=a.timesteps, seed=a.seed, resume=a.resume)
+                       timesteps=a.timesteps, seed=a.seed, resume=a.resume, keep_steps=a.keep_steps)
         env = SB3VecEnv(SpeedDreamsVecEnv(cfg))
         Model = {"ppo": CpuRolloutPPO, "sac": SAC}[a.algo]
         if a.resume:
             if a.algo != "ppo":
                 p.error("--resume is PPO only")
             model = resume_ppo(a.resume, env, a.device, algo_kwargs)
+            if a.keep_steps:
+                if model.num_timesteps >= a.timesteps:
+                    p.error(f"the checkpoint is already at {model.num_timesteps} steps")
+                model._last_obs = None  # the saved observation belongs to the old workers: learn() must reset
             venv = model.get_env()
             model.set_random_seed(a.seed)
         else:
@@ -170,7 +187,7 @@ def main():
         model.set_logger(Logger(folder=None, output_formats=[HumanOutputFormat(sys.stdout),
                                                              MLflowOutputFormat()]))
         try:
-            model.learn(a.timesteps, callback=[
+            model.learn(a.timesteps - model.num_timesteps if a.keep_steps else a.timesteps, reset_num_timesteps=not a.keep_steps, callback=[
                 TrainingMetricsCallback(every=a.log_every),
                 *([ObsStatsCallback()] if a.algo == "ppo" else []),
                 EvalCallback(cfg, every=a.eval_every, episodes=a.eval_episodes, laps=a.eval_laps, verbose=1,

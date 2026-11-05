@@ -24,6 +24,7 @@ from .track import EdgeTable, LineTable, LookaheadTable
 FULL_THROTTLE = 0.95
 OFFTRACK_WHEELS = 2  # behaviour metric: at least half the car off the road
 BRAKE_ON = 0.1  # behaviour metric: the brake counts as applied from here
+START_RETRIES = 4  # new launch draws for an env whose first observation isn't finite; the grid after that
 GEARBOX_ACTIONS = {"auto": (), "agent": ("shift",), "points": ("shift_up", "shift_down")}  # extra actions
 # Per-episode behaviour means in info["stats"], logged as behavior/* and eval/behavior/*.
 BEHAVIOR_STATS = ("steer_delta", "steer_requested", "steer_reversal_frac", "steer_limit_frac", "steer_lock_frac",
@@ -70,6 +71,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._car_ranges = np.array([getattr(cfg, f) for f in CAR_FACTORS], np.float32)  # [3, (lo, hi)]
         self._car = np.ones((n, len(CAR_FACTORS)), np.float32)  # factors of each env's current episode
         self._launched = np.zeros(n, bool)  # the current episode started from a random launch
+        self.start_retries = 0  # launches restarted because their first observation wasn't finite
         self._launch_steps = np.zeros(n, np.int64)  # agent steps driven in launched episodes, per worker
         self._mode_steps = np.zeros(n, np.int64)    # and in all episodes, while launches are on
         self.obs_layout = features.make_layout(self.action_names, self._look.n_features if self._look is not None else 0,
@@ -125,6 +127,7 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._draw_car(np.arange(self.num_envs))
         self._draw_start(np.arange(self.num_envs))
         self.client.exchange(CMD_RESET)
+        self._retry_bad_starts(np.arange(self.num_envs))
         self._start_rewards(slice(None))
         self._clear(slice(None), time.perf_counter())
         return self._observe(), {}
@@ -152,6 +155,25 @@ class SpeedDreamsVecEnv(VectorEnv):
         slots = np.stack([self._rng.uniform(1e-4, 1 - 1e-4, k), self._rng.uniform(0.5 - half_range, 0.5 + half_range, k),
                           self._rng.uniform(-cfg.launch_yaw, cfg.launch_yaw, k), self._rng.uniform(*cfg.launch_speed, k)], 1)
         self._act[idx, A["launch_pos"]:A["launch_speed"] + 1] = np.where(launch[:, None], slots, 0).astype(np.float32)
+
+    def _retry_bad_starts(self, idx: np.ndarray) -> None:
+        """Rare launches come back from the engine with a NaN position and speed, before any reward reads them, and would
+        reach the policy: seen near the right edge with some heading, probably a car corner starting past a barrier. Restart
+        those envs with a new draw, then from the grid. A grid start that isn't finite is a different bug, so it raises."""
+        for attempt in range(START_RETRIES + 2):
+            bad = idx[~np.isfinite(self._raw[idx]).all(axis=1)]
+            if not len(bad):
+                return
+            if attempt == START_RETRIES + 1 or self.cfg.launch_share <= 0:
+                raise RuntimeError(f"non-finite first observation from a grid start: envs {bad.tolist()}")
+            self.start_retries += len(bad)
+            self._draw_start(bad)
+            if attempt == START_RETRIES:
+                self._launched[bad] = False
+                self._act[bad, A["launch_pos"]:A["launch_speed"] + 1] = 0
+            self._cmds[:] = CMD_NONE
+            self._cmds[bad] = CMD_RESET
+            self.client.exchange(self._cmds)
 
     def _start_rewards(self, idx) -> None:
         """Reward state of envs idx at their first observation. A launched car's distance raced counts from where it
@@ -399,6 +421,7 @@ class SpeedDreamsVecEnv(VectorEnv):
             self._assign_track(int(i), race)
             if switch[i]:
                 self._steps_on_track[i] = 0
+        self._retry_bad_starts(idx)
         self._start_rewards(idx)
         self._clear(idx, now)
         obs[idx] = self._observe(idx)

@@ -244,6 +244,7 @@ class TrainingMetricsCallback(BaseCallback):
         env, sb3env = _base_env(self.training_env)
         if env.cfg.launch_share > 0:
             m["launch/share"] = float(env._launch_steps.sum() / max(env._mode_steps.sum(), 1))
+            m["launch/start_retries"] = env.start_retries  # since the run began
             if self.launched:
                 b = list(self.launched)
                 m["launch/episode_seconds"] = float(np.mean([s["seconds"] for s in b]))
@@ -333,6 +334,7 @@ class EvalCallback(BaseCallback):
         self._window: list[tuple[int, float, Path]] = []  # (step, score, local model snapshot) of the last evals
 
     def _on_training_start(self):
+        self._last = self.num_timesteps  # a resume that keeps its step count isn't due an eval at once
         self.refs = {r: reference_mod.load(reference_for(r), laps=3) for r in self.races}
         self.ref = self.refs[self.train_races[0]]
         mlflow.log_params({"eval.episodes": self.cfg.n_workers // len(self.races),
@@ -463,6 +465,9 @@ class CheckpointCallback(BaseCallback):
     def __init__(self, every: int = 1_000_000):
         super().__init__()
         self.every, self._last = every, 0
+
+    def _on_training_start(self):
+        self._last = self.num_timesteps
 
     def _on_step(self) -> bool:
         if self.num_timesteps - self._last >= self.every:

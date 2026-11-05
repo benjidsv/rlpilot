@@ -90,7 +90,9 @@ class EnvConfig:
     # launched car faces down the road, in a gear for its speed. 0: grid only, and no random draws are made for it.
     launch_share: float = 0.0
     launch_speed: tuple[float, float] = (0.0, 29.0)  # m/s, uniform (29 m/s = 105 km/h, the range of Sony's 2024 vision paper)
-    launch_lateral: float = 0.8      # uniform over this share of the road's width, around its middle
+    # Uniform over this share of the road's width, around its middle. proto-8 used 0.8 until 130.9M: 0.10 from the right edge
+    # with some heading can come back from placement with a NaN position, about 1 launch in 10,000 (see vec_env._retry_bad_starts).
+    launch_lateral: float = 0.7
     launch_yaw: float = 0.1          # rad, uniform within +- this of the track direction
     max_episode_seconds: float = 300.0  # sim time; keep below the engine's slow-lap elimination (~425 s on Jarama)
     laps_per_episode: int = 0        # > 0: completing this many laps ends the episode (terminated, "lap_done")

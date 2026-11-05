@@ -346,3 +346,13 @@ Mean advantage just before a crash, in units of its std in ordinary driving (tra
 So 0.98 carries about 1.5-2.3x the crash signal at 3-4 s, even after its extra variance. What this can't say: episodes are selected for crashing, these critics were trained at 0.95, and a bigger signal doesn't show that the action taken then caused the crash. It justifies trying 0.98; it doesn't show 0.95 is the limit. Also, V stays ~0.9 above the realized return at 2-3 s (one crash penalty is 0.98), but conditioning on a crash inflates that, so it isn't a calibration measure.
 
 **Plan:** proto-8 with launches only, at lambda 0.95. Then the same run with `--gae-lambda 0.98` if it doesn't settle the lethal corners.
+
+## proto-8's crash at 130.9M (2026-11-05)
+
+**Cause: a launch placement bug.** A launch can return NaN position, speed and rays in its first observation, and the policy raises on it. The reward stays finite because the reward step reads the previous episode. Reproduced deterministically from checkpoint 0130000910 on Racepark3, at lap fraction 0.9898, 0.10 of the width from the right edge, heading -0.095 rad, at any speed. Heading 0 or 0.2 from the edge is fine. Random scan: 1 failure in ~10,500 launches over 0.10-0.90 on 35 tracks; 2 in 5,250 at 0.10-0.12 on the right; 0 in 21,000 at 0.15-0.85. Seen on Racepark3, Petit and Longjour. Probably a car corner starting past a barrier; not traced inside the engine.
+
+**Unrelated slowdown.** Env throughput halved (30k to 15k steps/s) from about 22:40: the Mac was unplugged at ~9% battery and recharged slowly. proto-7-control's crash is still unexplained: it had no launches and no slowdown, and there is no traceback.
+
+**Fix:** `launch_lateral` 0.8 -> 0.7, and `_retry_bad_starts` redraws a non-finite launch, then uses the grid (`launch/start_retries` counts them). `--keep-steps` and `--lr-decay-steps` resume with the same step count and schedule: checked at 130M, with learning rate 1.83e-4 as in the first run.
+
+**Continuing:** `proto-8-cont`, from 130M to 500M, on proto-8's schedule to 3e-5 at 300M, then held there. Past 300M there's no proto-7 to compare with: that stretch shows what launches do at a low learning rate. The launch range changes at 130M.
