@@ -22,10 +22,6 @@ cmake -S "$ROOT/native" -B "$ROOT/native/build" -DCMAKE_BUILD_TYPE=Release
 cmake --build "$ROOT/native/build" -j"$(nproc)"
 cmake --install "$ROOT/native/build"
 
-# Python env (gym wrapper, SB3, MLflow)
-if command -v uv >/dev/null; then
-  [ -d "$ROOT/.venv" ] || uv venv "$ROOT/.venv"
-  VIRTUAL_ENV="$ROOT/.venv" uv pip install -e "$ROOT[train,dev]"
-else
-  echo "uv not found: skipping the Python env (pip install -e '.[train,dev]' in a venv)"
-fi
+# Python env (gym wrapper, SB3, MLflow). Python 3.14 like the Mac's, so that checkpoints load on both.
+command -v uv >/dev/null || { echo "uv not found: https://docs.astral.sh/uv/ then rerun"; exit 1; }
+(cd "$ROOT" && uv sync --locked --extra train --extra dev --python 3.14)

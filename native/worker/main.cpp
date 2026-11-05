@@ -461,7 +461,7 @@ public:
 
 rlp_header *mapShm(const std::string &name)
 {
-    int fd = shm_open(name.c_str(), O_RDWR);
+    int fd = shm_open(name.c_str(), O_RDWR, 0);
     if (fd < 0)
         return nullptr;
     struct stat st;

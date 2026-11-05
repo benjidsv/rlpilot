@@ -13,9 +13,12 @@ from pathlib import Path
 
 import numpy as np
 import torch as th
+from gymnasium import spaces
 from stable_baselines3 import PPO
+from stable_baselines3.common.utils import explained_variance
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
+from torch.nn import functional as F
 
 from .vec_env import SpeedDreamsVecEnv
 
@@ -78,18 +81,90 @@ class SB3VecEnv(VecEnv):
 
 
 class CpuRolloutPPO(PPO):
-    """PPO whose rollouts use one torch thread: the policy runs on a batch of n_envs observations per step,
-    where waking a thread pool costs more than it saves (and the threads compete with the sim workers).
-    The updates keep all threads. Measured +6% end to end with 5 workers. Saved models load with PPO.load.
-    (Running the updates on MPS was slower: SB3 syncs to the CPU after every minibatch.)"""
+    """PPO whose rollouts always run on the CPU, with one torch thread: the policy runs on a batch of n_envs observations per
+    step, where waking a thread pool costs more than it saves (and the threads compete with the sim workers). The updates keep
+    all threads, or run on `device` if it's a GPU. Measured on a 7700X + RTX 4070 Ti, per ~10k samples: CPU only 0.42 s rollout +
+    0.43 s update, GPU only 0.62 s + 0.18 s. Saved models load with PPO.load. (Updates on MPS were slower: SB3 syncs to the CPU
+    after every minibatch.)"""
 
     def collect_rollouts(self, *args, **kwargs):
-        threads = th.get_num_threads()
+        threads, update_device = th.get_num_threads(), self.device
         th.set_num_threads(1)
+        cpu = th.device("cpu")
+        # .to() keeps the parameter objects, so the optimizer stays valid, and its state stays on update_device for train().
+        # Evaluations run in this method's callbacks, so they're on the CPU too.
+        self.policy.to(cpu)
+        self.device = cpu
         try:
             return super().collect_rollouts(*args, **kwargs)
         finally:
+            self.device = update_device
+            self.policy.to(update_device)
             th.set_num_threads(threads)
+
+    def train(self) -> None:
+        if self.device.type == "cpu" or self.clip_range_vf is not None or not isinstance(self.action_space, spaces.Box):
+            return super().train()
+        return self._train_on_gpu()
+
+    def _train_on_gpu(self) -> None:
+        """PPO.train with the same updates and the same random draws, minus its GPU overhead: the rollout goes to the GPU once
+        rather than per minibatch, and only the KL early stop waits for the GPU, rather than five values per minibatch."""
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining)
+        b = self.rollout_buffer
+        n = b.buffer_size * b.n_envs
+        if not b.generator_ready:
+            for name in ("observations", "actions", "values", "log_probs", "advantages", "returns"):
+                b.__dict__[name] = b.swap_and_flatten(b.__dict__[name])
+            b.generator_ready = True
+        obs, actions = b.to_torch(b.observations), b.to_torch(b.actions.astype(np.float32, copy=False))
+        old_log_probs, all_advantages, returns = (b.to_torch(x.flatten()) for x in (b.log_probs, b.advantages, b.returns))
+
+        logged = {"entropy_loss": [], "policy_gradient_loss": [], "value_loss": [], "clip_fraction": []}
+        continue_training = True
+        for _ in range(self.n_epochs):
+            approx_kl_divs = []
+            order = th.as_tensor(np.random.permutation(n), device=self.device)  # as RolloutBuffer.get
+            for start in range(0, n, self.batch_size):
+                batch = order[start:start + self.batch_size]
+                old_log_prob = old_log_probs[batch]
+                values, log_prob, entropy = self.policy.evaluate_actions(obs[batch], actions[batch])
+                advantages = all_advantages[batch]
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                ratio = th.exp(log_prob - old_log_prob)
+                policy_loss = -th.min(advantages * ratio, advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)).mean()
+                value_loss = F.mse_loss(returns[batch], values.flatten())
+                entropy_loss = -th.mean(-log_prob) if entropy is None else -th.mean(entropy)
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                with th.no_grad():
+                    logged["policy_gradient_loss"].append(policy_loss.detach())
+                    logged["value_loss"].append(value_loss.detach())
+                    logged["entropy_loss"].append(entropy_loss.detach())
+                    logged["clip_fraction"].append(th.mean((th.abs(ratio - 1) > clip_range).float()))
+                    log_ratio = log_prob - old_log_prob
+                    approx_kl_divs.append(th.mean((th.exp(log_ratio) - 1) - log_ratio))
+                if self.target_kl is not None and approx_kl_divs[-1].item() > 1.5 * self.target_kl:
+                    continue_training = False
+                    break
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+            self._n_updates += 1
+            if not continue_training:
+                break
+
+        for name, values in logged.items():
+            self.logger.record(f"train/{name}", th.stack(values).mean().item())
+        self.logger.record("train/approx_kl", th.stack(approx_kl_divs).mean().item())
+        self.logger.record("train/loss", loss.item())
+        self.logger.record("train/explained_variance", explained_variance(b.values.flatten(), b.returns.flatten()))
+        self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/clip_range", clip_range)
 
 
 def resume_ppo(directory: str | Path, env: VecEnv, device: str, settings: dict) -> CpuRolloutPPO:

@@ -39,7 +39,7 @@ def main():
     p.add_argument("--experiment", default="rlpilot")
     p.add_argument("--run-name", default=None)
     p.add_argument("--seed", type=int, default=None, help="network init and action sampling (the sim is deterministic)")
-    p.add_argument("--device", default="cpu", help="small MLPs are usually fastest on CPU")
+    p.add_argument("--device", default="cpu", help="where PPO updates run, e.g. cuda (rollouts and evals stay on the CPU)")
     p.add_argument("--laps-per-episode", type=int, default=0, help="training episodes end after N laps (0: time only)")
     p.add_argument("--gearbox", choices=["auto", "points", "agent"], default="auto",
                    help="auto: fixed shift points; points: the agent sets the up/downshift points; agent: the agent shifts")

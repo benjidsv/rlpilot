@@ -453,13 +453,22 @@ def test_no_jump_across_the_start_line_including_the_grid(laps, track):
     speed = np.hypot(raw[:, F["speed_x"]], raw[:, F["speed_y"]])
     # continuous along the path, whereas dist_from_start jumps at the line. The fastest a point can move in the world is the
     # rate of its distance along the lap, times 2.6 (the outside of a bend; Imola's seam is 5 m of map in 2 m of lap)
-    path = np.maximum.accumulate(raw[:, F["dist_raced"]])
-    grid = raw[:, F["dist_raced"]] < 0
+    # Without lap-sized jumps, as in reward.py: at Imola's seam dist_from_start can read a few metres past the lap for a few steps
+    raced = raw[:, F["dist_raced"]]
+    steps = np.diff(raced)
+    steps -= length * np.rint(steps / length)
+    unwrapped = raced[0] + np.r_[0.0, np.cumsum(steps)]
+    path = np.maximum.accumulate(unwrapped)
+    grid = raced < 0
     path = np.where(grid, raw[:, F["dist_from_start"]] - length, path)
     moved = np.diff(path)[:, None] + np.diff(edges.span(speed))[:, None] * edges.fractions
+    # `moved` means nothing while it reads past the lap, or until the path has caught up with its running maximum afterwards
+    past = raw[:, F["dist_from_start"]] >= length
+    behind = ~grid & (unwrapped < path)
+    ok = ~(past[:-1] | past[1:] | behind[:-1] | behind[1:])
     for p in (left, right):
         jump = np.hypot(np.diff(world_x(p), axis=0), np.diff(world_y(p), axis=0))
-        assert (jump <= 2.6 * np.abs(moved) + 0.25).all(), (track, jump.max())
+        assert (jump <= 2.6 * np.abs(moved) + 0.25)[ok].all(), (track, jump[ok].max())
     # the grid's first observation sees across the line with no gap between neighbouring points
     for p in (left[0], right[0]):
         assert np.hypot(*np.diff(p, axis=0).T).max() < 60.0 / (POINTS - 1) * 2.6

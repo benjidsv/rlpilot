@@ -20,7 +20,10 @@ set(SD_LIBDIR "${SD_PREFIX}/lib/games/speed-dreams-2/lib")
 
 # Must match the engine's own definitions: they change struct layouts (tCarElt, ...).
 set(SD_DEFINES CLIENT_SERVER GL_GLEXT_PROTOTYPES HAVE_CONFIG_H SHM SPEED_DREAMS THIRD_PARTY_EXPAT
-    TRACE_LEVEL=5 TRACE_OUT UNLOAD_SSGGRAPH USE_MACPORTS USE_RANDR_EXT _DEFAULT_SOURCE)
+    TRACE_LEVEL=5 TRACE_OUT UNLOAD_SSGGRAPH USE_RANDR_EXT _DEFAULT_SOURCE)
+if(APPLE)
+  list(APPEND SD_DEFINES USE_MACPORTS)
+endif()
 set(SD_INCLUDES "${SD_BUILD}" "${RLP_ROOT}/deps/include" "${SD_SRC}/interfaces"
     "${SD_SRC}/libs/portability" "${SD_SRC}/libs/tgf" "${SD_SRC}/libs/tgfdata" "${SD_SRC}/libs/tgfclient"
     "${SD_SRC}/libs/math" "${SD_SRC}/libs/robottools")

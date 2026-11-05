@@ -11,7 +11,9 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
+#endif
 
 #include "../protocol.h"
 #include "../sync.h"
@@ -44,8 +46,13 @@ int main(int argc, char **argv)
     uint32_t spin = argc > 6 ? atoi(argv[6]) : 50;
 
     char exe[1024], worker[1100], shm[32];
+#if defined(__APPLE__)
     uint32_t sz = sizeof exe;
     _NSGetExecutablePath(exe, &sz);
+#else
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    exe[len > 0 ? len : 0] = 0;
+#endif
     snprintf(worker, sizeof worker, "%.*s/rlpilot-worker", (int)(strrchr(exe, '/') - exe), exe);
     snprintf(shm, sizeof shm, "/rlpb%d", getpid());
 
