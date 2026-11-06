@@ -74,6 +74,8 @@ def main():
     p.add_argument("--height-points", type=int, default=0,
                    help="observe the road height at this many points ahead, over the edge points' span (0: off; "
                         "--edge-points - 1 puts them at the same places)")
+    p.add_argument("--accel-obs", action="store_true",
+                   help="observe the car's acceleration in its own frame (longitudinal, lateral, vertical)")
     p.add_argument("--offtrack-patience", type=float, default=RewardConfig.offtrack_patience,
                    help="s with all four wheels off the road before an episode ends")
     p.add_argument("--backwards-patience", type=float, default=RewardConfig.backwards_patience,
@@ -160,7 +162,7 @@ def main():
                     track_switch_steps=a.track_switch_steps, recycle_resets=a.recycle_resets, lookahead=a.lookahead, lookahead_stat=a.lookahead_stat,
                     launch_share=a.launch_share, launch_speed=(0.0, a.launch_max_speed),
                     line_obs=a.line_obs, edge_points=a.edge_points, edge_horizon=a.edge_horizon, edge_floor=a.edge_floor,
-                    height_points=a.height_points,
+                    height_points=a.height_points, accel_obs=a.accel_obs,
                     steer_limit=a.steer_limit, steer_history=a.steer_history,
                     reward=RewardConfig(steer_rate=a.steer_rate, steer_change=a.steer_change,
                                         steer_reversal=a.steer_reversal, steer_deadband=a.steer_deadband,

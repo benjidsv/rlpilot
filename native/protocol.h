@@ -19,7 +19,7 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 5
+#define RLP_VERSION 6
 #define RLP_MAX_CARS 8
 #define RLP_N_RAYS 19
 #define RLP_RAY_RANGE 200.0f
@@ -65,6 +65,7 @@ enum rlp_field {
     RLP_F_YAW,
     RLP_F_ACCEL_X,
     RLP_F_ACCEL_Y,
+    RLP_F_ACCEL_Z,         /* car frame (m/s^2), like ACCEL_X/Y: net acceleration, gravity included */
     RLP_F_TRACK_LENGTH,    /* m, constant */
     RLP_N_FIELDS
 };

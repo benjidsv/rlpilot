@@ -82,7 +82,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         self._mode_steps = np.zeros(n, np.int64)    # and in all episodes, while launches are on
         self.obs_layout = features.make_layout(self.action_names, self._look.n_features if self._look is not None else 0,
                                                len(self._line.points) if cfg.line_obs else 0, cfg.car_obs,
-                                               cfg.steer_history, cfg.edge_points, cfg.height_points)
+                                               cfg.steer_history, cfg.edge_points, cfg.height_points,
+                                               cfg.accel_obs)
         od = self.obs_layout.dim
         self.single_observation_space = gym.spaces.Box(-np.inf, np.inf, (od,), np.float32)
         self.single_action_space = gym.spaces.Box(-1.0, 1.0, (self.act_dim,), np.float32)
@@ -222,6 +223,8 @@ class SpeedDreamsVecEnv(VectorEnv):
         if self._height is not None:
             parts["height"] = self._height(raw[:, F["dist_from_start"]], np.hypot(raw[:, F["speed_x"]], raw[:, F["speed_y"]]),
                                            *(r[sel] for r in self._height_rows)) / features.HEIGHT_SCALE
+        if cfg.accel_obs:
+            parts["accel"] = raw[:, [F["accel_x"], F["accel_y"], F["accel_z"]]] / features.ACCEL_SCALE
         return features.assemble(self.obs_layout, parts)
 
     def _assign_track(self, i: int, race: str) -> None:

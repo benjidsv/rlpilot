@@ -158,6 +158,7 @@ void writeObs(uint32_t k)
     o[RLP_F_YAW] = car->_yaw;
     o[RLP_F_ACCEL_X] = car->_accel_x;
     o[RLP_F_ACCEL_Y] = car->_accel_y;
+    o[RLP_F_ACCEL_Z] = car->_accel_z;
     o[RLP_F_TRACK_LENGTH] = H.engine->inData()->track->length;
 
     float *rays = o + RLP_N_FIELDS;
