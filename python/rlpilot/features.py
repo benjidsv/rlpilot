@@ -27,6 +27,7 @@ EDGE_Y_SCALE = 50.0
 # Observation = metres / this. On the train and validation tracks at 60 m/s (6 s = 360 m ahead), the road differs by at most
 # 50 m from the car's height, so inputs stay within about 5, like the edges.
 HEIGHT_SCALE = 10.0
+TIMER_NAMES = ("offtrack_timer", "backwards_timer", "stuck_timer")
 ACCEL_SCALE = 10.0  # observation = m/s^2 / this (~1 g per unit). Not clipped.
 EDGE_GROUPS = ("edge_left_x", "edge_left_y", "edge_right_x", "edge_right_y")  # in the order of EdgeTable.car_frame
 
@@ -71,7 +72,8 @@ class ObsLayout:
 
 
 def make_layout(action_names: tuple[str, ...], n_lookahead: int = 0, n_line: int = 0, car_obs: bool = False,
-                steer_history: int = 0, edge_points: int = 0, height_points: int = 0, accel: bool = False) -> ObsLayout:
+                steer_history: int = 0, edge_points: int = 0, height_points: int = 0, accel: bool = False,
+                timers: bool = False) -> ObsLayout:
     named = lambda prefix, n: tuple(f"{prefix}{i}" for i in range(n))
     groups = [
         ObsGroup("speed", ("speed_x", "speed_y", "speed_z"), "car frame, m/s: x / 50 (+ = forward), y / 10, z / 10"),
@@ -112,6 +114,10 @@ def make_layout(action_names: tuple[str, ...], n_lookahead: int = 0, n_line: int
     if accel:
         groups.append(ObsGroup("accel", ("accel_x", "accel_y", "accel_z"),
                                f"the car's net acceleration, car frame, m/s^2 / {ACCEL_SCALE:g}, + = forward, left, up, not clipped"))
+    if timers:
+        groups.append(ObsGroup("timers", TIMER_NAMES,
+                               "time spent so far off the road (all 4 wheels), facing backwards and stuck, each / its "
+                               "termination patience, in [0, 1]: 1 ends the episode. 0 when the condition stops"))
     return ObsLayout(tuple(groups))
 
 

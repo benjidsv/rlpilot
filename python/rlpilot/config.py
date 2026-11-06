@@ -67,6 +67,9 @@ class EnvConfig:
     # The car's acceleration in its own frame (x forward, y left, z up; m/s^2), as the engine computes it from the net force:
     # what a driver feels as weight transfer. The policy has no memory, so it can't get this from two consecutive speeds.
     accel_obs: bool = False
+    # The clocks of the termination rules: time off the road (all 4 wheels), facing backwards and below stuck_speed, each over its
+    # rule's patience. A driver knows how long they've been on the grass; without this, the agent can't tell 0.5 s from 4.9 s.
+    timer_obs: bool = False
     lookahead_stat: str = "peak"     # per window: "peak" (signed max |curvature|) or "mean" (proto-3/4; dilutes
                                      # short tight corners, e.g. Spa's Bus Stop read -0.82 for a -1.34 peak)
     # Car randomization: factors drawn uniformly per episode (applied when the race restarts, ~ms).
