@@ -10,7 +10,7 @@
 A PPO driver for a racing simulator (Speed Dreams, a TORCS fork), trained on 29 tracks and tested on tracks it has
 never seen. The question is generalisation: can one policy drive a circuit it has never trained on? Over seven
 300M-step runs, plus pilots and fine-tunes, I changed the observations, the reward, the action space and the
-evaluation, and tried to make it perform on held-out tracks.
+evaluation, and tried to make it generalise to held-out tracks.
 
 ## Result
 
@@ -54,8 +54,7 @@ critic does see crashes coming about 2 s out on training tracks (AUC 0.77-0.91),
 more crash signal 3-4 s out (notes). So lambda 0.98 went into proto-9, bundled with three other changes, and that run
 can't attribute it.
 
-**3. Selection bias is real, especially on brittle policies:**
-Episodes are chaotic: a 3e-7 change in the actions flips crash vs
+**3. Selection bias is real, especially on brittle policies:** episodes are chaotic: a 3e-7 change in the actions flips crash vs
 lap at a marginal corner. Between checkpoints ~6M steps apart, a median of 8 of the 35 non-test tracks change outcome.
 The live dashboard's 4 monitored training tracks read 1.00 at 10 of proto-8-cont's last 12 evals, while the post-run
 sweep put all 29 at 0.53-0.78 over the same stretch of training. And `best/`'s validation score is 47.9% against 31.2%
@@ -116,7 +115,7 @@ as many attempts as the first one.
   looked fine. Progress now drops lap-sized jumps.
 - proto-6's line shaping was potential-based (Ng et al. 1999), capped at 3 m and faded out by half the run.
 
-**Evaluation** Deterministic policy, stock car, 2-lap episodes, the first episode per track clean and the rest with
+**Evaluation:** Deterministic policy, stock car, 2-lap episodes, the first episode per track clean and the rest with
 small action noise for 1 s. Lap times are compared with the built-in bot on the same track and car. `best/` is the best
 eval of the best window of 3. A post-run report sweeps every saved checkpoint on the 29 training and 6 validation tracks
 ([`report.py`](python/rlpilot/report.py)) with a crash map per track, because the live eval covered 10 tracks until
@@ -142,7 +141,7 @@ macOS: [docs/speed-dreams-setup.md](docs/speed-dreams-setup.md).
 ## Status and limits
 
 - **Reliability on new tracks is the open problem**: 31.2% on the test split.
-- **One seed per run and bundled changes** `--seed` doesn't reach the car and launch draws yet, which a multi-seed
+- **One seed per run and bundled changes:** `--seed` doesn't reach the car and launch draws yet, which a multi-seed
   comparison needs first. Each run takes 5-10 h, so I prioritise runs over seeds
 - **Builds on macOS (Apple Silicon) and Linux / WSL2**
 
