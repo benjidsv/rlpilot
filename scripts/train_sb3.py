@@ -126,6 +126,11 @@ def main():
     p.add_argument("--min-std", type=float, default=0.135, help="PPO: floor on the action std (0.135 = exp(-2))")
     p.add_argument("--max-std", type=float, default=1.0,
                    help="PPO: cap on the action std; pilot-4's entropy bonus drove it to 127 (actions are clipped to [-1, 1])")
+    p.add_argument("--sde", action="store_true",
+                   help="PPO: generalized state-dependent exploration (gSDE): the noise is a function of the policy's features, "
+                        "with weights redrawn every --sde-freq steps, so it is correlated over time. --min-std / --max-std then "
+                        "bound each action's RMS std over the states of the last rollout")
+    p.add_argument("--sde-freq", type=int, default=16, help="with --sde: steps between noise redraws (16 = 0.64 s at 25 Hz)")
     p.add_argument("--gamma", type=float, default=0.995,
                    help="discount per agent step: the horizon is ~1/(1-gamma) steps, e.g. 0.99 at 25 Hz = 4 s, "
                         "0.995 = 8 s (proto-4 braked too late for Spa's Bus Stop, ~4.2 s out at 0.99)")
@@ -144,6 +149,8 @@ def main():
     a = p.parse_args()
     if a.keep_steps and not a.resume:
         p.error("--keep-steps needs --resume")
+    if a.sde and (a.algo != "ppo" or a.resume):
+        p.error("--sde is for new PPO runs (a checkpoint's std has another shape)")
     if a.lr_decay_steps is not None and a.lr_schedule != "linear":
         p.error("--lr-decay-steps needs the linear schedule")
     if not 0 <= a.gae_lambda <= 1:
@@ -180,7 +187,7 @@ def main():
     algo_kwargs = {
         "ppo": dict(n_steps=a.n_steps, batch_size=a.batch_size, n_epochs=10, gamma=a.gamma, gae_lambda=a.gae_lambda,
                     learning_rate=lr, ent_coef=a.ent_coef, clip_range=0.2, target_kl=a.target_kl or None,
-                    policy_kwargs=dict(net_arch=[256, 256])),
+                    policy_kwargs=dict(net_arch=[256, 256]), **(dict(use_sde=True, sde_sample_freq=a.sde_freq) if a.sde else {})),
         "sac": dict(gamma=a.gamma, buffer_size=1_000_000, batch_size=256, learning_starts=10_000, train_freq=1,
                     gradient_steps=1, policy_kwargs=dict(net_arch=[256, 256])),
     }[a.algo]

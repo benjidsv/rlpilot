@@ -138,20 +138,61 @@ class StdClampCallback(BaseCallback):
     """PPO only: keeps the Gaussian policy's action std inside [min_std, max_std] and logs the std of each action
     dimension (`ppo/std_<name>`) every `every` timesteps. Without a cap the entropy bonus can grow the std
     without bound once the (clipped) actions saturate: pilot-4 (shifting, ent_coef 0.01) reached std 127.
-    The clamp runs before every rollout, i.e. right after each update."""
+    The clamp runs before every rollout, i.e. right after each update. With gSDE it bounds each action's RMS std over
+    the states of the last rollout (logged as ppo/std_<name>, with its 10th percentile over states as ppo/std_p10_<name>)."""
 
     def __init__(self, names: tuple[str, ...], min_std: float = 0.135, max_std: float = 1.0, every: int = 20_000):
         super().__init__()
         self.names, self.every, self._last = names, every, 0
+        self.min_std, self.max_std = min_std, max_std
         self.lo, self.hi = float(np.log(min_std)), float(np.log(max_std))
+        self._phi2 = None  # gSDE: mean squared policy feature over the last rollout [latent_dim]
 
     def _on_rollout_start(self):
         import torch
+        policy = self.model.policy
         with torch.no_grad():
-            self.model.policy.log_std.clamp_(self.lo, self.hi)
+            if not self.model.use_sde:
+                policy.log_std.clamp_(self.lo, self.hi)
+                return
+            # gSDE: the action std in state s is sqrt(phi(s)^2 @ sigma^2) per action (phi = the policy's last layer, sigma
+            # = exp(log_std) [latent_dim, n_actions]). Clamp each action's RMS std over the states of the last rollout
+            # by shifting its whole log_std column, which keeps how the noise is spread over states.
+            phi2 = self._phi2 if self._phi2 is not None else self._mean_phi2(self.model._last_obs)
+            sigma2 = policy.action_dist.get_std(policy.log_std) ** 2
+            rms = torch.sqrt(phi2 @ sigma2)  # [n_actions]
+            shift = torch.log(torch.clamp(rms, self.min_std, self.max_std) / rms)
+            policy.log_std.add_(shift[None, :])
+            policy.reset_noise(self.training_env.num_envs)  # SB3 drew this rollout's noise before this callback
+
+    def _features(self, obs):
+        import torch
+        policy = self.model.policy
+        obs_t = torch.as_tensor(np.asarray(obs).reshape(-1, *policy.observation_space.shape), device=policy.device)
+        return policy.mlp_extractor.forward_actor(policy.extract_features(obs_t, policy.pi_features_extractor))
+
+    def _mean_phi2(self, obs):
+        import torch
+        with torch.no_grad():
+            return (self._features(obs) ** 2).mean(0)
+
+    def _on_rollout_end(self):
+        if not self.model.use_sde:
+            return
+        import torch
+        policy = self.model.policy
+        with torch.no_grad():
+            phi = self._features(self.model.rollout_buffer.observations)
+            self._phi2 = (phi ** 2).mean(0)
+            if self.num_timesteps - self._last >= self.every:  # the std this rollout ran with, per state
+                self._last = self.num_timesteps
+                std = torch.sqrt((phi ** 2) @ policy.action_dist.get_std(policy.log_std) ** 2).cpu().numpy()
+                m = {f"ppo/std_{n}": float(np.sqrt((std[:, i] ** 2).mean())) for i, n in enumerate(self.names)}
+                m |= {f"ppo/std_p10_{n}": float(np.percentile(std[:, i], 10)) for i, n in enumerate(self.names)}
+                mlflow.log_metrics(m, step=self.num_timesteps)
 
     def _on_step(self) -> bool:
-        if self.num_timesteps - self._last >= self.every:
+        if not self.model.use_sde and self.num_timesteps - self._last >= self.every:
             self._last = self.num_timesteps
             std = self.model.policy.log_std.detach().exp().cpu().numpy()
             mlflow.log_metrics({f"ppo/std_{n}": float(v) for n, v in zip(self.names, std)}, step=self.num_timesteps)
