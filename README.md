@@ -10,7 +10,7 @@
 A PPO driver for a racing simulator (Speed Dreams, a TORCS fork), trained on 29 tracks and tested on tracks it has
 never seen. The question is generalisation: can one policy drive a circuit it has never trained on? Over seven
 300M-step runs, plus pilots and fine-tunes, I changed the observations, the reward, the action space and the
-evaluation, and tried to make it perform on held out tracks.
+evaluation, and tried to make it perform on held-out tracks.
 
 ## Result
 
@@ -23,7 +23,7 @@ evaluation, and tried to make it perform on held out tracks.
 | 6 validation | Never trained on, but **they selected `best/`** | 23 / 48 = **47.9%** | -3.6% (4 tracks) |
 | 6 test | Never trained on or used for any decision, evaluated once | 15 / 48 = **31.2%** | -3.7% and -5.6% (2 tracks) |
 
-I also minimized steering/pedal jitter with reward penalties and increased exploration with entropy bonuses and with a std on floor the actions.
+Steering is ~25x smoother since proto-7 (0.0038 vs 0.094 change per step), from rate-limited steering and penalties on the policy's own output. Exploration is held up by an entropy bonus and a floor on the action std, which turned into its own problem (finding 1).
 
 ![proto-8-cont's best checkpoint on Brno in the game, with its steering, brake and throttle inputs, beside a synced map of the same lap against the built-in bot](docs/img/lap_replay_clip.gif)
 
@@ -54,7 +54,7 @@ critic does see crashes coming about 2 s out on training tracks (AUC 0.77-0.91),
 more crash signal 3-4 s out (notes). So lambda 0.98 went into proto-9, bundled with three other changes, and that run
 can't attribute it.
 
-**3. Selection bias is real especially on brittle policies:**
+**3. Selection bias is real, especially on brittle policies:**
 Episodes are chaotic: a 3e-7 change in the actions flips crash vs
 lap at a marginal corner. Between checkpoints ~6M steps apart, a median of 8 of the 35 non-test tracks change outcome.
 The live dashboard's 4 monitored training tracks read 1.00 at 10 of proto-8-cont's last 12 evals, while the post-run
@@ -105,13 +105,13 @@ as many attempts as the first one.
 | Failed episode | -10 (proto-9: -50) |
 | Steering | -0.3 x \|change\| per step, -0.02 per reversal above a 0.015 dead-band |
 
-- **Size the penalties against progress.** Progress is ~0.14 per step at mean speed. proto-5's
+- **Size the penalties against progress:** Progress is ~0.14 per step at mean speed. proto-5's
   steering-rate penalty came to ~0.3% of it and couldn't stop the jitter; proto-7's two terms come to 3-8%, checked in a
   smoke run against the terminal penalty too ([notes](docs/research-notes-proto7.md)).
-- **A big terminal penalty bought slowness. It wasn't safer** With gamma 0.995 at 25 Hz, the discounted future at 40 m/s is
+- **A big terminal penalty bought slowness. It wasn't safer:** With gamma 0.995 at 25 Hz, the discounted future at 40 m/s is
   worth ~32 (0.1 x 40 m/s x 0.04 s per step, over ~200 steps), so -50 outweighs all of it. proto-9 got slower without
   finishing more.
-- **Reward hacking** A smoke run found the policy creeping off the grid and spinning across
+- **Reward hacking:** A smoke run found the policy creeping off the grid and spinning across
   the start line backwards: the lap counter jumped a lap, and all the progress reward came from it, while the return
   looked fine. Progress now drops lap-sized jumps.
 - proto-6's line shaping was potential-based (Ng et al. 1999), capped at 3 m and faded out by half the run.
@@ -143,8 +143,7 @@ macOS: [docs/speed-dreams-setup.md](docs/speed-dreams-setup.md).
 
 - **Reliability on new tracks is the open problem**: 31.2% on the test split.
 - **One seed per run and bundled changes** `--seed` doesn't reach the car and launch draws yet, which a multi-seed
-  comparison needs first. Runs take multiple hours, so I'm sadly not able to check as much as i want.
-- **One car, solo** No opponents yet.
+  comparison needs first. Each run takes 5-10 h, so I prioritise runs over seeds
 - **Builds on macOS (Apple Silicon) and Linux / WSL2**
 
 ## Quick start
