@@ -10,7 +10,7 @@
 A PPO driver for a racing simulator (Speed Dreams, a TORCS fork), trained on 29 tracks and tested on tracks it has
 never seen. The question is generalisation: can one policy drive a circuit it has never trained on? Over seven
 300M-step runs, plus pilots and fine-tunes, I changed the observations, the reward, the action space and the
-evaluation, and tried to make it generalise to held-out tracks.
+evaluation, and tried to make it generalise to held-out tracks. I am still working on it.
 
 ## Result
 
