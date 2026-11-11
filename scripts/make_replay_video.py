@@ -1,9 +1,12 @@
 """Put a synced map of the replayed lap next to a screen recording of it (scripts/record_lap.py).
 
-    python scripts/make_replay_video.py lap.mov --export
+    python scripts/make_replay_video.py brno.mov --export --track brno --lap-s 129.06 \
+        --title "Flying lap on Brno, real time" --subtitle "proto-8-cont best/, never trained on Brno"
+    python scripts/make_replay_video.py brno.mov --lap-s 129.06 --gif-only   # only redo the GIF from the master
 
-The recording must be cut to the lap: first frame on the line, last frame still on the lap. Writes replay/merged.mp4
-(the full lap, under 10 MB for GitHub) and docs/img/lap_replay_clip.gif (the --start/--length clip).
+The recording must be cut to the lap: first frame on the line, last frame still on the lap. --lap-s is the lap time
+scripts/record_lap.py printed for that lap. Writes replay/merged.mp4 (the full lap, under 10 MB for GitHub) and
+docs/img/lap_replay_clip.gif (the --start/--length clip).
 """
 
 import argparse
@@ -21,8 +24,6 @@ from matplotlib.patches import Wedge
 from make_readme_figures import DATA, IMG, LINE_SMOOTH_M, ROAD_FACTOR, ROOT, WideRoad
 
 REPLAY = ROOT / "replay"
-LAP_S = 108.27  # lap time of the recording in replay/, as shown by the game
-END_S = 108.25  # where the video is cut: its last frame (108.258 s) already brakes, past the end of the recording
 # The game's picture inside the macOS window recording is 2032x1184 at (120, 146). Keep its middle 50% and drop its top
 # 15%: that leaves the car and the input widget, and removes the rest of the HUD (gear, speed and rpm move to the map).
 CROP = "1016:1006:628:324"
@@ -33,22 +34,25 @@ AGENT, BOT, INK, MUTED, SURFACE, ROAD = "#2a78d6", "#eb6834", "#0b0b0b", "#52514
 KEEP_COLORS = (AGENT, BOT, "#00ff00", "#ff0000")  # the map's cars, the HUD's throttle and brake bars
 
 
-def export_lap() -> None:
-    """The recorded lap and the bot's lap 2, with the track borders."""
+def export_lap(track: str, lap_s: float) -> None:
+    """The recorded lap (the last lap_s seconds of the recording) and the bot's lap 2, with the track borders."""
     from rlpilot import reference
+    from rlpilot.track import race_for, reference_for
 
-    ref = reference.load("rlref")
+    ref = reference.load(reference_for(race_for(track)), laps=3)
     bot = ref.lap_trace(2)
-    c = np.fromfile(REPLAY / "jarama.controls", dtype=[(k, "f4") for k in ("steer", "accel", "brake", "clutch")]
+    c = np.fromfile(REPLAY / f"{track}.controls", dtype=[(k, "f4") for k in ("steer", "accel", "brake", "clutch")]
                     + [("gear", "i4"), ("x", "f4"), ("y", "f4")])
-    with open(REPLAY / "jarama.controls.check.csv") as f:  # written by the replay: time, x, y, x, y, speed, gear, rpm, redline
+    with open(REPLAY / f"{track}.controls.check.csv") as f:  # written by the replay: time, x, y, x, y, speed, gear, rpm, redline
         check = np.array([[float(v) for v in row] for row in csv.reader(f)])
+    if len(check) != len(c):
+        raise RuntimeError(f"the replay covered {len(check)} of {len(c)} recorded ticks: replay the whole recording first")
     t = check[:, 0]
-    lap = t >= t[-1] - LAP_S
+    lap = t >= t[-1] - lap_s
     xy = np.column_stack([c["x"][lap], c["y"][lap]])
     time = t[lap] - t[lap][0]
-    np.savez_compressed(DATA / "replay_lap.npz", left=ref.track_left.astype(np.float32),
-                        right=ref.track_right.astype(np.float32), agent_lap_s=LAP_S, bot_lap_s=ref.lap_times[1],
+    np.savez_compressed(DATA / "replay_lap.npz", track=track, left=ref.track_left.astype(np.float32),
+                        right=ref.track_right.astype(np.float32), agent_lap_s=lap_s, bot_lap_s=ref.lap_times[1],
                         agent_time=time.astype(np.float32), agent_x=xy[:, 0], agent_y=xy[:, 1],
                         agent_speed=check[lap, 5].astype(np.float32), agent_gear=check[lap, 6].astype(np.int8),
                         agent_rpm_fraction=(check[lap, 7] / check[lap, 8]).astype(np.float32),
@@ -57,7 +61,7 @@ def export_lap() -> None:
                         bot_y=bot["y"].astype(np.float32), bot_speed=bot["speed_x"].astype(np.float32))
 
 
-def map_frames():
+def map_frames(title: str, subtitle: str, end_s: float):
     """Yields one RGB frame of the map per video frame, in real time."""
     d = np.load(DATA / "replay_lap.npz")
     road = WideRoad(d["left"].astype(float), d["right"].astype(float), ROAD_FACTOR, LINE_SMOOTH_M)
@@ -75,7 +79,7 @@ def map_frames():
     ax.add_collection(PolyCollection(quads, facecolor=ROAD, edgecolor=ROAD, linewidth=0.5))
     ax.update_datalim(np.vstack([road.left, road.right]))
     ax.autoscale_view()
-    fig.text(0.03, 0.9, "Flying lap on Jarama, real time\nBest checkpoint of proto-6 vs built-in bot",
+    fig.text(0.03, 0.9, f"{title}\n{subtitle}",
              fontweight="bold", fontsize=15, color=INK, linespacing=1.35)
     fig.text(0.03, 0.025, f"Road and lines up to {ROAD_FACTOR:.0f}x wider, lines smoothed over {LINE_SMOOTH_M:.0f} m",
              fontsize=11, color=MUTED)
@@ -105,7 +109,7 @@ def map_frames():
     canvas.draw()
     background = canvas.copy_from_bbox(fig.bbox)
 
-    for now in np.arange(0, END_S, 1 / FPS):
+    for now in np.arange(0, end_s, 1 / FPS):
         canvas.restore_region(background)
         for name in cars:
             when = min(now, t[name][-1])
@@ -134,23 +138,23 @@ def map_frames():
         yield np.asarray(canvas.buffer_rgba())[..., :3].tobytes()
 
 
-def master(recording: Path, out: Path) -> None:
+def master(recording: Path, out: Path, title: str, subtitle: str, end_s: float) -> None:
     """Map on the left, game on the right, near-lossless: the small files are encoded from this."""
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{MAP_W}x{HEIGHT}", "-r", str(FPS),
            "-i", "-", "-i", str(recording), "-filter_complex",
-           f"[1:v]trim=end={END_S},setpts=PTS-STARTPTS,fps={FPS},crop={CROP},scale={CAM_W}:{HEIGHT}:flags=lanczos[cam];"
+           f"[1:v]trim=end={end_s},setpts=PTS-STARTPTS,fps={FPS},crop={CROP},scale={CAM_W}:{HEIGHT}:flags=lanczos[cam];"
            "[0:v][cam]hstack=shortest=1,format=yuv420p[v]",
            "-map", "[v]", "-an", "-c:v", "libx264", "-crf", "14", "-preset", "fast", str(out)]
     ffmpeg = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    for frame in map_frames():
+    for frame in map_frames(title, subtitle, end_s):
         ffmpeg.stdin.write(frame)
     ffmpeg.stdin.close()
     if ffmpeg.wait():
         raise RuntimeError("ffmpeg failed")
 
 
-def full_lap_mp4(source: Path, out: Path, target_mb: float = 9.5, width: int = 1200) -> None:
-    kbps = int(target_mb * 8000 / END_S)
+def full_lap_mp4(source: Path, out: Path, seconds: float, target_mb: float = 9.5, width: int = 1200) -> None:
+    kbps = int(target_mb * 8000 / seconds)
     base = ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-vf", f"scale={width}:-2:flags=lanczos", "-an",
             "-c:v", "libx264", "-preset", "slow", "-b:v", f"{kbps}k", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     log = str(REPLAY / "x264-pass")
@@ -178,21 +182,27 @@ def clip_gif(source: Path, out: Path, start: float, length: float, width: int, f
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("recording", nargs="?", type=Path, default=ROOT / "lap.mov")
-    p.add_argument("--start", type=float, default=42.0)
-    p.add_argument("--length", type=float, default=40.0)
-    p.add_argument("--width", type=int, default=640)
-    p.add_argument("--fps", type=int, default=10)
+    p.add_argument("recording", type=Path, help="screen recording of the replay, cut to the lap")
+    p.add_argument("--track", default="brno", help="replay/<track>.controls, from scripts/record_lap.py")
+    p.add_argument("--lap-s", type=float, required=True, help="lap time of the recorded lap, as record_lap.py printed it")
+    p.add_argument("--title", default="Flying lap on Brno, real time")
+    p.add_argument("--subtitle", default="proto-8-cont best/, never trained on Brno")
+    # The README's clip: Brno from 63 s to 106 s, 51-81% of the lap, ~9.5 MB
+    p.add_argument("--start", type=float, default=63.0)
+    p.add_argument("--length", type=float, default=43.0)
+    p.add_argument("--width", type=int, default=720)
+    p.add_argument("--fps", type=int, default=12)
     p.add_argument("--colors", type=int, default=32)
     p.add_argument("--export", action="store_true", help="re-export docs/data/replay_lap.npz from replay/")
     p.add_argument("--gif-only", action="store_true", help="reuse replay/merged-master.mp4")
     a = p.parse_args()
     source = REPLAY / "merged-master.mp4"
+    end_s = a.lap_s - 0.02  # the video's last frame stays on the lap: the recording ends on the line
     if not a.gif_only:
         if a.export or not (DATA / "replay_lap.npz").exists():
-            export_lap()
-        master(a.recording, source)
-        full_lap_mp4(source, REPLAY / "merged.mp4")
+            export_lap(a.track, a.lap_s)
+        master(a.recording, source, a.title, a.subtitle, end_s)
+        full_lap_mp4(source, REPLAY / "merged.mp4", end_s)
     clip_gif(source, IMG / "lap_replay_clip.gif", a.start, a.length, a.width, a.fps, a.colors)
     for f in (source, REPLAY / "merged.mp4", IMG / "lap_replay_clip.gif"):
         if f.exists():

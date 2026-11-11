@@ -8,7 +8,7 @@ Experiment log and plans. How the code works belongs in [gym-wrapper.md](gym-wra
 
 ## Status (2026-11-04)
 
-proto-7 is finished (300M), and random launches have been compared in a fine-tune (validation 0.25 -> 0.53, 2 of 7 stuck tracks cleared, in between on the pre-set criterion): see "Random launches instead of mistake learning". Next is proto-8, the full run: proto-7's flags plus `--launch-share 0.7`, with proto-7 as control. The test split is unspent. Deferred code fixes are listed under "Open items from the code review".
+proto-7 is finished (300M), and random launches have been compared in a fine-tune (validation 0.25 -> 0.53, 2 of 7 stuck tracks cleared, in between on the pre-set criterion): see "Random launches instead of mistake learning". Next is proto-8, the full run: proto-7's flags plus `--launch-share 0.7`, with proto-7 as control. The test split is unspent (update 2026-11-11: spent on proto-8-cont, see [results.md](results.md)). Deferred code fixes are listed under "Open items from the code review".
 
 ## proto-6 probes and proto-6.5
 

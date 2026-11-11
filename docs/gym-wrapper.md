@@ -1,6 +1,46 @@
 # Gym wrapper
 
-A Gymnasium `VectorEnv` over headless Speed Dreams, built to cost as little as possible on top of the simulator. SB3 and MLflow sit on top.
+A Gymnasium `VectorEnv` over headless Speed Dreams, built to cost as little as possible on top of the simulator. SB3 and MLflow sit on top. It was built with AI assistance (Claude Code). Results live in [results.md](results.md); this page is how the environment works.
+
+## Why a custom environment
+
+A simulator step here is cheap, about 12 µs for one 20 ms step. By my estimate, Gymnasium's `AsyncVectorEnv` would cost 50-200 µs per env per step (not benchmarked), so the wrapper would dwarf the simulator. Each run is 300M steps, so the wrapper adds as little as possible:
+
+- **One process per simulator.** The engine is full of globals, so parallelism has to come from processes, not threads.
+- **No Python in the workers.** Each is a small C++ host that replaces the game's `main.cpp` and text UI, pumps the engine, and restarts races in-process.
+- **One shared-memory block.** Python reads observations through NumPy views and writes actions into the same block, with no copying or serialization.
+- **One native call per vector step.** It's made through ctypes and releases the GIL. Python overhead is about 35 µs per vector step, independent of the number of envs.
+- **Reward and termination stay in Python**, vectorized over the batch, so they change without a rebuild. The C++ side only exports raw signals.
+
+```mermaid
+flowchart TD
+    T["Python trainer<br/>SB3 PPO + MLflow"] --> V["SpeedDreamsVecEnv<br/>reward, termination, features"]
+    V <-->|"NumPy views: actions, observations"| S[("Shared memory<br/>sequence numbers: spin, then futex")]
+    S <--> W1["rlpilot-worker 1 (C++)"]
+    S <--> W2["rlpilot-worker 2 (C++)"]
+    S <--> WN["rlpilot-worker N (C++)"]
+    W1 --> R1["Robot shim + engine<br/>one solo race"]
+    W2 --> R2["Robot shim + engine<br/>one solo race"]
+    WN --> RN["Robot shim + engine<br/>one solo race"]
+```
+
+Python writes the actions, bumps a command sequence number and waits for the workers. Each worker runs the engine until its robot module's next `rbDrive` call, writes the observation and signals back.
+
+## Throughput
+
+Measured on an M1 Pro (6 performance + 2 efficiency cores). The first three rows come from the [benchmark log](data/bench-2026-11-02.txt) of 2026-11-02, on AC power and not a perfectly idle machine. Control rates differ, so compare real-time factors rather than raw steps/s across 50 Hz and 25 Hz rows.
+
+| Path | Control rate | Env steps/s | Real-time factor |
+|---|---|---|---|
+| C bench, 1 worker, no Python | 50 Hz | **41.7k** (median of 5, spin 200 µs) | 834x |
+| C bench, 5 workers, no Python | 50 Hz | **167.5k** (median of 5, spin 200 µs; 157-169k) | 3,351x |
+| Python `VectorEnv`, 5 workers | 25 Hz | **37.4k** (median of 3; 36.6-40.7k) | 1,498x |
+| Full SB3 PPO loop, 5 workers, 200 µs spin ("Performance" below) | 25 Hz | ~6-8.6k | |
+| Full SB3 PPO loop, 20 workers, 50 µs spin (measured 2026-10-07) | 25 Hz | ~10.5-12.3k | |
+| proto-6 training, 20 workers, whole run including evals (MLflow `116a8a86`) | 25 Hz | 11.6k average: 300M steps in 25,770 s | |
+| proto-9.5 training on the desktop (Ryzen 7 7700X, RTX 4070 Ti, WSL2), 29 workers, CPU rollouts and GPU updates, whole run (MLflow `cc2e6507`) | 25 Hz | 17.7k average: 300M steps in 16,928 s | |
+
+The first measurement, at the commit that introduced the wrapper (2026-10-05), gave 178k (5 workers), 49k (1 worker) and ~46k (Python). Those didn't reproduce on 2026-11-02. The cause is unknown: the engine and benchmark code hadn't changed, and the 1-worker result is the same on battery and AC, so power alone doesn't explain it.
 
 ## Design
 
@@ -90,7 +130,7 @@ Where the gap to the bot is: at 3M steps the agent matches the bot's corner spee
 
 - **Eval jitter** (2026-10-07): re-evaluating the same checkpoint with other launch-noise seeds moves a track's completion by ~±0.25 and progress by ~±0.5 laps. Between checkpoints 5M steps apart the policy really changes (Brno: ~0.1 → ~0.95 completion, consistent over 4 seeds). Episodes are chaotic: a 3e-7 change in the actions (policy batch of 80 vs 8) flips crash vs lap at the policy's marginal corners, so each episode is an independent draw, not a copy. Hence `best/` = the best eval within the best window of `--eval-smooth` (3) consecutive evals by mean score (`eval/score_smoothed`), and `--eval-laps` 2 (proto-4: 3; progress is now out of 2 laps). Only full windows compete: before the first one, `best/` is a provisional best eval so far, which the first full window replaces whatever its score. Until 2026-11-04 the first evals competed on windows of 1 and 2, so a lucky early eval could keep `best/` for a whole run.
 
-- **proto-4** (36 tracks, car randomization): held-out generalization improved (Brno usually completes, Spa gets ~95% of a lap), but two regressions appeared. (1) Steering chatter: the deterministic steer flips sign every step (`steer_delta` 0.17 at 40M, 0.5-0.6 from 160M), with means mostly in range, so it's a feedback limit cycle that nothing penalized. (2) Spa's Bus Stop is a braking failure: the bot brakes at ~6430 m (227 → 53 km/h), the agent ~90 m later, with partial on/off braking, arriving at 106-130 km/h. The braking point is ~4.2 s out, at the edge of gamma 0.99's horizon.
+- **proto-4** (35 tracks, car randomization): held-out generalization improved (Brno usually completes, Spa gets ~95% of a lap), but two regressions appeared. (1) Steering chatter: the deterministic steer flips sign every step (`steer_delta` 0.17 at 40M, 0.5-0.6 from 160M), with means mostly in range, so it's a feedback limit cycle that nothing penalized. (2) Spa's Bus Stop is a braking failure: the bot brakes at ~6430 m (227 → 53 km/h), the agent ~90 m later, with partial on/off braking, arriving at 106-130 km/h. The braking point is ~4.2 s out, at the edge of gamma 0.99's horizon.
 - **proto-5 defaults:** `--gamma 0.995` (8 s horizon), `--steer-rate 0.02` (reward `-steer_rate x Δsteer²` per step, component `reward/steer`; 0.1 outweighed the terminal penalty while the policy was still noisy), `--lookahead-stat peak`, held-out tracks in the best-checkpoint score.
 
 ## proto-5 findings (2026-10-09)
@@ -113,7 +153,9 @@ Simplix computes its own racing line (clothoid-smoothed, `unitclothoid.cpp`). `t
 - **Car randomization** (`--car-random 0.1`, `EnvConfig.car_grip/car_mass/car_power`): per episode, the tyre mu (all compounds, dry and wet), the car mass and the engine torque curve are each scaled by a factor drawn in [1-x, 1+x]. The factors travel in shm act slots `RLP_A_CAR_*` (protocol v4). The worker scales the car's merged params in `rbNewTrack` (host API v2). A RESET restarts the race whenever the factors changed, including right after a spawn. `--car-obs` adds the factors to the observation as (f-1)x10. Evaluation always uses the stock car.
 - **The downshift action** (proto-3) is used as a two-position switch: its output is beyond ±1 78% of the time, which is why its std drifted to the 0.5 cap without affecting behaviour. Forcing any fixed downshift point in the gearbox breaks the trained policy, even with the observation kept unchanged: its driving is co-adapted to its own gear timing. 34-63% of downshifts are decided by the `down <= up - 0.05` clamp, i.e. the request was "as early as possible".
 
-## Performance (M1 Pro, 6 P + 2 E cores)
+## Performance (M1 Pro, 6 P + 2 E cores, measured 2026-10-07)
+
+The first measurements, before the 2026-11-02 benchmark above; the 178k didn't reproduce.
 
 | Path | Env steps/s |
 |---|---|
@@ -209,7 +251,7 @@ Yes, 30 points resolve it: from the bot's braking point at 229 km/h, 7 points fa
 
 ## Splits
 
-`splits.py`: 29 train / 6 validation (select checkpoints) / 6 test. `--split proto7` sets the track flags and can't be combined with them. `scripts/eval_test_tracks.py <run id>` runs a run's final `best/` on the test tracks, with the config rebuilt from its logged params, logs `test/*` to the run and refuses a second run; `--dry-run-tracks` checks the script without spending the test set.
+`splits.py`: 29 train / 6 validation (select checkpoints) / 6 test. The test split was spent once, on proto-8-cont's `best/`, on 2026-11-11 (see [results.md](results.md)). `--split proto7` sets the track flags and can't be combined with them. `scripts/eval_test_tracks.py <run id>` runs a run's final `best/` on the test tracks, with the config rebuilt from its logged params, logs `test/*` to the run and refuses a second run; `--dry-run-tracks` checks the script without spending the test set.
 
 ## Next steps
 

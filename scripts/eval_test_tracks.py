@@ -53,22 +53,32 @@ def main():
                                            time_limits=eval_time_limits([refs[r].best_lap for r in races], cfg.n_workers, a.laps))
     finally:
         env.close()
-    scores, logged = [], {}
-    print(f"{'track':14s} {'completion':>10s} {'progress':>8s} {'flying vs bot %':>15s} {'score':>6s}")
+    # completion_rate counts episodes with at least 1 lap, like the live evals. finished_share counts episodes that drove
+    # all `laps` laps (end == lap_done), like scripts/report.py's best/ numbers, so the two can be compared.
+    scores, logged, episodes = [], {}, []
+    print(f"{'track':14s} {'completion':>10s} {'finished':>8s} {'progress':>8s} {'flying vs bot %':>15s} {'score':>6s}")
     for t, race in enumerate(races):
         idx = range(t, cfg.n_workers, len(races))
         m = summarize([traces[i] for i in idx], [lap_times[i] for i in idx], [stats[i] for i in idx], refs[race]).metrics
         scores.append(track_score(m, refs[race].best_lap, a.laps))
+        finished = float(np.mean([stats[i]["end"] == "lap_done" for i in idx]))
         fly = m.get("eval/flying_lap_time_median")
         gap = 100 * (fly / refs[race].best_lap - 1) if fly else None
-        print(f"{tracks[t]:14s} {m['eval/completion_rate']:10.2f} {m['eval/progress']:8.2f} "
+        print(f"{tracks[t]:14s} {m['eval/completion_rate']:10.2f} {finished:8.2f} {m['eval/progress']:8.2f} "
               f"{f'{gap:+.1f}' if fly else '-':>15s} {scores[-1]:6.2f}")
         logged |= {f"test/{tracks[t]}/completion_rate": m["eval/completion_rate"], f"test/{tracks[t]}/progress": m["eval/progress"],
+                   f"test/{tracks[t]}/finished_share": finished,
                    f"test/{tracks[t]}/score": scores[-1]} | ({f"test/{tracks[t]}/flying_gap_pct": gap} if fly else {})
-    print(f"mean score {np.mean(scores):.3f}")
+        episodes += [{"track": tracks[t], "episode": e, "end": stats[i]["end"], "laps_done": len(lap_times[i]),
+                      "lap_times": [round(float(x), 3) for x in lap_times[i]], "bot_best_lap": round(refs[race].best_lap, 3)}
+                     for e, i in enumerate(idx)]
+    total = float(np.mean([e["end"] == "lap_done" for e in episodes]))
+    print(f"mean score {np.mean(scores):.3f}, finished {sum(e['end'] == 'lap_done' for e in episodes)}/{len(episodes)} = {total:.3f}")
     if not a.dry_run_tracks:  # these numbers can only be had once: keep them with the run
-        for key, value in (logged | {"test/score": float(np.mean(scores))}).items():
+        for key, value in (logged | {"test/score": float(np.mean(scores)), "test/finished_share": total}).items():
             client.log_metric(a.run_id, key, value)
+        client.log_dict(a.run_id, {"best_step": run.data.tags.get("best_step"), "laps": a.laps, "episodes": episodes},
+                        "test/episodes.json")
 
 
 if __name__ == "__main__":

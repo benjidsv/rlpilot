@@ -7,7 +7,7 @@ sd-local/
 mlruns/
 __pycache__/
 native/build/
-mlflow.db
+mlflow.db*
 reference/
 replay/
 reports/

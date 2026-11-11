@@ -135,4 +135,4 @@ Raised earlier, and not part of proto-9 unless results call for them:
 
 - **Launch at racing speed upstream of crash spots,** using `tracks/failures.csv`. Launches already cover these corners and they stay lethal, but launches top out at 105 km/h, while the crashes come from arriving at 160-210. So match the speed too, rather than only launching more often.
 - **Fix `--seed`** so it reaches the car and launch draws. Needed before any multi-seed comparison.
-- **Test split.** Still unspent. Run it once, on a final candidate.
+- **Test split.** Spent on 2026-11-11, on proto-8-cont's `best/`: 15/48 episodes finished (see [results.md](results.md)).
