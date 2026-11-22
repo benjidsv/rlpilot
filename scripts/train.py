@@ -21,6 +21,7 @@ from torch.distributions.categorical import (
 )  # rlpilot: the gear shift is a discrete choice
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm  # rlpilot
 
 from rlpilot import evaluate  # rlpilot
 from rlpilot.env import ENDS, RacingEnv  # rlpilot
@@ -303,11 +304,10 @@ def run_eval(
     if score > best:
         torch.save(ckpt, run_dir / "checkpoints" / "best.pt")
         best = score
-    print(
+    tqdm.write(  # rlpilot: above the progress bar
         f"eval at {step}: validation nominal survival {score:.3f} (best {best:.3f}), pace "
         f"{metrics['validation/pace']:.3f}, train nominal survival {metrics['train/nominal/survival']:.3f}, "
-        f"{time.time() - t0:.0f} s",
-        flush=True,
+        f"{time.time() - t0:.0f} s"
     )
     torch.set_num_threads(args.rollout_threads)
     return best
@@ -365,6 +365,8 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     torch.set_num_threads(args.rollout_threads)  # rlpilot
     next_eval, best = args.eval_every, -1.0  # rlpilot
+    bar = tqdm(total=args.num_iterations * args.batch_size, unit="step", unit_scale=True, desc="train",
+               dynamic_ncols=True, smoothing=0.05)  # rlpilot: replaces the SPS print
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -560,7 +562,14 @@ if __name__ == "__main__":
         writer.add_scalar("2_ppo/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("2_ppo/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("2_ppo/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
+        bar.update(args.batch_size)  # rlpilot
+        bar.set_postfix(
+            sps=int(global_step / (time.time() - start_time)),
+            ret=f"{np.mean([x['return'] for x in ended]):.0f}" if ended else "-",
+            speed=f"{np.mean([x['mean_speed'] for x in ended]):.1f}" if ended else "-",
+            best=f"{best:.3f}" if best >= 0 else "-",
+            refresh=False,
+        )
         writer.add_scalar(
             "5_perf/SPS", int(global_step / (time.time() - start_time)), global_step
         )
@@ -568,9 +577,12 @@ if __name__ == "__main__":
         if (
             global_step >= next_eval or iteration == args.num_iterations
         ):  # rlpilot: evaluate and checkpoint
+            bar.set_description("eval")  # rlpilot
             best = run_eval(agent.cpu(), norm, args, global_step, run_dir, writer, best)
+            bar.set_description("train")
             agent.to(device)
             next_eval += args.eval_every
 
+    bar.close()  # rlpilot
     envs.close()
     writer.close()
