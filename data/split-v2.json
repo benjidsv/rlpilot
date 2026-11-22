@@ -1,0 +1,57 @@
+{
+  "seed": 20261122,
+  "km": {
+    "train": 171.7,
+    "validation": 28.0,
+    "test": 26.4
+  },
+  "tracks": {
+    "train": [
+      "Imula",
+      "Summer-Olsen",
+      "aalborg",
+      "allondaz",
+      "ardennen-spa",
+      "atlanta",
+      "auriac",
+      "braga",
+      "brno",
+      "brondehach",
+      "bueno",
+      "charmey",
+      "chemisay",
+      "corkscrew",
+      "e-track-4",
+      "hidden-valley",
+      "inuksuk",
+      "jarama",
+      "kurpfalzring",
+      "lombaro",
+      "longjour",
+      "migrants",
+      "ole-road-1",
+      "peters",
+      "petit",
+      "prenzlau",
+      "racepark",
+      "racepark3",
+      "ruudskogen",
+      "salty",
+      "sao-paulo",
+      "spring"
+    ],
+    "validation": [
+      "alicante",
+      "dijon",
+      "espie",
+      "karwada",
+      "street-1",
+      "torino"
+    ],
+    "test": [
+      "nordschleife",
+      "pinabashi",
+      "tuna"
+    ]
+  }
+}

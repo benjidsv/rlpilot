@@ -19,7 +19,7 @@
 #include "../sync.h"
 
 extern char **environ;
-rlp_header *rlp_create(const char *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+rlp_header *rlp_create(const char *, uint32_t, uint32_t, uint32_t, uint32_t);
 void rlp_destroy(rlp_header *, const char *);
 int rlp_wait_ready(rlp_header *, uint32_t, int32_t *);
 int rlp_exchange(rlp_header *, const uint32_t *, uint32_t, int32_t *);
@@ -31,7 +31,7 @@ static void control(const float *o, float *a)
     float target = 10 + 0.25f * o[RLP_N_FIELDS + RLP_N_RAYS / 2]; /* faster when the road ahead is clear */
     a[RLP_A_ACCEL] = o[RLP_F_SPEED_X] < target ? 0.8f : 0;
     a[RLP_A_BRAKE] = o[RLP_F_SPEED_X] > target + 5 ? 0.5f : 0;
-    a[RLP_A_GEAR] = 0;
+    a[RLP_A_GEAR] = 1; /* stays in first: a throughput test, not a driver */
 }
 
 int main(int argc, char **argv)
@@ -56,7 +56,7 @@ int main(int argc, char **argv)
     snprintf(worker, sizeof worker, "%.*s/rlpilot-worker", (int)(strrchr(exe, '/') - exe), exe);
     snprintf(shm, sizeof shm, "/rlpb%d", getpid());
 
-    rlp_header *h = rlp_create(shm, n, 1, fs, RLP_FLAG_AUTO_GEAR, spin);
+    rlp_header *h = rlp_create(shm, n, 1, fs, spin);
     if (!h) {
         perror("rlp_create");
         return 1;

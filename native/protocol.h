@@ -19,16 +19,13 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 6
+#define RLP_VERSION 7
 #define RLP_MAX_CARS 8
 #define RLP_N_RAYS 19
 #define RLP_RAY_RANGE 200.0f
 
 enum rlp_cmd { RLP_CMD_NONE = 0, RLP_CMD_STEP = 1, RLP_CMD_RESET = 2, RLP_CMD_QUIT = 3 };
 enum rlp_status { RLP_ST_STARTING = 0, RLP_ST_READY = 1, RLP_ST_ERROR = 2, RLP_ST_EXITED = 3 };
-/* Gearbox: AUTO_GEAR = the worker's fixed shift points; SHIFT_POINTS = the worker shifts at the points the
- * client sends (RLP_A_SHIFT_UP/DOWN); neither = the client sends the gear (RLP_A_GEAR). */
-enum rlp_flags { RLP_FLAG_AUTO_GEAR = 1, RLP_FLAG_SHIFT_POINTS = 2 };
 
 /* Raw per-car fields, followed by RLP_N_RAYS track-edge distances (m). */
 enum rlp_field {
@@ -44,7 +41,9 @@ enum rlp_field {
     RLP_F_TRACK_WIDTH,
     RLP_F_RPM,             /* engine rad/s */
     RLP_F_RPM_REDLINE,
-    RLP_F_GEAR,
+    RLP_F_GEAR,            /* engaged gear: -1 reverse, 0 neutral (also briefly during a shift), 1.. */
+    RLP_F_RPM_UP,          /* engine rad/s the selected gear + 1 would give at this wheel speed, 0 if none */
+    RLP_F_RPM_DOWN,        /* same for the selected gear - 1 (forward gears only: 0 in 1st and reverse) */
     RLP_F_WHEEL_SPIN0,     /* rad/s, FR FL RR RL */
     RLP_F_WHEEL_SPIN1,
     RLP_F_WHEEL_SPIN2,
@@ -75,17 +74,11 @@ enum rlp_action {
     RLP_A_STEER,
     RLP_A_ACCEL,
     RLP_A_BRAKE,
-    RLP_A_GEAR,
-    RLP_A_SHIFT_UP,   /* SHIFT_POINTS: upshift when the engine reaches this fraction of the redline */
-    RLP_A_SHIFT_DOWN, /* SHIFT_POINTS: downshift when the lower gear would be at or below this fraction */
-    /* Car factors, applied when the race (re)starts (a RESET restarts it if they changed). 0 = 1 = stock. */
-    RLP_A_CAR_GRIP,   /* x tyre friction (mu) */
-    RLP_A_CAR_MASS,   /* x car mass */
-    RLP_A_CAR_POWER,  /* x engine torque curve */
+    RLP_A_GEAR,       /* the gear to select: -1 reverse, 1.. (the gearbox logic is the client's) */
     /* Where the race (re)start puts the car (a RESET restarts it if they changed). LAUNCH_POS 0 = on the grid. */
     RLP_A_LAUNCH_POS,     /* fraction of the lap from the start line, in (0, 1) */
-    RLP_A_LAUNCH_LATERAL, /* fraction of the road's width from its right edge */
-    RLP_A_LAUNCH_YAW,     /* rad from the track direction, + = left */
+    RLP_A_LAUNCH_LATERAL, /* fraction of the road's width from its right edge (< 0 or > 1: off the road) */
+    RLP_A_LAUNCH_YAW,     /* rad from the track direction, + = left, any value */
     RLP_A_LAUNCH_SPEED,   /* m/s, along the car */
     RLP_ACT_DIM
 };
@@ -95,7 +88,7 @@ typedef struct {
     uint32_t n_workers, n_cars;
     uint32_t obs_dim, act_dim;
     uint32_t frame_skip;   /* robot ticks (20 ms) per agent step */
-    uint32_t flags;        /* rlp_flags */
+    uint32_t _reserved;
     uint32_t spin_us;      /* busy-wait budget before sleeping */
     uint32_t _pad;
     uint64_t total_size, workers_off, obs_off, act_off;

@@ -1,9 +1,0 @@
-run,run_id,git_sha,git_dirty,best_step,split,tracks,best_episodes,best_finished,best_finished_strict,best_finished_share,best_finished_strict_share,best_tracks_with_lap2,best_lap2_gap_pct_median_of_tracks,late_window,late_checkpoints,late_episodes_per_track,late_finished_share,late_finished_strict_share
-proto-7,0d567d903d9e44509034d0c9b87d100a,506f9d4,False,296000999,train,29,232,150,150,0.6466,0.6466,21,-5.77,253-292M,6,2,0.6667,0.6667
-proto-7,0d567d903d9e44509034d0c9b87d100a,506f9d4,False,296000999,validation,6,48,23,23,0.4792,0.4792,3,-2.13,253-292M,6,2,0.3333,0.3333
-proto-8-cont,b60db21f2534453685ee010e315a5584,7a55d93,False,314001531,train,29,232,169,169,0.7284,0.7284,22,-6.71,251-295M,8,2,0.6789,0.6789
-proto-8-cont,b60db21f2534453685ee010e315a5584,7a55d93,False,314001531,validation,6,48,23,23,0.4792,0.4792,4,-3.58,251-295M,8,2,0.3542,0.3542
-proto-9-cont,0cfb244eb5bf4dbf91ad28dc89aab0f2,52bcd9d,False,152000890,train,29,232,155,142,0.6681,0.6121,23,4.0,254-295M,9,2,0.5805,0.3582
-proto-9-cont,0cfb244eb5bf4dbf91ad28dc89aab0f2,52bcd9d,False,152000890,validation,6,48,32,24,0.6667,0.5,4,3.57,254-295M,9,2,0.1852,0.0926
-proto-9.5,cc2e6507a9da4e28802dfb3d1974a052,ba7ca2e,False,280000945,train,29,232,176,149,0.7586,0.6422,23,-4.73,253-292M,6,2,0.6695,0.523
-proto-9.5,cc2e6507a9da4e28802dfb3d1974a052,ba7ca2e,False,280000945,validation,6,48,10,10,0.2083,0.2083,2,-2.4,253-292M,6,2,0.2222,0.2083

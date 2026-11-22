@@ -1,157 +1,220 @@
-"""Deterministic-policy evaluation over a few laps, compared to the built-in bot.
+"""Evaluation on the fixed scenario suite (data/suite-v2.csv, see scripts/make_suite.py), and grid laps.
 
-The simulator is deterministic, so with a deterministic policy every eval episode would be identical.
-Episode 0 is run exactly as the policy drives; the others get small action noise during the launch
-only (launch_seconds), which makes the trajectories diverge so completion rate and median lap time
-measure robustness rather than repeating one sample.
+A scenario is a start (track, place, tier, offsets, kick) and a task: drive SCENARIO_DISTANCE along the track. Every
+checkpoint of every run plays exactly the same list, with the same batch layout, so results are reproducible and two
+runs can be compared scenario by scenario (scripts/compare.py).
+
+Outcome of a scenario, best first:
+- clean:     reached the distance, never fully off the road, never lost control
+- survived:  reached it, went fully off the road at some point but kept control
+- recovered: reached it, but lost control on the way (hit something, faced backwards, or got far off the road)
+- failed:    didn't reach it (no progress for 10 s, wrecked, or out of time)
+"survival" = clean or survived. Crashed starts begin out of control, so for them the useful number is "completion"
+(anything but failed).
 """
 
 from __future__ import annotations
 
-import dataclasses
-from dataclasses import dataclass, field
+import csv
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-from ._native import A, F
-from .config import EnvConfig
-from .reference import Reference, lap_slice, lap_times_from_trace
-from .reward import END_GROUPS, TERM_REASONS, strict_failure
-from .vec_env import BEHAVIOR_STATS, SpeedDreamsVecEnv
+from .client import DATA, F
+from .env import ENDS, RacingEnv
+from .starts import KINDS, Starts
+from .tracks import Track, allocate
 
-TRACE_FIELDS = {"time": "time", "laps": "laps", "dist_from_start": "dist_from_start", "dist_raced": "dist_raced",
-                "speed_x": "speed_x", "x": "pos_x", "y": "pos_y", "last_lap_time": "last_lap_time",
-                "wheels_off": "wheels_off", "gear": "gear", "rpm": "rpm", "angle": "angle"}
-
-
-def eval_config(cfg: EnvConfig, races: tuple[str, ...], episodes: int, laps: int) -> EnvConfig:
-    """The env of an evaluation: `episodes` workers per race, all at once (worker i on race i % n), on the stock car (factor
-    observations, if any, read 0). Workers never change track, and with one reset per eval, recycling isn't needed."""
-    return dataclasses.replace(cfg, n_workers=episodes * len(races), laps_per_episode=laps, run_dir=None, race=races[0],
-                               races=races if len(races) > 1 else (), track_switch_steps=0, recycle_resets=2**62, launch_share=0.0,
-                               car_grip=(1.0, 1.0), car_mass=(1.0, 1.0), car_power=(1.0, 1.0))
+SUITE = DATA / "suite-v2.csv"
+SCENARIO_DISTANCE = 500.0  # m along the track
+SCENARIO_SECONDS = 60.0    # 500 m at 30 km/h on average: a car that hasn't made it by then failed
+OUTCOMES = ("failed", "recovered", "survived", "clean")
+STARTS_COLUMNS = ("kind", "s", "lateral", "yaw", "speed", "kick_steer", "kick_pedal", "kick_steps")
+Policy = Callable[[np.ndarray], np.ndarray]  # observations [n, DIM] -> actions [n, 3], deterministic
 
 
-def eval_time_limits(best_laps: list[float], n_workers: int, laps: int) -> np.ndarray:
-    """Per-worker episode limits: `laps` laps at 70% of the bot's pace, plus the standing start. best_laps: per race."""
-    return np.array([laps * best_laps[i % len(best_laps)] / 0.7 + 20.0 for i in range(n_workers)])
+def load_suite(splits: tuple[str, ...] = ("validation",), path: Path = SUITE) -> list[dict]:
+    with open(path) as f:
+        rows = [r for r in csv.DictReader(f) if r["split"] in splits]
+    for r in rows:
+        for k in ("s", "lateral", "yaw", "speed", "kick_steer", "kick_pedal", "bot_time"):
+            r[k] = float(r[k])
+        r["kick_steps"] = int(r["kick_steps"])
+        r["kind"] = KINDS.index(r["tier"])
+    return rows
 
 
-@dataclass
-class EvalResult:
-    metrics: dict[str, float]
-    traces: list[dict[str, np.ndarray]]   # one per episode: TRACE_FIELDS + steer, pedal, throttle, brake
-    lap_times: list[np.ndarray]           # completed laps per episode
-    stats: list[dict[str, float]] = field(default_factory=list)
+class _Layout:
+    """The suite's fixed layout: workers spread over the tracks in proportion to their number of scenarios, each working
+    through its share in suite order. `start_fn` hands each env its next scenario (`running`, -1 = none left, then a
+    grid start and the env is paused)."""
 
-    def best_lap_trace(self, episode: int = 0) -> tuple[dict[str, np.ndarray], int | None]:
-        """Fastest completed lap of an episode, or its first (partial) lap if none was completed."""
-        times = self.lap_times[episode]
-        lap = int(np.argmin(times)) + 1 if len(times) else 1
-        return lap_slice(self.traces[episode], lap), (lap if len(times) else None)
+    def __init__(self, suite: list[dict], n_workers: int):
+        counts = {}
+        for r in suite:
+            counts[r["track"]] = counts.get(r["track"], 0) + 1
+        self.suite, self.tracks = suite, allocate(counts, max(n_workers, len(counts)))
+        self.queues: list[list[int]] = [[] for _ in self.tracks]
+        for t in counts:  # a track's scenarios, dealt round-robin to its workers
+            mine = [w for w, wt in enumerate(self.tracks) if wt == t]
+            for j, i in enumerate([i for i, r in enumerate(suite) if r["track"] == t]):
+                self.queues[mine[j % len(mine)]].append(i)
+        self.running = np.full(len(self.tracks), -1)
+
+    def start_fn(self, idx: np.ndarray) -> Starts:
+        cols = {k: np.zeros(len(idx), np.int64 if k in ("kind", "kick_steps") else np.float64) for k in STARTS_COLUMNS}
+        for j, e in enumerate(idx):
+            self.running[e] = self.queues[e].pop(0) if self.queues[e] else -1
+            if self.running[e] >= 0:
+                for k in STARTS_COLUMNS:
+                    cols[k][j] = self.suite[self.running[e]][k]
+        return Starts(**cols)
+
+    def bad_launch(self, idx: np.ndarray, attempt: int) -> Starts:
+        ids = [self.suite[self.running[e]]["id"] for e in idx if self.running[e] >= 0]
+        raise RuntimeError(f"suite scenarios with a non-finite launch: {ids} (make_suite.py checks launches: regenerate)")
 
 
-def evaluate(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, reference: Reference | None = None,
-             launch_noise: float = 0.1, launch_seconds: float = 1.0, seed: int = 0) -> EvalResult:
-    """One episode per env, all on the same track (env 0 runs clean)."""
-    traces, lap_times, stats = rollout(policy, env, launch_noise, launch_seconds, seed)
-    return summarize(traces, lap_times, stats, reference)
-
-
-def rollout(policy: Callable[[np.ndarray], np.ndarray], env: SpeedDreamsVecEnv, launch_noise: float = 0.1,
-            launch_seconds: float = 1.0, seed: int = 0, clean=(0,), time_limits: np.ndarray | None = None
-            ) -> tuple[list[dict[str, np.ndarray]], list[np.ndarray], list[dict[str, float]]]:
-    """Runs one episode per env; the envs in `clean` get no launch noise. `time_limits` [n] (seconds) overrides
-    the env's max_episode_seconds per env (envs on different tracks). Returns per-env traces, lap times, stats.
-    Envs whose episode ended are paused (not simulated) until all have ended."""
-    n = env.num_envs
-    rng = np.random.default_rng(seed)
-    noise_steps = int(round(launch_seconds / env.cfg.step_seconds))
-    noisy = np.ones(n, bool)
-    noisy[list(clean)] = False
-    cols = [F[f] for f in TRACE_FIELDS.values()]
-    rows: list[list[np.ndarray]] = [[] for _ in range(n)]
-    acts: list[list[np.ndarray]] = [[] for _ in range(n)]
-    stats: list[dict | None] = [None] * n
-    active = np.ones(n, bool)
-
-    env.set_time_limits(time_limits)
+def run_suite(policy: Policy, suite: list[dict], n_workers: int = 48) -> list[dict]:
+    """Play every scenario once; returns one result row per scenario, in suite order."""
+    lay = _Layout(suite, n_workers)
+    results: list[dict | None] = [None] * len(suite)
+    lengths = {t: Track.load(t).length for t in set(lay.tracks)}
+    env = RacingEnv(lay.tracks, episode_seconds=SCENARIO_SECONDS, max_distance=SCENARIO_DISTANCE,
+                    start_fn=lay.start_fn, retry_fn=lay.bad_launch)
     try:
         obs, _ = env.reset()
-        t = 0
-        while active.any():
-            action = np.asarray(policy(obs), np.float32).reshape(n, env.act_dim).copy()
-            if t < noise_steps:
-                action[noisy] += rng.normal(0, launch_noise, action[noisy].shape).astype(np.float32)
-            obs, _, term, trunc, info = env.step(action, active)
-            done = term | trunc
-            for i in np.flatnonzero(active):
-                raw = info["final_raw"][i] if done[i] else env._raw[i]
-                rows[i].append(raw[cols].copy())
-                acts[i].append(np.r_[env.applied[i, :2], env._act[i, A["accel"]], env._act[i, A["brake"]]])
-                if done[i]:
-                    s = {k: float(v[i]) for k, v in info["stats"].items()}
-                    r = int(s.pop("term_reason"))
-                    s["end"] = TERM_REASONS[r] if r >= 0 else "time_limit"
-                    s["return"] = float(info["episode"]["r"][i])
-                    stats[i] = s
-                    active[i] = False
-            t += 1
+        while (lay.running >= 0).any():
+            before = lay.running.copy()
+            obs, _, _, _, info = env.step(policy(obs), before >= 0)
+            if "episode_end" not in info:
+                continue
+            e = info["episode_end"]
+            for i in np.flatnonzero(info["_episode_end"]):
+                sc = suite[before[i]]
+                end = ENDS[e["end"][i]]
+                reached = end == "distance"
+                outcome = ("recovered" if e["lost_control"][i] else "survived" if e["ever_off"][i] else "clean") \
+                    if reached else "failed"
+                results[before[i]] = {"id": sc["id"], "split": sc["split"], "track": sc["track"], "tier": sc["tier"],
+                                      "s": sc["s"], "outcome": outcome, "end": end,
+                                      "distance": round(float(e["distance"][i]), 1),
+                                      "seconds": round(float(e["seconds"][i]), 2), "bot_seconds": sc["bot_time"],
+                                      "pace": round(sc["bot_time"] / e["seconds"][i], 4) if reached else "",
+                                      "end_s": round(float(np.mod(sc["s"] + e["distance"][i], lengths[sc["track"]])), 1)}
     finally:
-        env.set_time_limits(None)
-
-    traces, lap_times = [], []
-    for i in range(n):
-        data = np.stack(rows[i])
-        a = np.stack(acts[i])
-        tr = {k: data[:, j] for j, k in enumerate(TRACE_FIELDS)} | {"steer": a[:, 0], "pedal": a[:, 1], "throttle": a[:, 2], "brake": a[:, 3]}
-        traces.append(tr)
-        lap_times.append(lap_times_from_trace(tr))
-        step, why = strict_failure(tr["wheels_off"], tr["speed_x"], tr["angle"], env.cfg.step_seconds, env.cfg.reward.stuck_speed)
-        stats[i]["strict_end"] = why
-        # laps finished before that point: `laps` counts start-line crossings, the first one from the grid
-        stats[i]["strict_laps"] = len(lap_times[i]) if why is None else min(max(int(tr["laps"][step]) - 1, 0), len(lap_times[i]))
-    return traces, lap_times, stats
+        env.close()
+    assert all(r is not None for r in results)
+    return results
 
 
-def summarize(traces: list[dict[str, np.ndarray]], lap_times: list[np.ndarray], stats: list[dict[str, float]],
-              reference: Reference | None = None) -> EvalResult:
-    """eval/* metrics over a set of episodes on one track (the first one is the clean episode)."""
-    n = len(traces)
-    all_laps = np.concatenate(lap_times)
-    m = {
-        "eval/completion_rate": float(np.mean([len(x) >= 1 for x in lap_times])),
-        "eval/progress": float(np.mean([s["progress"] for s in stats])),
-        "eval/laps_completed": float(np.mean([len(x) for x in lap_times])),
-    }
-    if len(all_laps):
-        m["eval/lap_time_best"] = float(all_laps.min())
-        m["eval/lap_time_median"] = float(np.median(all_laps))
-    flying = np.concatenate([x[1:] for x in lap_times])  # lap 1 is from a standing start
-    if len(flying):
-        m["eval/flying_lap_time_best"] = float(flying.min())
-        m["eval/flying_lap_time_median"] = float(np.median(flying))
-    # Where failed episodes ended (not lap_done / time_limit): one spot means one corner the policy can't take.
-    failed = [i for i, s in enumerate(stats) if END_GROUPS[s["end"]] not in ("lap_done", "timeout")]
-    if failed:
-        m["eval/fail_dist_from_start"] = float(np.median([traces[i]["dist_from_start"][-1] for i in failed]))
-        m["eval/fail_lap"] = float(np.mean([traces[i]["laps"][-1] for i in failed]))
-    if reference is not None and len(reference.lap_times):
-        m["eval/bot_lap_time_best"] = reference.best_lap
-        m["eval/bot_lap_time_median"] = reference.median_lap
-        if len(all_laps):
-            m["eval/gap_to_bot_best"] = m["eval/lap_time_best"] - reference.best_lap
-    # The same under the strict rules (see reward.py): what's comparable with earlier runs, and what selects best/.
-    strict = [x[:int(s["strict_laps"])] for x, s in zip(lap_times, stats)] if all("strict_laps" in s for s in stats) else lap_times
-    m["eval/completion_strict"] = float(np.mean([len(x) >= 1 for x in strict]))
-    m["eval/laps_completed_strict"] = float(np.mean([len(x) for x in strict]))
-    flying_strict = np.concatenate([x[1:] for x in strict])
-    if len(flying_strict):
-        m["eval/flying_lap_time_median_strict"] = float(np.median(flying_strict))
-    for k in BEHAVIOR_STATS:
-        m[f"eval/behavior/{k}"] = float(np.mean([s[k] for s in stats]))
-    groups = [END_GROUPS[s["end"]] for s in stats]
-    for g in sorted(set(END_GROUPS.values())):
-        m[f"eval/end/{g}"] = groups.count(g) / n
-    return EvalResult(m, traces, lap_times, stats)
+def check_launches(suite: list[dict], n_workers: int = 48) -> list[int]:
+    """Launch every scenario once (with its kick) without driving it; returns the indices of those whose state comes
+    back non-finite. The engine is deterministic, so a suite without any always launches cleanly."""
+    lay = _Layout(suite, n_workers)
+    bad: list[int] = []
+
+    def record(idx: np.ndarray, attempt: int) -> Starts:
+        bad.extend(int(lay.running[e]) for e in idx if lay.running[e] >= 0)
+        z = np.zeros(len(idx))
+        return Starts(np.zeros(len(idx), np.int64), z, z, z, z, z, z, np.zeros(len(idx), np.int64))  # the grid
+
+    env = RacingEnv(lay.tracks, start_fn=lay.start_fn, retry_fn=record)
+    try:
+        env.reset()
+        while (lay.running >= 0).any():
+            env._start(np.flatnonzero(lay.running >= 0))
+    finally:
+        env.close()
+    return sorted(set(bad))
+
+
+def write_results(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def read_results(path: Path) -> list[dict]:
+    with open(path) as f:
+        return list(csv.DictReader(f))
+
+
+def summarize(rows: list[dict], n_boot: int = 2000) -> dict[str, float]:
+    """Metrics per split ("{split}/..."): pooled over scenarios, so every 200 m of road weighs the same; the 90% interval
+    of the headline is a bootstrap over tracks (the unit of generalization)."""
+    m: dict[str, float] = {}
+    for split in sorted({r["split"] for r in rows}):
+        sp = [r for r in rows if r["split"] == split]
+        for tier in sorted({r["tier"] for r in sp}, key=KINDS.index):
+            t = [r for r in sp if r["tier"] == tier]
+            m[f"{split}/{tier}/survival"] = float(np.mean([r["outcome"] in ("clean", "survived") for r in t]))
+            m[f"{split}/{tier}/completion"] = float(np.mean([r["outcome"] != "failed" for r in t]))
+            m[f"{split}/{tier}/clean"] = float(np.mean([r["outcome"] == "clean" for r in t]))
+        nom = [r for r in sp if r["tier"] == "nominal"]
+        if not nom:
+            continue
+        paces = [float(r["pace"]) for r in nom if r["outcome"] in ("clean", "survived")]
+        m[f"{split}/pace"] = float(np.median(paces)) if paces else float("nan")
+        by_track = {}
+        for r in nom:
+            by_track.setdefault(r["track"], []).append(r["outcome"] in ("clean", "survived"))
+        groups = list(by_track.values())
+        rng = np.random.default_rng(0)
+        boot = [np.mean(np.concatenate([groups[i] for i in rng.integers(0, len(groups), len(groups))])) for _ in range(n_boot)]
+        m[f"{split}/nominal/survival_lo"], m[f"{split}/nominal/survival_hi"] = map(float, np.percentile(boot, [5, 95]))
+    return m
+
+
+def per_track(rows: list[dict]) -> list[dict]:
+    """One row per track: survival per tier, and pace."""
+    out = []
+    for track in sorted({r["track"] for r in rows}):
+        t = [r for r in rows if r["track"] == track]
+        row = {"track": track, "split": t[0]["split"], "scenarios": len(t)}
+        for tier in sorted({r["tier"] for r in t}, key=KINDS.index):
+            tt = [r for r in t if r["tier"] == tier]
+            row[tier] = float(np.mean([r["outcome"] in ("clean", "survived") for r in tt])) if tier != "crashed" \
+                else float(np.mean([r["outcome"] != "failed" for r in tt]))
+        paces = [float(r["pace"]) for r in t if r["tier"] == "nominal" and r["outcome"] in ("clean", "survived")]
+        row["pace"] = float(np.median(paces)) if paces else float("nan")
+        out.append(row)
+    return out
+
+
+def grid_laps(policy: Policy, tracks: list[str], laps: int = 2) -> list[dict]:
+    """The real task: `laps` laps from a standing start on the grid, one episode per track (the sim and the policy are
+    deterministic, so more would be copies). Ends when the laps are done, or on a failure."""
+    def grid(idx):
+        z = np.zeros(len(idx))
+        return Starts(np.zeros(len(idx), np.int64), z, z, z, z, z, z, np.zeros(len(idx), np.int64))
+    bot = {t: Track.load(t).bot_lap for t in tracks}
+    env = RacingEnv(list(tracks), episode_seconds=laps * max(bot.values()) / 0.6 + 30, start_fn=grid)
+    out = []
+    try:
+        obs, _ = env.reset()
+        active = np.ones(len(tracks), bool)
+        times: list[list[float]] = [[] for _ in tracks]
+        prev_laps = env._raw[:, F["laps"]].copy()
+        end = [""] * len(tracks)
+        while active.any():
+            obs, _, term, trunc, info = env.step(policy(obs), active)
+            raw = env._raw
+            for i in np.flatnonzero(active):
+                done = term[i] or trunc[i]
+                if not done and raw[i, F["laps"]] > prev_laps[i] and raw[i, F["laps"]] >= 2:
+                    times[i].append(float(raw[i, F["last_lap_time"]]))
+                prev_laps[i] = raw[i, F["laps"]]
+                if len(times[i]) >= laps or done:
+                    active[i] = False
+                    end[i] = "laps_done" if len(times[i]) >= laps else ENDS[info["episode_end"]["end"][i]]
+    finally:
+        env.close()
+    for i, t in enumerate(tracks):
+        out.append({"track": t, "end": end[i], "laps": len(times[i]), "lap_times": times[i], "bot_lap": bot[t],
+                    "best_vs_bot": (min(times[i]) / bot[t]) if times[i] else float("nan")})
+    return out
+

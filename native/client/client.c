@@ -15,7 +15,7 @@
 enum { RLP_OK = 0, RLP_ERR_TIMEOUT = -1, RLP_ERR_WORKER = -2, RLP_ERR_SYS = -3 };
 
 RLP_API rlp_header *rlp_create(const char *name, uint32_t n_workers, uint32_t n_cars, uint32_t frame_skip,
-                               uint32_t flags, uint32_t spin_us)
+                               uint32_t spin_us)
 {
     if (!n_workers || !n_cars || n_cars > RLP_MAX_CARS || !frame_skip)
         return NULL;
@@ -42,7 +42,6 @@ RLP_API rlp_header *rlp_create(const char *name, uint32_t n_workers, uint32_t n_
     rlp_header *h = (rlp_header *)p;
     *h = layout;
     h->frame_skip = frame_skip;
-    h->flags = flags;
     h->spin_us = spin_us;
     return h;
 }

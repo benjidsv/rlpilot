@@ -5,7 +5,7 @@
 For track t in sd-local/tracks/<category>/<t>/: data/raceman/rlpilot-<t>.xml (the agent) and rlref-<t>.xml (the
 bot), copies of rlpilot.xml / rlref.xml with only the track changed. Then reference.load() runs the bot for
 3 laps (cached in reference/). Tracks where the bot fails to complete 3 laps are reported, and their race
-configs removed, since without a reference there is no lookahead and no lap-time yardstick.
+configs removed, since without a reference there are no nominal starts and no pace yardstick.
 Writes reference/tracks.csv: track, category, length, bot best lap.
 """
 
@@ -14,10 +14,10 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from rlpilot import reference, workdirs
-from rlpilot.track import track_of
+from rlpilot.client import DATA, TEMPLATE
+from rlpilot.tracks import CACHE, Track, track_of
 
-RACEMAN = workdirs.DATA / "raceman"
+RACEMAN = DATA / "raceman"
 
 
 def race_xml(template: str, track: str, category: str) -> str:
@@ -36,10 +36,8 @@ def setup(track: str, category: str) -> tuple[str, str, float | None, float | No
         (RACEMAN / f"{race}.xml").write_text(race_xml("rlpilot", track, category))
         (RACEMAN / f"{ref}.xml").write_text(race_xml("rlref", track, category))
     try:
-        r = reference.load(ref, laps=3)
-        if len(r.lap_times) < 3:
-            raise RuntimeError(f"bot completed {len(r.lap_times)} of 3 laps")
-        return track, category, r.track_length, float(r.lap_times[1:].min()), "ok"
+        t = Track.load(track)  # runs the bot and the geometry dumps on first use
+        return track, category, t.length, t.bot_lap, "ok"
     except Exception as e:  # noqa: BLE001 - report and drop the track
         if race != "rlpilot":
             for name in (race, ref):
@@ -52,13 +50,13 @@ def main():
     p.add_argument("--categories", nargs="+", default=["circuit", "road", "gprix"])
     p.add_argument("--jobs", type=int, default=5)
     a = p.parse_args()
-    tracks = [(d.name, c) for c in a.categories for d in sorted((workdirs.TEMPLATE / "tracks" / c).glob("*"))
+    tracks = [(d.name, c) for c in a.categories for d in sorted((TEMPLATE / "tracks" / c).glob("*"))
               if d.is_dir() and (d / f"{d.name}.xml").exists()]
     tracks.append((track_of("rlpilot"), "circuit"))  # Jarama is in the install dir
     with ThreadPoolExecutor(a.jobs) as ex:
         results = list(ex.map(lambda tc: setup(*tc), tracks))
     ok = [r for r in results if r[4] == "ok"]
-    with open(reference.CACHE / "tracks.csv", "w") as f:
+    with open(CACHE / "tracks.csv", "w") as f:
         f.write("track,category,length_m,bot_best_lap_s\n")
         for t, c, length, lap, _ in sorted(ok):
             f.write(f"{t},{c},{length:.0f},{lap:.2f}\n")

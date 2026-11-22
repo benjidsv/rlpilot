@@ -1,128 +1,74 @@
-"""Vectorized reward and termination from raw shared-memory fields.
+"""Reward and termination. PLACEHOLDER reward for phase 1 (to be designed in phase 2); the termination rule is agreed.
 
-Kept in Python on purpose: shaping changes need no rebuild, and over a batch of envs this is a few
-numpy ops per step. The reward is returned split into components so they can be logged separately
-(total return hides reward hacking)."""
+Reward per step, split into components so each can be logged:
+- progress: PROGRESS per metre along the track, signed (driving backwards costs), and nothing gained while all four
+  wheels are off the road (no shortcuts across the grass).
+- damage:   -DAMAGE per point of damage taken.
+- terminal: -TERMINAL when an episode fails.
+
+Termination (fails the episode): no new best distance along the track for NO_PROGRESS_SECONDS (a spin, a reverse out
+of the grass or a three-point turn are all fine, as long as the car gets going again), damage over MAX_DAMAGE, or the
+engine ending the race. The time limit is a truncation, not a failure: the agent bootstraps through it.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-from ._native import F
-from .config import RewardConfig
+from .client import F
 
-# Termination reasons (index = code in info["stats"]["term_reason"]; -1 = time limit / truncation).
-# sim_error: the engine returned a non-finite state mid-episode (set by the env, not by RewardTracker)
-TERM_REASONS = ("offtrack", "stuck", "backwards", "damage", "race_over", "lap_done", "sim_error")
-LAP_DONE = TERM_REASONS.index("lap_done")
-SIM_ERROR = TERM_REASONS.index("sim_error")
-# Coarse groups for the dashboard.
-END_GROUPS = {"offtrack": "off_track", "stuck": "stuck_crashed", "backwards": "stuck_crashed",
-              "damage": "stuck_crashed", "race_over": "stuck_crashed", "lap_done": "lap_done",
-              "time_limit": "timeout", "sim_error": "sim_error"}
-REWARD_COMPONENTS = ("progress", "offtrack", "damage", "terminal", "steer", "line", "steer_change", "steer_reversal")
+PROGRESS = 0.1
+DAMAGE = 0.001
+TERMINAL = 10.0
+NO_PROGRESS_SECONDS = 10.0
+PROGRESS_STEP = 1.0     # m: a new best distance must beat the last one by this (jitter against a wall isn't progress)
+MAX_DAMAGE = 5000.0
+COMPONENTS = ("progress", "damage", "terminal")
+FAILURES = ("no_progress", "damage", "race_over", "sim_error")  # reason codes 0.. of terminated episodes
 
 
-# The rules every run up to proto-8 was judged by (s). Later runs may allow more, so evals also score episodes by these:
-# completion under looser rules isn't comparable with earlier runs.
-STRICT_OFFTRACK_S, STRICT_BACKWARDS_S, STRICT_STUCK_S = 1.0, 1.0, 4.0
+class Reward:
+    def __init__(self, n: int, step_seconds: float):
+        self.dt = step_seconds
+        self.raced = np.zeros(n, np.float64)      # m along the track this episode, signed
+        self.best = np.zeros(n, np.float64)       # best `raced` so far, in PROGRESS_STEP increments
+        self.since_best = np.zeros(n, np.float64)  # s since `best` last improved
+        self.prev_dist = np.zeros(n, np.float64)
+        self.prev_damage = np.zeros(n, np.float64)
+        self.damage_taken = np.zeros(n, bool)      # this step
+        self.components = np.zeros((len(COMPONENTS), n), np.float32)  # this step
 
-
-def strict_failure(wheels_off: np.ndarray, speed_x: np.ndarray, angle: np.ndarray, dt: float, stuck_speed: float = 1.0
-                   ) -> tuple[int, str | None]:
-    """First step of an episode's trace where the strict rules would have ended it, and which one: (-1, None) if none."""
-    rules = (("offtrack", wheels_off >= 4, STRICT_OFFTRACK_S), ("stuck", speed_x < stuck_speed, STRICT_STUCK_S),
-             ("backwards", np.cos(angle) < 0, STRICT_BACKWARDS_S))
-    first, why = -1, None
-    for name, cond, seconds in rules:
-        steps = int(round(seconds / dt))
-        if len(cond) >= steps:
-            full = np.flatnonzero(np.convolve(cond.astype(np.int64), np.ones(steps, np.int64), "valid") == steps)
-            if len(full) and (first < 0 or full[0] + steps - 1 < first):
-                first, why = int(full[0]) + steps - 1, name
-    return first, why
-
-
-class RewardTracker:
-    def __init__(self, n: int, cfg: RewardConfig, step_seconds: float, laps_per_episode: int = 0):
-        self.cfg, self.dt, self.laps_per_episode = cfg, step_seconds, laps_per_episode
-        self.prev_dist = np.zeros(n, np.float32)
-        self.raced = np.zeros(n, np.float64)  # m along the track this episode, without lap-sized jumps (see step)
-        self.prev_damage = np.zeros(n, np.float32)
-        self.off_t = np.zeros(n, np.float32)
-        self.stuck_t = np.zeros(n, np.float32)
-        self.back_t = np.zeros(n, np.float32)
-        self.components = np.zeros((len(REWARD_COMPONENTS), n), np.float32)
-        self.line_k = cfg.line_shaping  # mutable: training can fade it
-        self.prev_dev = np.zeros(n, np.float32)  # |offset from the racing line| (m) at the previous state
-        self.prev_change = np.zeros(n, np.float32)  # steering change of the previous step
-        self.reversed = np.zeros(n, bool)  # this step's reversal flags: consecutive changes of opposite signs, both
-                                           # above the dead-band
-
-    def reset(self, raw: np.ndarray, idx: np.ndarray | slice = slice(None), line_dev: np.ndarray | None = None) -> None:
-        """line_dev: |offset from the racing line| (m) of the envs idx (all n if idx is a slice)."""
-        if line_dev is not None:
-            self.prev_dev[idx] = line_dev
-        self.prev_dist[idx] = self.raced[idx] = raw[idx, F["dist_raced"]]
+    def reset(self, idx: np.ndarray, raw: np.ndarray) -> None:
+        self.raced[idx] = self.best[idx] = self.since_best[idx] = 0
+        self.prev_dist[idx] = raw[idx, F["dist_raced"]]
         self.prev_damage[idx] = raw[idx, F["damage"]]
-        self.prev_change[idx] = 0  # the first change of an episode can't be a reversal
-        self.off_t[idx] = self.stuck_t[idx] = self.back_t[idx] = 0
 
-    def step(self, raw: np.ndarray, d_steer: np.ndarray | float = 0.0, line_dev: np.ndarray | None = None
-             ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """raw [n, OBS_DIM], d_steer [n] change of the steer action since the previous step, line_dev [n]
-        |offset from the racing line| (m) of the new state (needed when line_k > 0).
-        Returns reward [n], terminated [n] bool, reason [n] int (-1 = none, else TERM_REASONS index).
-        The per-component rewards of this step are left in self.components [n_components, n]."""
-        c, dt = self.cfg, self.dt
-        dist, damage = raw[:, F["dist_raced"]], raw[:, F["damage"]]
-        wheels_off = raw[:, F["wheels_off"]]
-        # The engine's dist_raced = (laps - 1) x length + dist_from_start jumps by a lap when a car crosses the start line
-        # backwards (no lap is counted, but dist_from_start wraps), and back when it recrosses. A policy found this: creep
-        # off the grid, spin at full lock across the line, collect a lap of reward. Remove anything lap-sized: a car can't
-        # cover half a lap in one step, so real driving is unchanged.
-        length = raw[:, F["track_length"]]
+    def step(self, raw: np.ndarray, active: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """raw [n, OBS_DIM] after the step -> reward [n], terminated [n], reason [n] (index in FAILURES, -1 = none).
+        Envs not `active` (paused, not stepped) keep their state, get no reward and can't end."""
+        on = np.ones(len(raw), bool) if active is None else active
+        dist, damage = raw[:, F["dist_raced"]].astype(np.float64), raw[:, F["damage"]].astype(np.float64)
+        # The engine's dist_raced jumps by a lap when a car crosses the start line backwards (and back when it recrosses):
+        # remove anything lap-sized. A car can't cover half a lap in one step, so real driving is unchanged.
+        length = np.maximum(raw[:, F["track_length"]], 1.0)
         progress = dist - self.prev_dist
-        progress = progress - length * np.rint(progress / np.maximum(length, 1.0))
+        progress -= length * np.rint(progress / length)
+        d_damage = np.maximum(damage - self.prev_damage, 0)
+        progress, d_damage = progress * on, d_damage * on
+        self.prev_dist = np.where(on, dist, self.prev_dist)
+        self.prev_damage = np.where(on, damage, self.prev_damage)
+        self.damage_taken = d_damage > 0
         self.raced += progress
-        d_damage = damage - self.prev_damage
-        self.prev_dist[:], self.prev_damage[:] = dist, damage
 
-        self.off_t = np.where(wheels_off >= 4, self.off_t + dt, 0)
-        self.stuck_t = np.where(raw[:, F["speed_x"]] < c.stuck_speed, self.stuck_t + dt, 0)
-        self.back_t = np.where(np.cos(raw[:, F["angle"]]) < 0, self.back_t + dt, 0)
-
-        # laps counts start-line crossings; the first one (from the grid) is not a completed lap
-        laps_done = (raw[:, F["laps"]] - 1 >= self.laps_per_episode) if self.laps_per_episode > 0 \
-            else np.zeros(len(raw), bool)
-        conds = np.stack([self.off_t >= c.offtrack_patience,
-                          self.stuck_t >= c.stuck_patience,
-                          self.back_t >= c.backwards_patience,
-                          damage >= c.max_damage,
-                          raw[:, F["race_over"]] > 0,
-                          laps_done])
-        terminated = conds.any(axis=0)
+        improved = self.raced >= self.best + PROGRESS_STEP
+        self.best = np.where(improved, self.raced, self.best)
+        self.since_best = np.where(improved, 0.0, self.since_best + self.dt * on)
+        conds = np.stack([self.since_best >= NO_PROGRESS_SECONDS, damage >= MAX_DAMAGE, raw[:, F["race_over"]] > 0])
+        terminated = conds.any(axis=0) & on
         reason = np.where(terminated, conds.argmax(axis=0), -1)
-        failed = terminated & (reason != LAP_DONE)
 
-        comp = self.components
-        comp[0] = c.progress * np.where((wheels_off >= 4) & (progress > 0), progress * c.offtrack_progress, progress)
-        comp[1] = -c.offtrack * wheels_off / 4
-        comp[2] = -c.damage * d_damage
-        comp[3] = -c.terminal * failed
-        comp[4] = -c.steer_rate * np.square(d_steer)
-        comp[6] = -c.steer_change * np.abs(d_steer)
-        self.reversed = (d_steer * self.prev_change < 0) & (np.abs(d_steer) > c.steer_deadband) \
-            & (np.abs(self.prev_change) > c.steer_deadband)
-        comp[7] = -c.steer_reversal * self.reversed
-        self.prev_change[:] = d_steer
-        if line_dev is not None and self.line_k > 0:
-            # both potentials with the current k, so fading it never creates a one-off jump
-            phi = -self.line_k * np.minimum(line_dev, c.line_cap) * ~terminated
-            prev = -self.line_k * np.minimum(self.prev_dev, c.line_cap)
-            comp[5] = c.gamma * phi - prev
-        else:
-            comp[5] = 0
-        if line_dev is not None:
-            self.prev_dev[:] = line_dev
-        return comp.sum(axis=0), terminated, reason
+        off = raw[:, F["wheels_off"]] >= 4
+        self.components[0] = PROGRESS * np.where(off & (progress > 0), 0.0, progress)
+        self.components[1] = -DAMAGE * d_damage
+        self.components[2] = -TERMINAL * terminated
+        return self.components.sum(axis=0), terminated, reason
