@@ -19,15 +19,13 @@
 #endif
 
 #define RLP_MAGIC 0x31504C52u /* "RLP1" */
-#define RLP_VERSION 7
+#define RLP_VERSION 8
 #define RLP_MAX_CARS 8
-#define RLP_N_RAYS 19
-#define RLP_RAY_RANGE 200.0f
 
 enum rlp_cmd { RLP_CMD_NONE = 0, RLP_CMD_STEP = 1, RLP_CMD_RESET = 2, RLP_CMD_QUIT = 3 };
 enum rlp_status { RLP_ST_STARTING = 0, RLP_ST_READY = 1, RLP_ST_ERROR = 2, RLP_ST_EXITED = 3 };
 
-/* Raw per-car fields, followed by RLP_N_RAYS track-edge distances (m). */
+/* Raw per-car fields. */
 enum rlp_field {
     RLP_F_TIME,            /* race time (s) */
     RLP_F_SPEED_X,         /* car frame (m/s) */
@@ -68,7 +66,7 @@ enum rlp_field {
     RLP_F_TRACK_LENGTH,    /* m, constant */
     RLP_N_FIELDS
 };
-#define RLP_OBS_DIM (RLP_N_FIELDS + RLP_N_RAYS)
+#define RLP_OBS_DIM RLP_N_FIELDS
 
 enum rlp_action {
     RLP_A_STEER,

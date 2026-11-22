@@ -218,6 +218,53 @@ class Agent(nn.Module):
         )
 
 
+# rlpilot: TensorBoard layout. The Scalars tab shows one metric per chart, in numbered sections (1_dashboard: the
+# numbers that say whether a run is better; 2_ppo: health; 3_eval: every tier of both splits; 4_driving: training
+# episodes; 5_perf), and compares runs well: one line per run. The Custom Scalars tab draws several metrics on one
+# chart (LAYOUT): best for reading one run, since each run multiplies the lines.
+DASHBOARD = {  # 1_dashboard/<name>: eval metric
+    "validation_nominal_survival": "validation/nominal/survival",
+    "train_nominal_survival": "train/nominal/survival",
+    "validation_pace": "validation/pace",
+    "validation_crashed_completion": "validation/crashed/completion",
+    "validation_disturbed_survival": "validation/disturbed/survival",
+}
+LAYOUT = {
+    "dashboard": {
+        "nominal survival, validation (90% band over tracks)": [
+            "Margin",
+            [
+                "3_eval/validation/nominal/survival",
+                "3_eval/validation/nominal/survival_lo",
+                "3_eval/validation/nominal/survival_hi",
+            ],
+        ],
+        "nominal survival, train vs validation": [
+            "Multiline",
+            [r"3_eval/(train|validation)/nominal/survival$"],
+        ],
+        "recovery, validation": [
+            "Multiline",
+            [r"3_eval/validation/(crashed/completion|disturbed/survival)$"],
+        ],
+    },
+    "eval by tier": {
+        f"{m}, {split}": ["Multiline", [rf"3_eval/{split}/[a-z]+/{m}$"]]
+        for split in ("validation", "train")
+        for m in ("survival", "completion", "clean")
+    },
+    "driving": {
+        "how episodes end": ["Multiline", [r"4_driving/end/"]],
+        "failed near start, by kind of start": [
+            "Multiline",
+            [r"4_driving/failed_near_start/"],
+        ],
+        "reward components": ["Multiline", [r"4_driving/reward_"]],
+    },
+    "ppo": {"action std": ["Multiline", [r"2_ppo/std_"]]},
+}
+
+
 def run_eval(
     agent, norm, args, step, run_dir, writer, best
 ):  # rlpilot: the scenario suite, validation + train
@@ -236,8 +283,10 @@ def run_eval(
     evaluate.write_results(rows, run_dir / "eval" / f"{step:010d}.csv")
     metrics = evaluate.summarize(rows)
     for k, v in metrics.items():
-        writer.add_scalar(f"eval/{k}", v, step)
-    writer.add_scalar("eval/seconds", time.time() - t0, step)
+        writer.add_scalar(f"3_eval/{k}", v, step)
+    for name, k in DASHBOARD.items():
+        writer.add_scalar(f"1_dashboard/{name}", metrics[k], step)
+    writer.add_scalar("5_perf/eval_seconds", time.time() - t0, step)
     ckpt = {
         "agent": agent.state_dict(),
         "obs_mean": norm.obs_rms.mean,
@@ -279,7 +328,7 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s"
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
-
+    writer.add_custom_scalars(LAYOUT)  # rlpilot
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -381,11 +430,11 @@ if __name__ == "__main__":
                 "reward_terminal",
             ):
                 writer.add_scalar(
-                    f"episodes/{k}", np.mean([x[k] for x in ended]), global_step
+                    f"4_driving/{k}", np.mean([x[k] for x in ended]), global_step
                 )
             for code, name in enumerate(ENDS):
                 writer.add_scalar(
-                    f"episodes/end_{name}",
+                    f"4_driving/end/{name}",
                     np.mean([x["end"] == code for x in ended]),
                     global_step,
                 )
@@ -393,15 +442,15 @@ if __name__ == "__main__":
                 mine = [x for x in ended if x["kind"] == code]
                 if mine:
                     writer.add_scalar(
-                        f"episodes/failed_near_start_{name}",
+                        f"4_driving/failed_near_start/{name}",
                         np.mean([x["failed_near_start"] for x in mine]),
                         global_step,
                     )
         writer.add_scalar(
-            "charts/std_steer", agent.actor_logstd[0, 0].exp().item(), global_step
+            "2_ppo/std_steer", agent.actor_logstd[0, 0].exp().item(), global_step
         )  # rlpilot
         writer.add_scalar(
-            "charts/std_pedal", agent.actor_logstd[0, 1].exp().item(), global_step
+            "2_ppo/std_pedal", agent.actor_logstd[0, 1].exp().item(), global_step
         )  # rlpilot
 
         # bootstrap value if not done
@@ -501,19 +550,19 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # rlpilot: grouped under 2_ppo and 5_perf (see LAYOUT); old_approx_kl dropped
         writer.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
+            "2_ppo/learning_rate", optimizer.param_groups[0]["lr"], global_step
         )
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
+        writer.add_scalar("2_ppo/value_loss", v_loss.item(), global_step)
+        writer.add_scalar("2_ppo/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("2_ppo/entropy", entropy_loss.item(), global_step)
+        writer.add_scalar("2_ppo/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("2_ppo/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("2_ppo/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar(
-            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
+            "5_perf/SPS", int(global_step / (time.time() - start_time)), global_step
         )
 
         if (

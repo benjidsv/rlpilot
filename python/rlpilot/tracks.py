@@ -1,8 +1,9 @@
 """Tracks: names, the frozen split, and each track's geometry and bot reference on a ~1 m grid along the lap.
 
 A track `t` is raced with data/raceman/rlpilot-<t>.xml (rlpilot.xml for Jarama) and has a built-in bot reference in
-rlref-<t>.xml. Running that bot once in the worker's trace mode gives the track map (road edges), the road height and
-the width beside the road, and the bot's laps; they are cached in reference/, keyed by the race file's content.
+rlref-<t>.xml. Running that bot once in the worker's trace mode gives the track map (road edges), the road height at
+each edge, the width and the surface beside the road, and the bot's laps; they are cached in reference/, keyed by the
+race file's content.
 
 Everything is indexed by the distance along the lap (`s`, m from the start line), never by the nearest point: at a
 figure-eight's crossing the nearest point can belong to the other branch.
@@ -28,8 +29,10 @@ TRACE_COLUMNS = ("time", "laps", "dist_from_start", "dist_raced", "speed_x", "x"
                  "steer", "accel", "brake")
 # Columns of Track.table, per grid cell.
 COLUMNS = ("left_x", "left_y", "right_x", "right_y",  # road edges, world frame (m)
-           "height",                                   # road height at the centreline (m)
+           "left_z", "right_z",                        # road height at each edge (m)
            "side_left", "side_right",                  # width beside each edge before the barrier (m)
+           "grass_left", "grass_right",                # 1 where the widest surface beside the edge is grass
+           "loose_left", "loose_right",                # 1 where it is loose: sand, gravel or dirt (else it is paved)
            "bot_offset",                               # the bot's lateral offset from the centreline (m, + = left)
            "bot_speed",                                # m/s
            "bot_time",                                 # s since the start line on its fastest lap
@@ -72,10 +75,41 @@ def _prefix(track: str) -> Path:
     CACHE.mkdir(exist_ok=True)
     if not Path(f"{prefix}_laps.csv").exists():
         run_worker_once(ref, ["-o", str(prefix), "-n", str(REF_LAPS)])
-    for flag, suffix in (("-z", "height"), ("-b", "sides")):  # geometry dumps, no bot laps needed
+    for flag, suffix in (("-z", "height"), ("-b", "sides"), ("-g", "surfaces")):  # geometry dumps, no bot laps needed
         if not Path(f"{prefix}_{suffix}.csv").exists():
             run_worker_once(ref, [flag, f"{prefix}_{suffix}.csv"], timeout=120)
     return prefix
+
+
+# What a driver would call the surface beside the road, from the track's material names: what it looks like, not its
+# exact grip. A name that matches no class, or several (blends such as "b-asphalt-grass6", tarmac fading into grass),
+# falls back on its physics.
+KIND_WORDS = {"loose": ("sand", "gravel", "dirt"),
+              "grass": ("grass",),
+              "paved": ("asphalt", "road", "concrete", "conc", "curb", "kerb", "tarmac", "pit", "tile", "rwy", "none")}
+
+
+def surface_kind(material: str, friction: float, rollres: float) -> str:
+    """"paved", "grass" or "loose" for a surface beside the road."""
+    name = material.lower()
+    kinds = [k for k, words in KIND_WORDS.items() if any(w in name for w in words)]
+    if len(kinds) == 1:
+        return kinds[0]
+    if rollres >= 0.1:
+        return "loose"
+    return "paved" if friction >= 0.7 else "grass"
+
+
+def surface_kinds(path: str) -> np.ndarray:
+    """The surfaces dump -> [m, 4] floats: grass left, grass right, loose left, loose right (paved = all 0)."""
+    rows = [line.split() for line in open(path) if not line.startswith("#")]
+    out = np.zeros((len(rows), 4), np.float64)
+    for i, (lm, lf, lr, rm, rf, rr) in enumerate(rows):
+        for side, (m, f, r) in enumerate(((lm, lf, lr), (rm, rf, rr))):
+            kind = surface_kind(m, float(f), float(r))
+            out[i, side] = kind == "grass"
+            out[i, 2 + side] = kind == "loose"
+    return out
 
 
 def lap_times(trace: dict[str, np.ndarray]) -> np.ndarray:
@@ -104,9 +138,10 @@ class Track:
         with open(f"{prefix}_track.csv") as f:
             length = float(f.readline().split("length=")[1].split()[0])
         edges = np.loadtxt(f"{prefix}_track.csv", ndmin=2)              # [m, 4] at the engine's border samples
-        height = np.loadtxt(f"{prefix}_height.csv", ndmin=2).mean(1)     # [m]
+        height = np.loadtxt(f"{prefix}_height.csv", ndmin=2)            # [m, 2] left, right
         sides = np.loadtxt(f"{prefix}_sides.csv", ndmin=2)              # [m, 2]
-        geometry, cells, spacing = _on_lap_grid(edges, length, np.column_stack([edges, height, sides]))
+        kinds = surface_kinds(f"{prefix}_surfaces.csv")                 # [m, 4] grass l/r, gravel l/r
+        geometry, cells, spacing = _on_lap_grid(edges, length, np.column_stack([edges, height, sides, kinds]))
 
         data = np.loadtxt(f"{prefix}_laps.csv", ndmin=2)
         trace = {c: data[:, i] for i, c in enumerate(TRACE_COLUMNS)}

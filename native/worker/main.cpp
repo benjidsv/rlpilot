@@ -7,7 +7,7 @@
 //
 // Usage: rlpilot-worker -lc <localdir>/ -s <race> -m <shm name> -w <worker index> [-nr] [-tl <level>]
 //        rlpilot-worker -lc <localdir>/ -s <race> -o <out prefix> [-n <laps>] [-nr]
-//        rlpilot-worker -lc <localdir>/ -s <race> [-z <heights file>] [-b <sides file>]
+//        rlpilot-worker -lc <localdir>/ -s <race> [-z <heights file>] [-b <sides file>] [-g <surfaces file>]
 // The second form (trace mode) needs no client: it runs the race as configured (e.g. with a built-in
 // bot), records car 0 every 20 ms to <prefix>_laps.csv until it completes <laps> laps, and samples the
 // track borders to <prefix>_track.csv. Used to build reference lap times / traces for evaluation.
@@ -40,10 +40,6 @@
 #include "../sync.h"
 
 namespace {
-
-// Track-edge rangefinder angles (deg, + = left), as in the TORCS SCR championship.
-const float kRayAngles[RLP_N_RAYS] = {-90, -75, -60, -45, -30, -20, -15, -10, -5, 0,
-                                      5,   10,  15,  20,  30,  45,  60,  75,  90};
 
 struct Host
 {
@@ -80,35 +76,6 @@ void fatal(const char *msg)
         rlp_signal(&H.w->done_sync, H.last_cmd_seq);
     }
     std::_Exit(3);
-}
-
-float trackRay(tTrackSeg *seg, float x0, float y0, float dx, float dy)
-{
-    // Sphere tracing: distance to the nearest road edge bounds how far the ray can go without
-    // leaving the road (exact on straights and arcs), then bisect the crossing.
-    tTrkLocPos p;
-    float t = 0, tIn = 0;
-    for (int it = 0; it < 48; it++) {
-        RtTrackGlobal2Local(seg, x0 + t * dx, y0 + t * dy, &p, TR_LPOS_MAIN);
-        seg = p.seg;
-        float d = std::min(p.toLeft, p.toRight);
-        if (d < 0) {
-            if (t == 0)
-                return 0;
-            float lo = tIn, hi = t;
-            for (int b = 0; b < 6; b++) {
-                float mid = 0.5f * (lo + hi);
-                RtTrackGlobal2Local(seg, x0 + mid * dx, y0 + mid * dy, &p, TR_LPOS_MAIN);
-                (std::min(p.toLeft, p.toRight) < 0 ? hi : lo) = mid;
-            }
-            return 0.5f * (lo + hi);
-        }
-        tIn = t;
-        t += std::max(d, 0.5f + 0.02f * t);
-        if (t >= RLP_RAY_RANGE)
-            return RLP_RAY_RANGE;
-    }
-    return t;
 }
 
 // Highest forward gear. The simulator's gearNb is that + 1 (it counts neutral, not reverse): v1 read it as also counting
@@ -168,12 +135,6 @@ void writeObs(uint32_t k)
     o[RLP_F_ACCEL_Y] = car->_accel_y;
     o[RLP_F_ACCEL_Z] = car->_accel_z;
     o[RLP_F_TRACK_LENGTH] = H.engine->inData()->track->length;
-
-    float *rays = o + RLP_N_FIELDS;
-    for (int r = 0; r < RLP_N_RAYS; r++) {
-        float a = car->_yaw + kRayAngles[r] * (float)(PI / 180.0);
-        rays[r] = tp.seg ? trackRay(tp.seg, car->_pos_X, car->_pos_Y, cosf(a), sinf(a)) : 0;
-    }
 }
 
 void publish()
@@ -461,6 +422,43 @@ void writeSides(const std::string &path, tTrack *track)
     fclose(f);
 }
 
+// Surface beside each edge of the road, at the same points as writeTrack, row for row: the material name of the widest
+// side segment (what a driver sees there: grass, sand, ...), with its friction and rolling resistance so that names
+// Python can't classify can fall back on physics. "none" when there's nothing before the barrier.
+void writeSurface(FILE *f, tTrackSeg *seg, int side, float frac)
+{
+    tTrackSeg *widest = nullptr;
+    float best = 0;
+    for (tTrackSeg *s = seg->side[side]; s; s = s->side[side]) {
+        float w = s->startWidth + (s->endWidth - s->startWidth) * frac;
+        if (w > best && s->surface)
+            best = w, widest = s;
+    }
+    if (!widest)
+        fprintf(f, "none 0 0");
+    else
+        fprintf(f, "%s %.3f %.3f", widest->surface->material, widest->surface->kFrictionDry, widest->surface->kRollRes);
+}
+
+void writeSurfaces(const std::string &path, tTrack *track)
+{
+    FILE *f = fopen(path.c_str(), "w");
+    if (!f)
+        fatal("cannot write the surfaces file");
+    fprintf(f, "# left_material left_friction left_rollres right_material right_friction right_rollres\n");
+    tTrackSeg *seg = track->seg->next; // track->seg is the last segment
+    for (int i = 0; i < track->nseg; i++, seg = seg->next) {
+        int n = std::max(1, (int)ceilf(seg->length / 2.0f));
+        for (int j = 0; j < n; j++) {
+            writeSurface(f, seg, TR_SIDE_LFT, (float)j / n);
+            fputc(' ', f);
+            writeSurface(f, seg, TR_SIDE_RGT, (float)j / n);
+            fputc('\n', f);
+        }
+    }
+    fclose(f);
+}
+
 int runTrace(const std::string &prefix, int laps)
 {
     tRmInfo *re = H.engine->inData();
@@ -524,17 +522,21 @@ int main(int argc, char *argv[])
     app->registerOption("n", "tracelaps", true);
     app->registerOption("z", "heights", true);
     app->registerOption("b", "sides", true);
+    app->registerOption("g", "surfaces", true);
     if (!app->parseOptions())
         return 1;
 
-    std::string race, shmName, worker, tracePrefix, traceLaps = "3", heightsPath, sidesPath;
+    std::string race, shmName, worker, tracePrefix, traceLaps = "3", heightsPath, sidesPath,
+                surfacesPath;
     bool heights = app->hasOption("heights", heightsPath);
     bool sides = app->hasOption("sides", sidesPath);
-    bool trace = heights || sides || app->hasOption("trace", tracePrefix);
+    bool surfaces = app->hasOption("surfaces", surfacesPath);
+    bool dump = heights || sides || surfaces;
+    bool trace = dump || app->hasOption("trace", tracePrefix);
     app->hasOption("tracelaps", traceLaps);
     if (!app->hasOption("startrace", race) ||
         (!trace && (!app->hasOption("shm", shmName) || !app->hasOption("worker", worker)))) {
-        fprintf(stderr, "usage: rlpilot-worker -lc <dir>/ -s <race> (-m <shm name> -w <index> | -o <prefix> [-n <laps>] | -z <heights file> | -b <sides file>)\n");
+        fprintf(stderr, "usage: rlpilot-worker -lc <dir>/ -s <race> (-m <shm name> -w <index> | -o <prefix> [-n <laps>] | -z <heights file> | -b <sides file> | -g <surfaces file>)\n");
         return 1;
     }
     std::fill(std::begin(H.slot_of), std::end(H.slot_of), -1);
@@ -574,11 +576,13 @@ int main(int argc, char *argv[])
     H.engine->configureRace(/*bInteractive=*/false);
     H.engine->race()->forceResultsOnly();
     H.engine->startNewRace();
-    if (heights || sides) {
+    if (dump) {
         if (heights)
             writeHeights(heightsPath, H.engine->inData()->track);
         if (sides)
             writeSides(sidesPath, H.engine->inData()->track);
+        if (surfaces)
+            writeSurfaces(surfacesPath, H.engine->inData()->track);
         GfTraceShutdown();
         std::_Exit(0);
     }

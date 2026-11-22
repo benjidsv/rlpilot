@@ -28,7 +28,7 @@ static void control(const float *o, float *a)
 {
     float w = o[RLP_F_TRACK_WIDTH] > 1 ? o[RLP_F_TRACK_WIDTH] : 10;
     a[RLP_A_STEER] = 1.5f * (o[RLP_F_ANGLE] - 0.5f * o[RLP_F_TO_MIDDLE] / w);
-    float target = 10 + 0.25f * o[RLP_N_FIELDS + RLP_N_RAYS / 2]; /* faster when the road ahead is clear */
+    float target = 20; /* m/s */
     a[RLP_A_ACCEL] = o[RLP_F_SPEED_X] < target ? 0.8f : 0;
     a[RLP_A_BRAKE] = o[RLP_F_SPEED_X] > target + 5 ? 0.5f : 0;
     a[RLP_A_GEAR] = 1; /* stays in first: a throughput test, not a driver */
@@ -97,9 +97,9 @@ int main(int argc, char **argv)
         uint32_t cmd = (s % ep == 0) ? RLP_CMD_RESET : RLP_CMD_STEP;
         if (getenv("RLP_DEBUG") && s % 250 == 0) {
             const float *o = rlp_obs_at(h, 0, 0);
-            printf("step %u t=%.2f v=%.1f gear=%.0f rpm=%.0f angle=%.2f mid=%.2f dist=%.0f lap=%.0f off=%.0f state=%.0f ray0=%.1f ray9=%.1f\n",
+            printf("step %u t=%.2f v=%.1f gear=%.0f rpm=%.0f angle=%.2f mid=%.2f dist=%.0f lap=%.0f off=%.0f state=%.0f\n",
                    s, o[RLP_F_TIME], o[RLP_F_SPEED_X], o[RLP_F_GEAR], o[RLP_F_RPM], o[RLP_F_ANGLE], o[RLP_F_TO_MIDDLE],
-                   o[RLP_F_DIST_RACED], o[RLP_F_LAPS], o[RLP_F_WHEELS_OFF], o[RLP_F_CAR_STATE], o[RLP_N_FIELDS], o[RLP_N_FIELDS + 9]);
+                   o[RLP_F_DIST_RACED], o[RLP_F_LAPS], o[RLP_F_WHEELS_OFF], o[RLP_F_CAR_STATE]);
         }
         for (uint32_t i = 0; i < n; i++) {
             const float *o = rlp_obs_at(h, i, 0);

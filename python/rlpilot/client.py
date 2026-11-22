@@ -38,16 +38,14 @@ def _parse_protocol(text: str):
         return float(re.search(r"#define %s ([0-9.]+)" % name, text).group(1))
 
     return enum("rlp_field", "RLP_F_"), enum("rlp_action", "RLP_A_"), {
-        k: define("RLP_" + k.upper()) for k in ("version", "n_rays", "ray_range")}
+        k: define("RLP_" + k.upper()) for k in ("version",)}
 
 
 _FIELDS, _ACTIONS, _DEFS = _parse_protocol((ROOT / "native" / "protocol.h").read_text())
 F = {name: i for i, name in enumerate(_FIELDS)}  # raw obs field -> column
 A = {name: i for i, name in enumerate(_ACTIONS)}  # action slot -> column
 N_FIELDS = len(_FIELDS)
-N_RAYS = int(_DEFS["n_rays"])
-RAY_RANGE = _DEFS["ray_range"]
-OBS_DIM = N_FIELDS + N_RAYS  # the rays follow the fields
+OBS_DIM = N_FIELDS
 ACT_DIM = len(_ACTIONS)
 PROTOCOL_VERSION = int(_DEFS["version"])
 
