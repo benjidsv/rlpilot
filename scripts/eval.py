@@ -26,10 +26,12 @@ from train import Agent  # noqa: E402  (the policy is defined in the single-file
 def load_policy(path: Path):
     ckpt = torch.load(path, weights_only=False)
     space = types.SimpleNamespace(single_observation_space=gym.spaces.Box(-np.inf, np.inf, (obs.DIM,), np.float32))
-    agent = Agent(space, ckpt["args"]["hidden"])
+    agent = Agent(space, ckpt["args"]["hidden"], activation=ckpt["args"].get("activation", "tanh"))
     agent.load_state_dict(ckpt["agent"])
     agent.eval()
     mean, std = ckpt["obs_mean"], np.sqrt(ckpt["obs_var"] + ckpt["epsilon"])
+    fixed = ckpt.get("obs_fixed", np.zeros(len(mean), bool))  # inputs that skip the normalization, as in training
+    mean, std = np.where(fixed, 0.0, mean), np.where(fixed, 1.0, std)
     torch.set_num_threads(1)  # as in training's evals: the same thread count gives the same actions
 
     def policy(o):

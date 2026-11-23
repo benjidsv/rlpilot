@@ -23,7 +23,7 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # rlpilot
 
-from rlpilot import evaluate  # rlpilot
+from rlpilot import evaluate, obs as observation  # rlpilot
 from rlpilot.env import ENDS, RacingEnv  # rlpilot
 from rlpilot.starts import KINDS  # rlpilot
 from rlpilot.tracks import Track, allocate, load_split  # rlpilot
@@ -79,6 +79,14 @@ class Args:
     # rlpilot: our own arguments
     hidden: int = 256
     """width of the two hidden layers of the actor and the critic (CleanRL: 64)"""
+    anneal_timesteps: int = 0
+    """steps over which the learning rate anneals to 0 (0 = total-timesteps). Set it to a longer run's length to stop
+    early on that run's schedule: a 3M test with 10M here follows a 10M run's first 3M exactly"""
+    activation: str = "tanh"
+    """activation of the hidden layers: tanh (CleanRL) or relu"""
+    first_gain: float = float(np.sqrt(2))
+    """orthogonal-init gain of the first layer of the actor and the critic (CleanRL: sqrt 2). With many correlated
+    inputs, sqrt 2 starts tanh units saturated: 273 inputs gave a pre-activation std of 1.2, 16% of units past 0.95"""
     hold_bias: float = 3.0
     """initial logit of 'hold' over 'down' / 'up': exp(3) / (exp(3) + 2) = 91% hold, so ~4.5% per shift at the start"""
     episode_seconds: float = 30.0
@@ -104,21 +112,23 @@ class Args:
 class NormalizeObservation(gym.vector.VectorWrapper):
     # rlpilot: gymnasium's NormalizeObservation + TransformObservation(clip), for an env that resets in the same step
     # (gymnasium's refuse it, since they can't see info["final_obs"]): the final observations are normalized too.
-    def __init__(self, env, epsilon=1e-8):
+    # rlpilot: inputs marked `fixed` are already at a fixed scale (obs.FIXED) and pass through unchanged.
+    def __init__(self, env, epsilon=1e-8, fixed=None):
         super().__init__(env)
         self.obs_rms = gym.wrappers.utils.RunningMeanStd(
             shape=self.single_observation_space.shape
         )
         self.epsilon = epsilon
+        self.fixed = (
+            np.zeros(self.single_observation_space.shape, bool) if fixed is None else np.asarray(fixed, bool)
+        )
 
     def normalize(
         self, obs
     ):  # without updating the statistics: the final observations, and evaluation
-        return np.clip(
-            (obs - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + self.epsilon),
-            -10,
-            10,
-        ).astype(np.float32)
+        mean = np.where(self.fixed, 0.0, self.obs_rms.mean)
+        std = np.where(self.fixed, 1.0, np.sqrt(self.obs_rms.var + self.epsilon))
+        return np.clip((obs - mean) / std, -10, 10).astype(np.float32)
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -142,7 +152,7 @@ def make_env(
     )  # samples spread per metre of road
     env = RacingEnv(tracks, episode_seconds=args.episode_seconds, seed=args.seed)
     env = norm = NormalizeObservation(
-        env
+        env, fixed=observation.FIXED
     )  # kept to normalize the eval's observations the same way
     env = gym.wrappers.vector.NormalizeReward(env, gamma=args.gamma)
     env = gym.wrappers.vector.TransformReward(
@@ -163,22 +173,25 @@ class Agent(nn.Module):
     # rlpilot: a hybrid policy. Actions are [steer, pedal, shift]: a Gaussian over steer and pedal (as in CleanRL) and a
     # categorical over the shift (down / hold / up), from the same actor body. The log-probability of an action is the
     # sum of the two, and so is the entropy.
-    def __init__(self, envs, hidden=64, hold_bias=0.0):
+    def __init__(
+        self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2)
+    ):  # rlpilot: activation and first_gain are our arguments (see Args)
         super().__init__()
         n_obs = np.array(envs.single_observation_space.shape).prod()
+        act = {"tanh": nn.Tanh, "relu": nn.ReLU}[activation]
         self.critic = nn.Sequential(
-            layer_init(nn.Linear(n_obs, hidden)),
-            nn.Tanh(),
+            layer_init(nn.Linear(n_obs, hidden), std=first_gain),
+            act(),
             layer_init(nn.Linear(hidden, hidden)),
-            nn.Tanh(),
+            act(),
             layer_init(nn.Linear(hidden, 1), std=1.0),
         )
         self.actor_body = (
             nn.Sequential(  # rlpilot: was actor_mean, without its output layer
-                layer_init(nn.Linear(n_obs, hidden)),
-                nn.Tanh(),
+                layer_init(nn.Linear(n_obs, hidden), std=first_gain),
+                act(),
                 layer_init(nn.Linear(hidden, hidden)),
-                nn.Tanh(),
+                act(),
             )
         )
         self.actor_mean = layer_init(
@@ -293,6 +306,7 @@ def run_eval(
         "obs_mean": norm.obs_rms.mean,
         "obs_var": norm.obs_rms.var,
         "epsilon": norm.epsilon,
+        "obs_fixed": norm.fixed,  # rlpilot: inputs that skip the normalization
         "args": vars(args),
         "step": step,
         "metrics": metrics,
@@ -340,7 +354,7 @@ if __name__ == "__main__":
     # env setup
     envs, norm = make_env(args)  # rlpilot
 
-    agent = Agent(envs, args.hidden, args.hold_bias).to(
+    agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain).to(
         device
     )  # rlpilot: hidden width, hold bias
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -371,7 +385,9 @@ if __name__ == "__main__":
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            frac = 1.0 - (iteration - 1.0) / (
+                (args.anneal_timesteps or args.total_timesteps) // args.batch_size
+            )  # rlpilot: was / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
