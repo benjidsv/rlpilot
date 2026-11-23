@@ -63,8 +63,8 @@ cd rlpilot
 uv run python scripts/download_tracks.py --categories circuit road gprix
 uv run python scripts/setup_tracks.py
 uv run pytest
+uv run wandb login   # once; metrics go to W&B, project RLPilot
 uv run python scripts/train.py --exp-name first --total-timesteps 50000000
-tensorboard --logdir runs
 ```
 
 ## Repository

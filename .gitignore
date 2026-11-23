@@ -16,3 +16,4 @@ reports/
 .claude
 .pytest_cache/
 runs/
+wandb/

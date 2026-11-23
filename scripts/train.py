@@ -2,7 +2,7 @@
 # Every change is marked "rlpilot:". docs: https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 #
 #     python scripts/train.py --exp-name first --total-timesteps 50000000
-#     tensorboard --logdir runs
+#     metrics: Weights & Biases, project RLPilot (--no-track to skip it); eval results: runs/<run>/eval/*.csv
 import json
 import os
 import random
@@ -20,8 +20,8 @@ from torch.distributions.categorical import (
     Categorical,
 )  # rlpilot: the gear shift is a discrete choice
 from torch.distributions.normal import Normal
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm  # rlpilot
+import wandb
 
 from rlpilot import evaluate, obs as observation  # rlpilot
 from rlpilot.env import ENDS, RacingEnv  # rlpilot
@@ -39,7 +39,13 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    # rlpilot: removed wandb, video capture and the Hugging Face upload; the model is always saved (checkpoints/)
+    track: bool = True  # rlpilot: on by default (was False); off = no metrics logged (eval CSVs still written)
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "RLPilot"  # rlpilot: was "cleanRL"; the entity defaults to the logged-in account
+    """the wandb's project name"""
+    wandb_entity: str | None = None
+    """the entity (team) of wandb's project"""
+    # rlpilot: removed TensorBoard, video capture and the Hugging Face upload; the model is always saved (checkpoints/)
 
     # Algorithm specific arguments
     # rlpilot: no env_id; the env is RacingEnv on the training tracks of data/split-v2.json
@@ -253,63 +259,12 @@ class Agent(nn.Module):
         )
 
 
-# rlpilot: TensorBoard layout. The Scalars tab shows one metric per chart, in numbered sections (1_dashboard: the
-# numbers that say whether a run is better; 2_ppo: health; 3_eval: every tier of both splits; 4_driving: training
-# episodes; 5_perf), and compares runs well: one line per run. The Custom Scalars tab draws several metrics on one
-# chart (LAYOUT): best for reading one run, since each run multiplies the lines.
-DASHBOARD = {  # 1_dashboard/<name>: eval metric
-    "validation_nominal_survival": "validation/nominal/survival",
-    "train_nominal_survival": "train/nominal/survival",
-    "validation_pace": "validation/pace",
-    "validation_crashed_completion": "validation/crashed/completion",
-    "validation_disturbed_survival": "validation/disturbed/survival",
-}
-LAYOUT = {
-    "dashboard": {
-        "nominal survival, validation (90% band over tracks)": [
-            "Margin",
-            [
-                "3_eval/validation/nominal/survival",
-                "3_eval/validation/nominal/survival_lo",
-                "3_eval/validation/nominal/survival_hi",
-            ],
-        ],
-        "nominal survival, train vs validation": [
-            "Multiline",
-            [r"3_eval/(train|validation)/nominal/survival$"],
-        ],
-        "recovery, validation": [
-            "Multiline",
-            [r"3_eval/validation/(crashed/completion|disturbed/survival)$"],
-        ],
-    },
-    "eval by tier": {
-        f"{m}, {split}": ["Multiline", [rf"3_eval/{split}/[a-z]+/{m}$"]]
-        for split in ("validation", "train")
-        for m in ("survival", "completion", "clean")
-    },
-    "driving": {
-        "how episodes end": ["Multiline", [r"4_driving/end/"]],
-        "failed near start, by kind of start": [
-            "Multiline",
-            [r"4_driving/failed_near_start/"],
-        ],
-        "reward components": ["Multiline", [r"4_driving/reward_"]],
-        "losses of control per episode, by cause": [
-            "Multiline",
-            [r"4_driving/lost_"],
-        ],
-        "nominal scenarios that lost control, validation, by cause": [
-            "Multiline",
-            [r"3_eval/validation/nominal/lost_"],
-        ],
-    },
-    "ppo": {"action std": ["Multiline", [r"2_ppo/std_"]]},
-}
+# rlpilot: the metrics are logged to W&B in numbered sections: 2_ppo (health), 3_eval (every tier of both splits),
+# 4_driving (training episodes), 5_perf. The workspace's charts are laid out by scripts/wandb_workspace.py.
 
 
 def run_eval(
-    agent, norm, args, step, run_dir, writer, best, suite
+    agent, norm, args, step, run_dir, best, suite
 ):  # rlpilot: the scenario suite, validation + train
     torch.set_num_threads(
         1
@@ -323,11 +278,10 @@ def run_eval(
     rows = suite.run(policy)
     evaluate.write_results(rows, run_dir / "eval" / f"{step:010d}.csv")
     metrics = evaluate.summarize(rows)
-    for k, v in metrics.items():
-        writer.add_scalar(f"3_eval/{k}", v, step)
-    for name, k in DASHBOARD.items():
-        writer.add_scalar(f"1_dashboard/{name}", metrics[k], step)
-    writer.add_scalar("5_perf/eval_seconds", time.time() - t0, step)
+    wandb.log(
+        {f"3_eval/{k}": v for k, v in metrics.items()}
+        | {"5_perf/eval_seconds": time.time() - t0, "global_step": step}
+    )
     ckpt = {
         "agent": agent.state_dict(),
         "obs_mean": norm.obs_rms.mean,
@@ -363,13 +317,18 @@ if __name__ == "__main__":
     run_dir = Path("runs") / run_name  # rlpilot
     (run_dir / "checkpoints").mkdir(parents=True)  # rlpilot
     (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))  # rlpilot
-    writer = SummaryWriter(str(run_dir))
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-    writer.add_custom_scalars(LAYOUT)  # rlpilot
+    wandb.init(
+        project=args.wandb_project_name,
+        entity=args.wandb_entity,
+        config=vars(args),  # rlpilot: replaces the hyperparameters text
+        name=run_name,
+        group=args.exp_name,  # rlpilot: the seeds of one setup share a group (mean + band in the UI)
+        dir=str(run_dir),  # rlpilot: wandb's local files go in the run's folder
+        save_code=True,
+        mode=None if args.track else "disabled",  # rlpilot: disabled = wandb.log does nothing
+    )  # rlpilot: no sync_tensorboard (no TensorBoard), no monitor_gym (no videos)
+    for section in ("2_ppo", "3_eval", "4_driving", "5_perf"):  # rlpilot: plot against env steps
+        wandb.define_metric(f"{section}/*", step_metric="global_step")
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -422,6 +381,7 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         ended = []  # rlpilot: statistics of the episodes that ended during this rollout
+        logs = {}  # rlpilot: this iteration's metrics, one wandb.log at its end
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
@@ -482,29 +442,17 @@ if __name__ == "__main__":
                 "lost_far_off",
                 "damage",
             ):
-                writer.add_scalar(
-                    f"4_driving/{k}", np.mean([x[k] for x in ended]), global_step
-                )
+                logs[f"4_driving/{k}"] = np.mean([x[k] for x in ended])
             for code, name in enumerate(ENDS):
-                writer.add_scalar(
-                    f"4_driving/end/{name}",
-                    np.mean([x["end"] == code for x in ended]),
-                    global_step,
-                )
+                logs[f"4_driving/end/{name}"] = np.mean([x["end"] == code for x in ended])
             for code, name in enumerate(KINDS):
                 mine = [x for x in ended if x["kind"] == code]
                 if mine:
-                    writer.add_scalar(
-                        f"4_driving/failed_near_start/{name}",
-                        np.mean([x["failed_near_start"] for x in mine]),
-                        global_step,
+                    logs[f"4_driving/failed_near_start/{name}"] = np.mean(
+                        [x["failed_near_start"] for x in mine]
                     )
-        writer.add_scalar(
-            "2_ppo/std_steer", agent.actor_logstd[0, 0].exp().item(), global_step
-        )  # rlpilot
-        writer.add_scalar(
-            "2_ppo/std_pedal", agent.actor_logstd[0, 1].exp().item(), global_step
-        )  # rlpilot
+        logs["2_ppo/std_steer"] = agent.actor_logstd[0, 0].exp().item()  # rlpilot
+        logs["2_ppo/std_pedal"] = agent.actor_logstd[0, 1].exp().item()  # rlpilot
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -603,16 +551,14 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        # rlpilot: grouped under 2_ppo and 5_perf (see LAYOUT); old_approx_kl dropped
-        writer.add_scalar(
-            "2_ppo/learning_rate", optimizer.param_groups[0]["lr"], global_step
-        )
-        writer.add_scalar("2_ppo/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("2_ppo/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("2_ppo/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("2_ppo/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("2_ppo/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("2_ppo/explained_variance", explained_var, global_step)
+        # rlpilot: grouped under 2_ppo and 5_perf, logged to W&B; old_approx_kl dropped
+        logs["2_ppo/learning_rate"] = optimizer.param_groups[0]["lr"]
+        logs["2_ppo/value_loss"] = v_loss.item()
+        logs["2_ppo/policy_loss"] = pg_loss.item()
+        logs["2_ppo/entropy"] = entropy_loss.item()
+        logs["2_ppo/approx_kl"] = approx_kl.item()
+        logs["2_ppo/clipfrac"] = np.mean(clipfracs)
+        logs["2_ppo/explained_variance"] = explained_var
         bar.update(args.batch_size)  # rlpilot
         bar.set_postfix(
             sps=int(global_step / (time.time() - start_time)),
@@ -621,16 +567,15 @@ if __name__ == "__main__":
             best=f"{best:.3f}" if best >= 0 else "-",
             refresh=False,
         )
-        writer.add_scalar(
-            "5_perf/SPS", int(global_step / (time.time() - start_time)), global_step
-        )
+        logs["5_perf/SPS"] = int(global_step / (time.time() - start_time))
+        wandb.log(logs | {"global_step": global_step})  # rlpilot
 
         if (
             global_step >= next_eval or iteration == args.num_iterations
         ):  # rlpilot: evaluate and checkpoint
             bar.set_description("eval")  # rlpilot
             best = run_eval(
-                agent.cpu(), norm, args, global_step, run_dir, writer, best, suite
+                agent.cpu(), norm, args, global_step, run_dir, best, suite
             )
             bar.set_description("train")
             agent.to(device)
@@ -639,4 +584,4 @@ if __name__ == "__main__":
     bar.close()  # rlpilot
     envs.close()
     suite.close()  # rlpilot
-    writer.close()
+    wandb.finish()  # rlpilot: waits for the last uploads

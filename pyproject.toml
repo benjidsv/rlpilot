@@ -6,7 +6,13 @@ requires-python = ">=3.11"
 dependencies = ["numpy>=1.26", "gymnasium>=1.1"]
 
 [project.optional-dependencies]
-train = ["torch>=2.4", "tensorboard>=2.17", "tyro>=0.8", "tqdm>=4.66"]
+train = [
+    "torch>=2.4",
+    "tyro>=0.8",
+    "tqdm>=4.66",
+    "wandb>=0.31.2",
+    "wandb-workspaces>=0.4.13",
+]
 dev = ["pytest>=8"]
 
 [build-system]
