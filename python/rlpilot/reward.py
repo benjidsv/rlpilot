@@ -2,17 +2,17 @@
 
 Reward per step, split into components so each can be logged:
 - progress: PROGRESS per metre along the track (`metre_weight` reweights each metre: env.py's "bot_seconds" units pay
-  each metre by the time the bot took over it). With `best_only` (the default), only metres past the furthest point
-  reached this episode pay: reversing costs nothing, and driving back over metres already covered pays nothing. Without
-  it, progress is signed (driving backwards costs). Either way nothing is gained while all four wheels are off the road
-  (no shortcuts across the grass).
+  each metre by the time the bot took over it). By default progress is signed (driving backwards costs): the
+  2026-11-23 reward sweep kept the phase-1 reward. With `best_only`, only metres past the furthest point reached this
+  episode pay: reversing costs nothing, and driving back over metres already covered pays nothing. Either way nothing
+  is gained while all four wheels are off the road (no shortcuts across the grass).
 - damage:   -DAMAGE per point of damage taken.
-- control:  -lost_cost each time the car loses control, by any of LOST_CAUSES: a new contact (damage taken this step and
-  not the last), starting to face backwards, or going more than FAR_OFF beyond the road's edge. Charged once, when the
-  car enters the state, not for as long as it lasts: a long recovery mustn't cost more than giving up. A cause already
-  true at the launch (a crashed start facing backwards) isn't charged. These are the evaluation's tests: a scenario that
-  reached its distance but lost control is "recovered" (evaluate.py). `lost_causes` picks the causes charged; the
-  states are tracked (and reported) whatever it is.
+- control:  -lost_cost (default 0: off) each time the car loses control, by any of LOST_CAUSES: a new contact (damage
+  taken this step and not the last), starting to face backwards, or going more than FAR_OFF beyond the road's edge.
+  Charged once, when the car enters the state, not for as long as it lasts: a long recovery mustn't cost more than
+  giving up. A cause already true at the launch (a crashed start facing backwards) isn't charged. These are the
+  evaluation's tests: a scenario that reached its distance but lost control is "recovered" (evaluate.py).
+  `lost_causes` picks the causes charged; the states are tracked (and reported) whatever it is.
 - terminal: -terminal (default TERMINAL) when an episode fails.
 
 Termination (fails the episode): no new best distance along the track for NO_PROGRESS_SECONDS (a spin, a reverse out
@@ -30,7 +30,7 @@ from .client import F
 
 PROGRESS = 0.1
 DAMAGE = 0.001
-LOST_COST = 2.0         # per loss of control: 20 m of progress
+LOST_COST = 0.0         # per loss of control (off: 2 made the car give up, 1 was within the seed noise)
 TERMINAL = 10.0
 FAR_OFF = 3.0           # m beyond the road's edge that counts as having lost control
 NO_PROGRESS_SECONDS = 10.0
@@ -48,7 +48,7 @@ def lost_states(raw: np.ndarray, damage_taken: np.ndarray) -> np.ndarray:
 
 
 class Reward:
-    def __init__(self, n: int, step_seconds: float, lost_cost: float = LOST_COST, best_only: bool = True,
+    def __init__(self, n: int, step_seconds: float, lost_cost: float = LOST_COST, best_only: bool = False,
                  terminal: float = TERMINAL, lost_causes: tuple[str, ...] = LOST_CAUSES,
                  metre_weight: Callable[[np.ndarray], np.ndarray] | None = None):
         """metre_weight(raw) -> [n]: what each metre of progress is worth, relative to the others (None: 1)."""

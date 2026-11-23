@@ -26,7 +26,7 @@ def drive(r, states):
 
 
 def test_best_only_progress():
-    r = Reward(1, 0.04)
+    r = Reward(1, 0.04, best_only=True)
     r.reset(np.array([0]), state(100))
     # forward 10 m, back 5 m, forward 8 m (3 new), then 4 m fully off the road, then 2 m back on it
     path = [110, 105, 113, 117, 119]
@@ -36,7 +36,7 @@ def test_best_only_progress():
 
 
 def test_signed_progress_is_the_old_reward():
-    r = Reward(1, 0.04, lost_cost=0.0, best_only=False)
+    r = Reward(1, 0.04)  # the defaults: the phase-1 reward
     r.reset(np.array([0]), state(100))
     path, off = [110, 105, 113, 109, 117], [0, 0, 0, 4, 4]
     comps, _ = drive(r, [state(d, wheels_off=w) for d, w in zip(path, off)])
@@ -58,7 +58,7 @@ def test_losing_control_is_charged_once_per_entry():
 
 
 def test_a_launch_already_out_of_control_isnt_charged():
-    r = Reward(1, 0.04)
+    r = Reward(1, 0.04, lost_cost=2.0)
     r.reset(np.array([0]), state(0, angle=3.0, to_middle=9.0))  # a crashed start: backwards and far off
     comps, onsets = drive(r, [state(1, angle=3.0, to_middle=9.0), state(2, angle=0.0, to_middle=9.0),
                               state(3, angle=3.0, to_middle=0.0)])

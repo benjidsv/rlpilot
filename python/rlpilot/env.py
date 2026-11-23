@@ -43,7 +43,7 @@ class RacingEnv(VectorEnv):
                  start_fn: Callable[[np.ndarray], Starts] | None = None,
                  retry_fn: Callable[[np.ndarray, int], Starts] | None = None, seed: int = 0, frame_skip: int = 2,
                  spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False,
-                 lost_cost: float = LOST_COST, best_only_progress: bool = True, terminal: float = TERMINAL,
+                 lost_cost: float = LOST_COST, best_only_progress: bool = False, terminal: float = TERMINAL,
                  lost_causes: tuple[str, ...] = LOST_CAUSES, progress_units: str = "metres"):
         """tracks: one per worker. start_fn(env indices) -> their next Starts (default: random training starts).
         retry_fn(env indices, attempt) -> replacements for starts whose first observation wasn't finite (default: new

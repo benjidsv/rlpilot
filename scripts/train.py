@@ -97,11 +97,12 @@ class Args:
     """initial logit of 'hold' over 'down' / 'up': exp(3) / (exp(3) + 2) = 91% hold, so ~4.5% per shift at the start"""
     episode_seconds: float = 30.0
     """training episodes are cut (and bootstrapped) after this much sim time"""
-    lost_control_cost: float = 2.0
+    lost_control_cost: float = 0.0
     """reward lost each time the car loses control: a new contact, starting to face backwards, or going 3 m beyond the
-    road's edge (reward.py; 2 = 20 m of progress; 0 = the phase-1 reward)"""
-    best_only_progress: bool = True
-    """progress pays only past the furthest point reached this episode, so reversing costs nothing (False: signed)"""
+    road's edge (reward.py; 1 = 10 m of progress). Off by default: the reward sweep found 2 makes the car give up"""
+    best_only_progress: bool = False
+    """progress pays only past the furthest point reached this episode, so reversing costs nothing (default: signed,
+    the phase-1 reward)"""
     lost_control_causes: tuple[str, ...] = ("contact", "backwards", "far_off")
     """which ways of losing control --lost-control-cost charges (all are still tracked and evaluated)"""
     terminal: float = 10.0
