@@ -25,12 +25,14 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from . import obs as observation
 from .client import CMD_NONE, CMD_RESET, CMD_STEP, Client, F
 from .controls import HOLD, Controls
-from .reward import COMPONENTS, FAILURES, LOST_CAUSES, LOST_COST, Reward
+from .reward import COMPONENTS, FAILURES, LOST_CAUSES, LOST_COST, TERMINAL, Reward
 from .starts import K, Starts, draw, train_kinds, write_launch
 from .tracks import Track, TrackTable, race_for
 
 ENDS = FAILURES + ("time_limit", "distance")  # end codes of info["episode_end"]["end"]
 START_RETRIES = 4  # new draws for a start whose first observation isn't finite (rare launches); then the grid
+REF_SPEED = 40.0   # m/s: progress_units="bot_seconds" pays a metre at this bot speed like a metre (the bot averages
+                   # 39.3 m/s over the training road), so the costs keep their size against progress
 NEAR_START = 50.0  # m: an episode that fails without ever getting this far down the road led nowhere (start too hard?)
 
 
@@ -41,10 +43,13 @@ class RacingEnv(VectorEnv):
                  start_fn: Callable[[np.ndarray], Starts] | None = None,
                  retry_fn: Callable[[np.ndarray, int], Starts] | None = None, seed: int = 0, frame_skip: int = 2,
                  spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False,
-                 lost_cost: float = LOST_COST, best_only_progress: bool = True):
+                 lost_cost: float = LOST_COST, best_only_progress: bool = True, terminal: float = TERMINAL,
+                 lost_causes: tuple[str, ...] = LOST_CAUSES, progress_units: str = "metres"):
         """tracks: one per worker. start_fn(env indices) -> their next Starts (default: random training starts).
         retry_fn(env indices, attempt) -> replacements for starts whose first observation wasn't finite (default: new
-        random starts, then the grid). lost_cost, best_only_progress: see reward.py."""
+        random starts, then the grid). lost_cost, best_only_progress, terminal,
+        lost_causes: see reward.py. progress_units: "metres", or "bot_seconds": each metre pays REF_SPEED / the bot's speed
+        there, so a second at the bot's pace pays the same everywhere (and a metre at REF_SPEED as much as in metres)."""
         self.track_names = sorted(set(tracks))
         self.table = TrackTable([Track.load(t) for t in self.track_names])
         self.track = np.array([self.track_names.index(t) for t in tracks], np.int64)  # per env, index in track_names
@@ -70,7 +75,10 @@ class RacingEnv(VectorEnv):
         self._cmds = np.full(n, CMD_STEP, np.uint32)
         self._sim_failed = np.zeros(n, bool)
         self.controls = Controls(n)
-        self.reward = Reward(n, self.dt, lost_cost, best_only_progress)
+        if progress_units not in ("metres", "bot_seconds"):
+            raise ValueError(f"progress_units: metres or bot_seconds, not {progress_units!r}")
+        weight = self._bot_second_weight if progress_units == "bot_seconds" else None
+        self.reward = Reward(n, self.dt, lost_cost, best_only_progress, terminal, lost_causes, weight)
         self.starts = draw(np.zeros(n, np.int64), self.track, np.zeros(n), self.table, self._rng)  # current, per env
         self.start_retries = 0
         # per-episode accumulators
@@ -331,6 +339,10 @@ class RacingEnv(VectorEnv):
             self._start(idx)
             obs[idx] = self._observe()[idx]
         return obs, reward, terminated, truncated, info
+
+    def _bot_second_weight(self, raw: np.ndarray) -> np.ndarray:
+        v = self.table.at(self.track, raw[:, F["dist_from_start"]].astype(np.float64)[:, None], "bot_speed")[:, 0]
+        return REF_SPEED / np.maximum(v, 5.0)
 
     def _sim_error(self, idx: np.ndarray) -> None:
         """Envs idx came back from a step with a non-finite state (v1 saw a NaN position mid-episode, about once per

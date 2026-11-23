@@ -7,6 +7,10 @@ the other fails. Pass = survived (clean or survived) for every tier except crash
 failed). The p-value is an exact two-sided sign test on those discordant scenarios: how surprising the split would be
 if A and B were equally good. Scenarios aren't fully independent (neighbouring ones share a corner), so read it as a
 guide; --tracks shows whether a difference is spread out or comes from one track.
+
+It compares two *policies*, not two setups: two seeds of the same setup already differ (in the 3M reward sweep, p < 0.05
+in 11 of 42 same-setup pairs on validation, 18 of 42 on train). To say a change is better, run 3 seeds of each and read
+scripts/sweep_report.py, which measures the difference against the noise between seeds.
 """
 
 import argparse

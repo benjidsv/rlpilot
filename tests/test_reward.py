@@ -65,3 +65,15 @@ def test_a_launch_already_out_of_control_isnt_charged():
     assert (onsets[:, LOST_CAUSES.index("far_off")] == 0).all()
     assert list(onsets[:, LOST_CAUSES.index("backwards")]) == [False, False, True]  # turned round, then back again
     assert np.allclose(comps[:, C], [0, 0, -2.0])
+
+
+def test_charged_causes_terminal_and_metre_weight():
+    r = Reward(1, 0.04, lost_cost=2.0, lost_causes=("contact",), terminal=20.0, metre_weight=lambda raw: np.full(1, 0.5))
+    r.reset(np.array([0]), state(0))
+    comps, onsets = drive(r, [state(10, angle=3.0), state(20, damage=5, angle=3.0)])
+    assert onsets[0, LOST_CAUSES.index("backwards")] and comps[0, C] == 0  # tracked, not charged
+    assert comps[1, C] == -2.0
+    assert np.allclose(comps[:, P], [0.5, 0.5])  # 10 m at weight 0.5
+    r.since_best[:] = 100.0  # the no-progress rule
+    comps, _ = drive(r, [state(20, damage=5)])
+    assert comps[0, COMPONENTS.index("terminal")] == -20.0

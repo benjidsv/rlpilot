@@ -96,6 +96,13 @@ class Args:
     road's edge (reward.py; 2 = 20 m of progress; 0 = the phase-1 reward)"""
     best_only_progress: bool = True
     """progress pays only past the furthest point reached this episode, so reversing costs nothing (False: signed)"""
+    lost_control_causes: tuple[str, ...] = ("contact", "backwards", "far_off")
+    """which ways of losing control --lost-control-cost charges (all are still tracked and evaluated)"""
+    terminal: float = 10.0
+    """reward lost when a training episode fails (no progress for 10 s, wrecked). The eval's rules don't change"""
+    progress_units: str = "metres"
+    """metres (0.1 each) or bot_seconds (each metre pays 40 m/s / the bot's speed there: ~4 per second of the bot's
+    lap, the same on average, but a second weighs the same on a straight as in a hairpin)"""
     eval_every: int = 10_000_000
     """steps between two evaluations on the scenario suite (validation and training tracks)"""
     eval_workers: int = 48
@@ -161,6 +168,9 @@ def make_env(
         seed=args.seed,
         lost_cost=args.lost_control_cost,
         best_only_progress=args.best_only_progress,
+        terminal=args.terminal,
+        lost_causes=tuple(args.lost_control_causes),
+        progress_units=args.progress_units,
     )
     env = norm = NormalizeObservation(
         env, fixed=observation.FIXED

@@ -1,7 +1,8 @@
 """Reward and termination.
 
 Reward per step, split into components so each can be logged:
-- progress: PROGRESS per metre along the track. With `best_only` (the default), only metres past the furthest point
+- progress: PROGRESS per metre along the track (`metre_weight` reweights each metre: env.py's "bot_seconds" units pay
+  each metre by the time the bot took over it). With `best_only` (the default), only metres past the furthest point
   reached this episode pay: reversing costs nothing, and driving back over metres already covered pays nothing. Without
   it, progress is signed (driving backwards costs). Either way nothing is gained while all four wheels are off the road
   (no shortcuts across the grass).
@@ -10,8 +11,9 @@ Reward per step, split into components so each can be logged:
   not the last), starting to face backwards, or going more than FAR_OFF beyond the road's edge. Charged once, when the
   car enters the state, not for as long as it lasts: a long recovery mustn't cost more than giving up. A cause already
   true at the launch (a crashed start facing backwards) isn't charged. These are the evaluation's tests: a scenario that
-  reached its distance but lost control is "recovered" (evaluate.py).
-- terminal: -TERMINAL when an episode fails.
+  reached its distance but lost control is "recovered" (evaluate.py). `lost_causes` picks the causes charged; the
+  states are tracked (and reported) whatever it is.
+- terminal: -terminal (default TERMINAL) when an episode fails.
 
 Termination (fails the episode): no new best distance along the track for NO_PROGRESS_SECONDS (a spin, a reverse out
 of the grass or a three-point turn are all fine, as long as the car gets going again), damage over MAX_DAMAGE, or the
@@ -19,6 +21,8 @@ engine ending the race. The time limit is a truncation, not a failure: the agent
 """
 
 from __future__ import annotations
+
+from typing import Callable
 
 import numpy as np
 
@@ -44,9 +48,16 @@ def lost_states(raw: np.ndarray, damage_taken: np.ndarray) -> np.ndarray:
 
 
 class Reward:
-    def __init__(self, n: int, step_seconds: float, lost_cost: float = LOST_COST, best_only: bool = True):
+    def __init__(self, n: int, step_seconds: float, lost_cost: float = LOST_COST, best_only: bool = True,
+                 terminal: float = TERMINAL, lost_causes: tuple[str, ...] = LOST_CAUSES,
+                 metre_weight: Callable[[np.ndarray], np.ndarray] | None = None):
+        """metre_weight(raw) -> [n]: what each metre of progress is worth, relative to the others (None: 1)."""
         self.dt = step_seconds
-        self.lost_cost, self.best_only = lost_cost, best_only
+        self.lost_cost, self.best_only, self.terminal, self.metre_weight = lost_cost, best_only, terminal, metre_weight
+        unknown = set(lost_causes) - set(LOST_CAUSES)
+        if unknown:
+            raise ValueError(f"unknown causes of losing control: {sorted(unknown)} (known: {LOST_CAUSES})")
+        self.charged = np.array([c in lost_causes for c in LOST_CAUSES])[:, None]
         self.raced = np.zeros(n, np.float64)      # m along the track this episode, signed
         self.peak = np.zeros(n, np.float64)       # furthest `raced` so far (best_only progress pays past it)
         self.best = np.zeros(n, np.float64)       # best `raced` so far, in PROGRESS_STEP increments (the clock's)
@@ -98,8 +109,10 @@ class Reward:
 
         off = raw[:, F["wheels_off"]] >= 4
         paid = gained if self.best_only else progress
+        if self.metre_weight is not None:
+            paid = paid * self.metre_weight(raw)
         self.components[0] = PROGRESS * np.where(off & (paid > 0), 0.0, paid)
         self.components[1] = -DAMAGE * d_damage
-        self.components[2] = -self.lost_cost * self.onset.sum(axis=0)
-        self.components[3] = -TERMINAL * terminated
+        self.components[2] = -self.lost_cost * (self.onset & self.charged).sum(axis=0)
+        self.components[3] = -self.terminal * terminated
         return self.components.sum(axis=0), terminated, reason
