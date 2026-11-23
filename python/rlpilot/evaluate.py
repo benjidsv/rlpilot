@@ -10,6 +10,9 @@ Outcome of a scenario, best first:
 - survived:  reached it, went fully off the road at some point but kept control
 - recovered: reached it, but lost control on the way (hit something, faced backwards, or got far off the road)
 - failed:    didn't reach it (no progress for 10 s, wrecked, or out of time)
+Losing control uses the reward's tests (reward.LOST_CAUSES): `lost_first` is the first cause seen, `contact`,
+`backwards` and `far_off` count how often each was entered (a state the launch began in isn't counted), `damage` is in
+points.
 "survival" = clean or survived. Crashed starts begin out of control, so for them the useful number is "completion"
 (anything but failed).
 """
@@ -24,6 +27,7 @@ import numpy as np
 
 from .client import DATA, F
 from .env import ENDS, RacingEnv
+from .reward import LOST_CAUSES
 from .starts import KINDS, Starts
 from .tracks import Track
 
@@ -127,7 +131,10 @@ class Suite:
                                       "seconds": round(float(e["seconds"][i]), 2), "bot_seconds": sc["bot_time"],
                                       "pace": round(sc["bot_time"] / e["seconds"][i], 4) if reached else "",
                                       "end_s": round(float(np.mod(sc["s"] + e["distance"][i],
-                                                                  self.lengths[sc["track"]])), 1)}
+                                                                  self.lengths[sc["track"]])), 1),
+                                      "lost_first": LOST_CAUSES[e["lost_first"][i]] if e["lost_first"][i] >= 0 else "",
+                                      **{c: int(e[f"lost_{c}"][i]) for c in LOST_CAUSES},
+                                      "damage": round(float(e["damage"][i]), 1)}
         assert all(r is not None for r in results)
         return results
 
@@ -190,6 +197,9 @@ def summarize(rows: list[dict], n_boot: int = 2000) -> dict[str, float]:
             m[f"{split}/{tier}/completion"] = float(np.mean([r["outcome"] != "failed" for r in t]))
             m[f"{split}/{tier}/clean"] = float(np.mean([r["outcome"] == "clean" for r in t]))
         nom = [r for r in sp if r["tier"] == "nominal"]
+        for c in LOST_CAUSES:  # nominal scenarios that entered this loss-of-control state (absent from old CSVs)
+            if nom and c in nom[0]:
+                m[f"{split}/nominal/lost_{c}"] = float(np.mean([int(r[c]) > 0 for r in nom]))
         if not nom:
             continue
         paces = [float(r["pace"]) for r in nom if r["outcome"] in ("clean", "survived")]
@@ -202,6 +212,21 @@ def summarize(rows: list[dict], n_boot: int = 2000) -> dict[str, float]:
         boot = [np.mean(np.concatenate([groups[i] for i in rng.integers(0, len(groups), len(groups))])) for _ in range(n_boot)]
         m[f"{split}/nominal/survival_lo"], m[f"{split}/nominal/survival_hi"] = map(float, np.percentile(boot, [5, 95]))
     return m
+
+
+def lost_breakdown(rows: list[dict]) -> list[dict]:
+    """Per split and tier: recovered scenarios by the first cause of losing control, and the median damage of the
+    scenarios that hit something."""
+    out = []
+    for split in sorted({r["split"] for r in rows}):
+        for tier in sorted({r["tier"] for r in rows if r["split"] == split}, key=KINDS.index):
+            t = [r for r in rows if r["split"] == split and r["tier"] == tier]
+            rec = [r for r in t if r["outcome"] == "recovered"]
+            hit = [float(r["damage"]) for r in t if int(r["contact"]) > 0 or float(r["damage"]) > 0]
+            out.append({"split": split, "tier": tier, "scenarios": len(t), "recovered": len(rec),
+                        **{c: sum(r["lost_first"] == c for r in rec) for c in LOST_CAUSES},
+                        "with damage": len(hit), "median damage": float(np.median(hit)) if hit else float("nan")})
+    return out
 
 
 def per_track(rows: list[dict]) -> list[dict]:

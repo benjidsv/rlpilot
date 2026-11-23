@@ -31,6 +31,12 @@ def test_suite_is_reproducible():
         s.close()
     m = evaluate.summarize(a)
     assert 0 <= m["validation/nominal/survival"] <= 1 and "validation/crashed/completion" in m
+    assert "validation/nominal/lost_contact" in m
+    for r in a:  # a scenario that made it lost control exactly when a first cause was recorded
+        assert {"lost_first", "contact", "backwards", "far_off", "damage"} <= set(r)
+        if r["outcome"] != "failed":
+            assert (r["outcome"] == "recovered") == (r["lost_first"] != "")
+    assert sum(b["recovered"] for b in evaluate.lost_breakdown(a)) == sum(r["outcome"] == "recovered" for r in a)
 
 
 def test_sign_test():

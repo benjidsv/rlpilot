@@ -63,6 +63,13 @@ def main():
     print(f"\n  {'track':15s} {'split':10s} " + " ".join(f"{c:>9s}" for c in cols))
     for r in table:
         print(f"  {r['track']:15s} {r['split']:10s} " + " ".join(f"{r[c]:9.2f}" for c in cols))
+    lost = evaluate.lost_breakdown(rows)
+    cols = [c for c in lost[0] if c not in ("split", "tier")]
+    print("\n  recovered scenarios by the first way they lost control; damage over the scenarios that took any")
+    print(f"  {'split':10s} {'tier':10s} " + " ".join(f"{c:>13s}" for c in cols))
+    for r in lost:
+        print(f"  {r['split']:10s} {r['tier']:10s} " + " ".join(
+            f"{r[c]:13.0f}" if c == "median damage" else f"{r[c]:13d}" for c in cols))
     if a.grid_laps:
         tracks = [t for s in a.splits for t in load_split()[s]]
         print("\n  grid laps (2 laps from a standing start):")

@@ -91,6 +91,11 @@ class Args:
     """initial logit of 'hold' over 'down' / 'up': exp(3) / (exp(3) + 2) = 91% hold, so ~4.5% per shift at the start"""
     episode_seconds: float = 30.0
     """training episodes are cut (and bootstrapped) after this much sim time"""
+    lost_control_cost: float = 2.0
+    """reward lost each time the car loses control: a new contact, starting to face backwards, or going 3 m beyond the
+    road's edge (reward.py; 2 = 20 m of progress; 0 = the phase-1 reward)"""
+    best_only_progress: bool = True
+    """progress pays only past the furthest point reached this episode, so reversing costs nothing (False: signed)"""
     eval_every: int = 10_000_000
     """steps between two evaluations on the scenario suite (validation and training tracks)"""
     eval_workers: int = 48
@@ -150,7 +155,13 @@ def make_env(
     tracks = allocate(
         {t: Track.load(t).length for t in train}, args.num_envs
     )  # samples spread per metre of road
-    env = RacingEnv(tracks, episode_seconds=args.episode_seconds, seed=args.seed)
+    env = RacingEnv(
+        tracks,
+        episode_seconds=args.episode_seconds,
+        seed=args.seed,
+        lost_cost=args.lost_control_cost,
+        best_only_progress=args.best_only_progress,
+    )
     env = norm = NormalizeObservation(
         env, fixed=observation.FIXED
     )  # kept to normalize the eval's observations the same way
@@ -274,6 +285,14 @@ LAYOUT = {
             [r"4_driving/failed_near_start/"],
         ],
         "reward components": ["Multiline", [r"4_driving/reward_"]],
+        "losses of control per episode, by cause": [
+            "Multiline",
+            [r"4_driving/lost_"],
+        ],
+        "nominal scenarios that lost control, validation, by cause": [
+            "Multiline",
+            [r"3_eval/validation/nominal/lost_"],
+        ],
     },
     "ppo": {"action std": ["Multiline", [r"2_ppo/std_"]]},
 }
@@ -446,7 +465,12 @@ if __name__ == "__main__":
                 "mean_speed",
                 "reward_progress",
                 "reward_damage",
+                "reward_control",
                 "reward_terminal",
+                "lost_contact",
+                "lost_backwards",
+                "lost_far_off",
+                "damage",
             ):
                 writer.add_scalar(
                     f"4_driving/{k}", np.mean([x[k] for x in ended]), global_step

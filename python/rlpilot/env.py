@@ -25,13 +25,12 @@ from gymnasium.vector import AutoresetMode, VectorEnv
 from . import obs as observation
 from .client import CMD_NONE, CMD_RESET, CMD_STEP, Client, F
 from .controls import HOLD, Controls
-from .reward import COMPONENTS, FAILURES, Reward
+from .reward import COMPONENTS, FAILURES, LOST_CAUSES, LOST_COST, Reward
 from .starts import K, Starts, draw, train_kinds, write_launch
 from .tracks import Track, TrackTable, race_for
 
 ENDS = FAILURES + ("time_limit", "distance")  # end codes of info["episode_end"]["end"]
 START_RETRIES = 4  # new draws for a start whose first observation isn't finite (rare launches); then the grid
-FAR_OFF = 3.0      # m beyond the road's edge that counts as having lost control
 NEAR_START = 50.0  # m: an episode that fails without ever getting this far down the road led nowhere (start too hard?)
 
 
@@ -41,10 +40,11 @@ class RacingEnv(VectorEnv):
     def __init__(self, tracks: list[str], episode_seconds: float = 30.0, max_distance: float | None = None,
                  start_fn: Callable[[np.ndarray], Starts] | None = None,
                  retry_fn: Callable[[np.ndarray, int], Starts] | None = None, seed: int = 0, frame_skip: int = 2,
-                 spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False):
+                 spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False,
+                 lost_cost: float = LOST_COST, best_only_progress: bool = True):
         """tracks: one per worker. start_fn(env indices) -> their next Starts (default: random training starts).
         retry_fn(env indices, attempt) -> replacements for starts whose first observation wasn't finite (default: new
-        random starts, then the grid)."""
+        random starts, then the grid). lost_cost, best_only_progress: see reward.py."""
         self.track_names = sorted(set(tracks))
         self.table = TrackTable([Track.load(t) for t in self.track_names])
         self.track = np.array([self.track_names.index(t) for t in tracks], np.int64)  # per env, index in track_names
@@ -70,7 +70,7 @@ class RacingEnv(VectorEnv):
         self._cmds = np.full(n, CMD_STEP, np.uint32)
         self._sim_failed = np.zeros(n, bool)
         self.controls = Controls(n)
-        self.reward = Reward(n, self.dt)
+        self.reward = Reward(n, self.dt, lost_cost, best_only_progress)
         self.starts = draw(np.zeros(n, np.int64), self.track, np.zeros(n), self.table, self._rng)  # current, per env
         self.start_retries = 0
         # per-episode accumulators
@@ -83,6 +83,9 @@ class RacingEnv(VectorEnv):
         self._speed = np.zeros(n)
         self._ever_off = np.zeros(n, bool)     # all four wheels off the road at some point
         self._lost = np.zeros(n, bool)         # lost control at some point: hit something, faced backwards, far off
+        self._lost_first = np.full(n, -1)      # the first of LOST_CAUSES seen (-1 = none)
+        self._lost_count = np.zeros((len(LOST_CAUSES), n), np.int64)  # times each was entered (not at the launch)
+        self._damage = np.zeros(n)
         # overlap_starts: envs waiting for their launch, launched but not answered yet, forced steps left of their kick,
         # retries of their launch
         self._pending = np.zeros(n, bool)
@@ -156,6 +159,7 @@ class RacingEnv(VectorEnv):
         self._ret[idx] = self._len[idx] = self._comp[:, idx] = 0
         self._shifts[idx] = self._refused[idx] = self._off_steps[idx] = self._speed[idx] = 0
         self._ever_off[idx] = self._lost[idx] = False
+        self._lost_first[idx], self._lost_count[:, idx], self._damage[idx] = -1, 0, 0
 
     def _kick(self, envs: np.ndarray, starts: Starts) -> None:
         """Forced actions of disturbed starts, stepped inside the reset (no reward, no observation)."""
@@ -280,9 +284,8 @@ class RacingEnv(VectorEnv):
             terminated |= f
             reason[f] = FAILURES.index("sim_error")
             self._sim_failed[:] = False
-        hw = np.maximum(raw[:, F["track_width"]], 1.0) * 0.5
         off = raw[:, F["wheels_off"]] >= 4
-        lost = self.reward.damage_taken | (np.cos(raw[:, F["angle"]]) < 0) | (np.abs(raw[:, F["to_middle"]]) > hw + FAR_OFF)
+        lost = self.reward.lost.any(axis=0)  # the reward's tests (reward.lost_states), so both agree
         self._ret += reward * on
         self._len += on
         self._comp += self.reward.components * on
@@ -291,7 +294,11 @@ class RacingEnv(VectorEnv):
         self._off_steps += off & on
         self._speed += raw[:, F["speed_x"]] * on
         self._ever_off |= off & on
+        first = lost & on & (self._lost_first < 0)
+        self._lost_first[first] = self.reward.lost[:, first].argmax(axis=0)
         self._lost |= lost & on
+        self._lost_count += self.reward.onset
+        self._damage += self.reward.d_damage
 
         truncated = self._len >= self.max_steps
         if self.max_distance is not None:
@@ -314,7 +321,9 @@ class RacingEnv(VectorEnv):
             "shifts_per_min": at_end(self._shifts / (steps * self.dt / 60)), "refused_shifts": at_end(self._refused),
             "offroad_frac": at_end(self._off_steps / steps), "mean_speed": at_end(self._speed / steps),
             "ever_off": at_end(self._ever_off), "lost_control": at_end(self._lost),
-        } | {f"reward_{c}": at_end(self._comp[i]) for i, c in enumerate(COMPONENTS)}
+            "lost_first": np.where(done, self._lost_first, -1), "damage": at_end(self._damage),
+        } | {f"lost_{c}": at_end(self._lost_count[i]) for i, c in enumerate(LOST_CAUSES)} \
+          | {f"reward_{c}": at_end(self._comp[i]) for i, c in enumerate(COMPONENTS)}
         info = {"final_obs": obs.copy(), "_final_obs": done.copy(), "episode_end": stats, "_episode_end": done.copy()}
         if self.overlap_starts:
             self._pending[idx] = True  # launched during the next steps
