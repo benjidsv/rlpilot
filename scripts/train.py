@@ -110,6 +110,21 @@ class Args:
     progress_units: str = "metres"
     """metres (0.1 each) or bot_seconds (each metre pays 40 m/s / the bot's speed there: ~4 per second of the bot's
     lap, the same on average, but a second weighs the same on a straight as in a hairpin)"""
+    steer_noise_power: float = 0.0
+    """training's steering noise shrinks with speed: its std is multiplied by max(floor, min(1, (steer_noise_speed /
+    speed) ^ power)), 1 = halved when the speed doubles, 2 = quartered. 0 = off. The steering itself (its rate) doesn't change,
+    nor does the evaluation (it drives the mean)"""
+    steer_noise_speed: float = 20.0
+    """m/s: below this speed the steering noise is the policy's own std"""
+    steer_noise_floor: float = 0.1
+    """the steering std's multiplier never goes below this: at power 2 it reaches 0.1 at 63 m/s (the base runs' fastest
+    1% of validation driving is above 58 m/s). A std near 0 would also make PPO's ratio explode for tiny changes of
+    the mean"""
+    learned_std: bool = True
+    """the std of steer and pedal is an output of the actor (a linear head on its body, per state, within
+    [exp(LOGSTD_MIN), exp(LOGSTD_MAX)]) instead of one learned number for every state (CleanRL, --no-learned-std).
+    Starts at 1, like it. The steering round (3 seeds x 10M, docs/v2.md): it learns ~0.65 below 20 m/s and ~0.05
+    above 40, with better nominal driving than one std"""
     eval_every: int = 10_000_000
     """steps between two evaluations on the scenario suite (validation and training tracks)"""
     eval_workers: int = 48
@@ -197,13 +212,17 @@ def layer_init(layer, std=None, bias_const=0.0):
     return layer
 
 
+LOGSTD_MIN, LOGSTD_MAX = -3.5, 0.5  # rlpilot: a learned std stays in [0.03, 1.65]
+LOGSTD_BIAS = float(np.log(-LOGSTD_MIN / LOGSTD_MAX))  # rlpilot: sigmoid(bias) = 3.5 / 4, so the std starts at 1
+
+
 class Agent(nn.Module):
     # rlpilot: a hybrid policy. Actions are [steer, pedal, shift]: a Gaussian over steer and pedal (as in CleanRL) and a
     # categorical over the shift (down / hold / up), from the same actor body. The log-probability of an action is the
     # sum of the two, and so is the entropy.
     def __init__(
-        self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2)
-    ):  # rlpilot: activation and first_gain are our arguments (see Args)
+        self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2), learned_std=False
+    ):  # rlpilot: activation, first_gain and learned_std are our arguments (see Args)
         super().__init__()
         n_obs = np.array(envs.single_observation_space.shape).prod()
         act = {"tanh": nn.Tanh, "relu": nn.ReLU}[activation]
@@ -231,15 +250,26 @@ class Agent(nn.Module):
         )  # rlpilot: down, hold, up
         with torch.no_grad():
             self.shift_logits.bias[1] = hold_bias
+        self.learned_std = learned_std  # rlpilot: a per-state std (Args.learned_std), created last: off = as before
+        if learned_std:
+            self.logstd_head = layer_init(nn.Linear(hidden, 2), std=0.01, bias_const=LOGSTD_BIAS)
 
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None):
+    def get_action_and_value(self, x, action=None, steer_scale=None):
+        # rlpilot: steer_scale [n] multiplies the steering's std (steer_noise_scale); the update must pass the same
+        # scale the rollout sampled with, so it is stored with the actions
         h = self.actor_body(x)
         action_mean = self.actor_mean(h)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
+        if self.learned_std:  # rlpilot: squashed into [LOGSTD_MIN, LOGSTD_MAX], so no state's noise can vanish
+            action_logstd = LOGSTD_MIN + (LOGSTD_MAX - LOGSTD_MIN) * torch.sigmoid(self.logstd_head(h))
+        else:
+            action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
+        if steer_scale is not None:  # rlpilot
+            action_std = action_std * torch.stack([steer_scale, torch.ones_like(steer_scale)], 1)
+        self.last_mean, self.last_std = action_mean.detach(), action_std.detach()  # rlpilot: for the logs
         probs = Normal(action_mean, action_std)
         shift = Categorical(logits=self.shift_logits(h))
         if action is None:
@@ -258,6 +288,25 @@ class Agent(nn.Module):
             [self.actor_mean(h), self.shift_logits(h).argmax(1, keepdim=True).float()],
             1,
         )
+
+
+SPEED = observation.NAMES.index("speed_x / 50")  # rlpilot
+
+
+def car_speed(norm, x):
+    """rlpilot: x [n, obs] normalized observations -> [n] the car's forward speed in m/s, unsigned (read back from the
+    normalization: its statistics are the ones x was normalized with)"""
+    m, s = norm.obs_rms.mean[SPEED], np.sqrt(norm.obs_rms.var[SPEED] + norm.epsilon)
+    return (x[:, SPEED] * float(s) + float(m)).abs() * 50
+
+
+def steer_noise_scale(norm, x, args):
+    """rlpilot: x [n, obs] normalized observations -> [n] multiplier of the steering's std, from the car's speed"""
+    if args.steer_noise_power == 0:
+        return torch.ones(len(x), device=x.device)
+    speed = car_speed(norm, x)
+    scale = torch.clamp(args.steer_noise_speed / speed.clamp(min=1e-3), max=1.0) ** args.steer_noise_power
+    return scale.clamp(min=args.steer_noise_floor)
 
 
 # rlpilot: the metrics are logged to W&B in numbered sections: 2_ppo (health), 3_eval (every tier of both splits),
@@ -341,7 +390,7 @@ if __name__ == "__main__":
     # env setup
     envs, norm = make_env(args)  # rlpilot
 
-    agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain).to(
+    agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain, args.learned_std).to(
         device
     )  # rlpilot: hidden width, hold bias
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -357,6 +406,10 @@ if __name__ == "__main__":
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    steer_scales = torch.ones((args.num_steps, args.num_envs)).to(device)  # rlpilot: see steer_noise_scale
+    stds = torch.zeros((args.num_steps, args.num_envs, 2)).to(device)  # rlpilot: the std applied, for the logs
+    speeds = torch.zeros((args.num_steps, args.num_envs)).to(device)  # rlpilot: m/s, for the logs
+    means = torch.zeros((args.num_steps, args.num_envs, 2)).to(device)  # rlpilot: the Gaussian's mean, for the logs
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -390,8 +443,11 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                steer_scales[step] = steer_noise_scale(norm, next_obs, args)  # rlpilot
+                action, logprob, _, value = agent.get_action_and_value(next_obs, steer_scale=steer_scales[step])
                 values[step] = value.flatten()
+                stds[step], speeds[step] = agent.last_std, car_speed(norm, next_obs)  # rlpilot
+                means[step] = agent.last_mean  # rlpilot
             actions[step] = action
             logprobs[step] = logprob
 
@@ -452,8 +508,15 @@ if __name__ == "__main__":
                     logs[f"4_driving/failed_near_start/{name}"] = np.mean(
                         [x["failed_near_start"] for x in mine]
                     )
-        logs["2_ppo/std_steer"] = agent.actor_logstd[0, 0].exp().item()  # rlpilot
-        logs["2_ppo/std_pedal"] = agent.actor_logstd[0, 1].exp().item()  # rlpilot
+        # rlpilot: the policy's std (before any speed scaling; with --learned-std, its mean over the rollout), then the
+        # std applied (after it), overall, at low speed and at high speed
+        policy_std = (stds / torch.stack([steer_scales, torch.ones_like(steer_scales)], -1)).reshape(-1, 2).mean(0)
+        logs["2_ppo/std_steer"], logs["2_ppo/std_pedal"] = policy_std.tolist()
+        logs["2_ppo/std_steer_applied"] = stds[..., 0].mean().item()
+        for band, sel in (("slow", speeds < 20), ("fast", speeds > 40)):  # m/s
+            if sel.any():
+                logs[f"2_ppo/std_steer_{band}"] = stds[..., 0][sel].mean().item()
+                logs[f"2_ppo/std_pedal_{band}"] = stds[..., 1][sel].mean().item()
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -475,6 +538,17 @@ if __name__ == "__main__":
                 )
             returns = advantages + values
 
+            # rlpilot: the std's pressure, per speed band: the mean of A * (z^2 - 1), A the normalized advantage and z
+            # how far the sampled action strayed from the mean in stds. It's the policy gradient on log std (at ratio
+            # 1): > 0 the noise paid and PPO raises the std there, < 0 it cost and PPO lowers it, ~0 no signal
+            z = (actions[..., :2] - means) / stds
+            adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            pressure = adv[..., None] * (z**2 - 1)
+            for band, sel in (("slow", speeds < 20), ("fast", speeds > 40)):  # m/s
+                if sel.any():
+                    logs[f"2_ppo/std_pressure_steer_{band}"] = pressure[..., 0][sel].mean().item()
+                    logs[f"2_ppo/std_pressure_pedal_{band}"] = pressure[..., 1][sel].mean().item()
+
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
@@ -482,6 +556,7 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
+        b_steer_scales = steer_scales.reshape(-1)  # rlpilot
 
         # Optimizing the policy and value network
         torch.set_num_threads(args.update_threads)  # rlpilot
@@ -494,8 +569,8 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
-                )
+                    b_obs[mb_inds], b_actions[mb_inds], steer_scale=b_steer_scales[mb_inds]
+                )  # rlpilot: the steering noise's scale the actions were sampled with
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 

@@ -1,4 +1,4 @@
-"""The reward sweep: tests of reward variants, 3 seeds each (the default for any comparison: one run's result moves by
+"""The sweep: tests of training variants (the reward, then the steering noise), 3 seeds each (the default for any comparison: one run's result moves by
 ~0.055 in validation nominal survival from seed to seed), one after the other on this machine. 3M-step runs follow a
 10M learning-rate schedule; --steps 10000000 runs a full 10M schedule with an eval every 2M. Seed-major: every variant's seed 1, then every seed 2, ..., so a sweep stopped early still
 covers every variant. Resumable: a run whose final eval CSV exists is skipped, so rerunning the command continues.
@@ -26,8 +26,12 @@ LONG_EVAL_EVERY = 2_000_000            # runs longer than STEPS are evaluated th
 SEEDS = (1, 2, 3)
 
 # The phase-1 reward: 0.1 per metre (signed), damage 0.001 per point, -10 on failure, no control cost, gamma 0.995.
+# Training's steering noise doesn't depend on the speed, and the std is one number for every state (--no-learned-std,
+# while train.py now learns it per state): the setup these sweeps' "base" runs were made with.
 BASE = {"lost-control-cost": 0.0, "best-only-progress": False, "terminal": 10.0, "gamma": 0.995,
-        "progress-units": "metres", "lost-control-causes": ("contact", "backwards", "far_off")}
+        "progress-units": "metres", "lost-control-causes": ("contact", "backwards", "far_off"),
+        "steer-noise-power": 0.0, "steer-noise-speed": 20.0, "steer-noise-floor": 0.1,
+        "learned-std": False}
 
 VARIANTS = {
     # the reference, and the noise between seeds
@@ -53,6 +57,16 @@ VARIANTS = {
     "botsec-cost1": {"progress-units": "bot_seconds", "lost-control-cost": 1.0},
     # the sweep's lead (botsec-cost1) with best-only progress, which raised crashed completion on its own
     "botsec-best-cost1": {"progress-units": "bot_seconds", "best-only-progress": True, "lost-control-cost": 1.0},
+    # steering noise that shrinks with speed above 20 m/s (std x 20 / v, or x (20 / v)^2, never below x 0.1): is the noise at speed what
+    # holds the steering back? The steering's rate is unchanged
+    "steernoise-v1": {"steer-noise-power": 1.0},
+    "steernoise-v2": {"steer-noise-power": 2.0},
+    # the std of steer and pedal learned per state (an output of the actor), no speed scaling: can it keep v1's crashed
+    # recovery without v2's loss in nominal driving?
+    "learnedstd": {"learned-std": True},
+    # the learned std with progress in the bot's seconds: more reward pressure where the car is slow, where the learned
+    # std stays high (no pressure on it there)
+    "learnedstd-botsec": {"learned-std": True, "progress-units": "bot_seconds"},
 }
 
 

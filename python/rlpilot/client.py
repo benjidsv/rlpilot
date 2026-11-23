@@ -160,7 +160,9 @@ class Client:
 
     def _spawn(self, i: int) -> subprocess.Popen:
         args = [str(WORKER_BIN), "-lc", f"{self.dirs[i]}/", "-s", self.races[i], "-m", self.name.decode(),
-                "-w", str(i), "-tl", "1", "-nr"]  # -nr: no srand(time), the engine is deterministic
+                "-w", str(i), "-tl", os.environ.get("RLP_WORKER_TRACELEVEL", "1"), "-nr"]
+        # -nr: no srand(time), the engine is deterministic. -tl: the engine's log level, 1 = errors only; 3 shows its
+        # info messages (race states, eliminations), for debugging a worker (they land in the WorkerError's tail)
         with open(self.dirs[i] / "worker.log", "wb") as log:
             return subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
 
@@ -231,6 +233,8 @@ class Client:
         if 0 <= i < len(self.dirs):
             log = (self.dirs[i] / "worker.log").read_text(errors="replace").splitlines()
             tail = "\n".join(l for l in log if "Error" in l)[-2000:] or "\n".join(log[-10:])
+            if os.environ.get("RLP_WORKER_TRACELEVEL", "1") != "1":  # debugging: what the engine said last
+                tail += "\n-- last lines --\n" + "\n".join(log[-40:])
         raise WorkerError(f"{what} failed: {_ERRORS.get(rc, rc)} (worker {i}, {self.races[i] if 0 <= i < self.n_workers else '?'})\n{tail}")
 
     def close(self):
