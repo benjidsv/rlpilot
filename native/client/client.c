@@ -81,29 +81,35 @@ RLP_API int rlp_wait_ready(rlp_header *h, uint32_t timeout_ms, int32_t *bad)
     return RLP_OK;
 }
 
-/* Send cmds[w] (RLP_CMD_NONE = leave that worker alone) to every worker, then wait for all answers.
- * Actions must already be written to the act array. */
-RLP_API int rlp_exchange(rlp_header *h, const uint32_t *cmds, uint32_t timeout_ms, int32_t *bad)
+/* Send one command per worker (RLP_CMD_NONE skips it) without waiting for the answers: rlp_wait collects them, and
+ * rlp_answered polls one worker. A worker must have answered its last command before it is sent another. */
+RLP_API void rlp_send(rlp_header *h, const uint32_t *cmds)
 {
-    uint32_t want[256];
     uint32_t n = h->n_workers < 256 ? h->n_workers : 256;
     for (uint32_t i = 0; i < n; i++) {
         if (cmds[i] == RLP_CMD_NONE)
             continue;
         rlp_worker *w = rlp_worker_at(h, i);
         w->cmd = cmds[i];
-        want[i] = w->cmd_sync.seq + 1;
-        rlp_signal(&w->cmd_sync, want[i]);
+        rlp_signal(&w->cmd_sync, w->cmd_sync.seq + 1);
     }
+}
+
+/* Wait for the answers of the workers sent a command (cmds[i] != RLP_CMD_NONE). Returns RLP_OK, or the error code
+ * with *bad set to the failing worker index. */
+RLP_API int rlp_wait(rlp_header *h, const uint32_t *cmds, uint32_t timeout_ms, int32_t *bad)
+{
+    uint32_t n = h->n_workers < 256 ? h->n_workers : 256;
     for (uint32_t i = 0; i < n; i++) {
         if (cmds[i] == RLP_CMD_NONE)
             continue;
         rlp_worker *w = rlp_worker_at(h, i);
+        uint32_t want = w->cmd_sync.seq; // only this process writes it
         uint64_t deadline = rlp_now_ns() + (uint64_t)timeout_ms * 1000000;
         uint32_t v;
-        while ((v = rlp_load(&w->done_sync.seq)) != want[i]) {
+        while ((v = rlp_load(&w->done_sync.seq)) != want) {
             rlp_wait_change(&w->done_sync, v, h->spin_us ? 1000 : 0, 200);
-            if (rlp_load(&w->done_sync.seq) == want[i])
+            if (rlp_load(&w->done_sync.seq) == want)
                 break;
             if (!worker_alive(w) || rlp_now_ns() > deadline) {
                 if (bad)
@@ -118,4 +124,21 @@ RLP_API int rlp_exchange(rlp_header *h, const uint32_t *cmds, uint32_t timeout_m
         }
     }
     return RLP_OK;
+}
+
+/* Without blocking: 1 if worker i has answered its last command (its observation is then readable), 0 if not yet,
+ * or RLP_ERR_WORKER if it died or reported an error. */
+RLP_API int rlp_answered(rlp_header *h, uint32_t i)
+{
+    rlp_worker *w = rlp_worker_at(h, i);
+    if (rlp_load(&w->done_sync.seq) == w->cmd_sync.seq)
+        return rlp_load(&w->status) == RLP_ST_READY ? 1 : RLP_ERR_WORKER;
+    return worker_alive(w) ? 0 : RLP_ERR_WORKER;
+}
+
+/* Send and wait: one synchronous step of every commanded worker. Actions must already be in the act array. */
+RLP_API int rlp_exchange(rlp_header *h, const uint32_t *cmds, uint32_t timeout_ms, int32_t *bad)
+{
+    rlp_send(h, cmds);
+    return rlp_wait(h, cmds, timeout_ms, bad);
 }

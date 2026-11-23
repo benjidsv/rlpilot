@@ -22,6 +22,13 @@ def test_suite_is_reproducible():
     b = evaluate.run_suite(scripted, suite, n_workers=6)
     assert a == b
     assert [r["id"] for r in a] == [r["id"] for r in suite]
+    # the layout doesn't matter: every scenario is a fresh race, its launch overlapped with the others' steps or not
+    assert evaluate.run_suite(scripted, suite, n_workers=2) == a
+    s = evaluate.Suite(suite, n_workers=6)  # nor do earlier runs on the same workers (train.py keeps them up)
+    try:
+        assert s.run(scripted) == a and s.run(scripted) == a
+    finally:
+        s.close()
     m = evaluate.summarize(a)
     assert 0 <= m["validation/nominal/survival"] <= 1 and "validation/crashed/completion" in m
 

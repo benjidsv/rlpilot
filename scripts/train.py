@@ -94,7 +94,7 @@ class Args:
     eval_every: int = 10_000_000
     """steps between two evaluations on the scenario suite (validation and training tracks)"""
     eval_workers: int = 48
-    """workers of the eval env; part of the suite's fixed layout, so keep it the same between runs"""
+    """workers of the eval env (results don't depend on it; 48 is the fastest on the Mac's 8 cores)"""
     rollout_threads: int = 1
     """torch threads while collecting rollouts (small batches: more threads only add overhead)"""
     update_threads: int = 4
@@ -280,7 +280,7 @@ LAYOUT = {
 
 
 def run_eval(
-    agent, norm, args, step, run_dir, writer, best
+    agent, norm, args, step, run_dir, writer, best, suite
 ):  # rlpilot: the scenario suite, validation + train
     torch.set_num_threads(
         1
@@ -291,9 +291,7 @@ def run_eval(
             return agent.act_deterministic(torch.as_tensor(norm.normalize(o))).numpy()
 
     t0 = time.time()
-    rows = evaluate.run_suite(
-        policy, evaluate.load_suite(("validation", "train")), args.eval_workers
-    )
+    rows = suite.run(policy)
     evaluate.write_results(rows, run_dir / "eval" / f"{step:010d}.csv")
     metrics = evaluate.summarize(rows)
     for k, v in metrics.items():
@@ -379,6 +377,9 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     torch.set_num_threads(args.rollout_threads)  # rlpilot
     next_eval, best = args.eval_every, -1.0  # rlpilot
+    suite = evaluate.Suite(
+        evaluate.load_suite(("validation", "train")), args.eval_workers
+    )  # rlpilot: the eval's workers, up for the whole run (starting them takes ~12 s)
     bar = tqdm(total=args.num_iterations * args.batch_size, unit="step", unit_scale=True, desc="train",
                dynamic_ncols=True, smoothing=0.05)  # rlpilot: replaces the SPS print
 
@@ -594,11 +595,14 @@ if __name__ == "__main__":
             global_step >= next_eval or iteration == args.num_iterations
         ):  # rlpilot: evaluate and checkpoint
             bar.set_description("eval")  # rlpilot
-            best = run_eval(agent.cpu(), norm, args, global_step, run_dir, writer, best)
+            best = run_eval(
+                agent.cpu(), norm, args, global_step, run_dir, writer, best, suite
+            )
             bar.set_description("train")
             agent.to(device)
             next_eval += args.eval_every
 
     bar.close()  # rlpilot
     envs.close()
+    suite.close()  # rlpilot
     writer.close()

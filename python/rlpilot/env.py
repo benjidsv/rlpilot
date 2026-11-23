@@ -8,6 +8,10 @@
   statistics are in info["episode_end"] (arrays [n], valid where info["_episode_end"]).
 - Ends: a failure (reward.FAILURES) terminates; the time limit, or `max_distance` along the track (eval scenarios),
   truncates.
+- `overlap_starts` (evaluation): an env whose episode ended launches its next one while the others keep driving. Its
+  reset is sent without waiting for the answer (a race restart takes ~8 ms, several steps of the others), and its
+  kick steps run in the others' exchanges. Otherwise every reset holds up every worker. Not gymnasium's autoreset:
+  until `driving` is true again, the env's returned observation, reward and action are meaningless.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ class RacingEnv(VectorEnv):
     def __init__(self, tracks: list[str], episode_seconds: float = 30.0, max_distance: float | None = None,
                  start_fn: Callable[[np.ndarray], Starts] | None = None,
                  retry_fn: Callable[[np.ndarray, int], Starts] | None = None, seed: int = 0, frame_skip: int = 2,
-                 spin_us: int = 50, recycle_resets: int = 2000, run_dir=None):
+                 spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False):
         """tracks: one per worker. start_fn(env indices) -> their next Starts (default: random training starts).
         retry_fn(env indices, attempt) -> replacements for starts whose first observation wasn't finite (default: new
         random starts, then the grid)."""
@@ -49,6 +53,7 @@ class RacingEnv(VectorEnv):
         self.max_steps = int(round(episode_seconds / self.dt))
         self.max_distance = max_distance
         self.recycle_resets = recycle_resets
+        self.overlap_starts = overlap_starts
         self.start_fn = start_fn or self._random_starts
         self.retry_fn = retry_fn or self._random_retry
         self._rng = np.random.default_rng(seed)
@@ -78,6 +83,25 @@ class RacingEnv(VectorEnv):
         self._speed = np.zeros(n)
         self._ever_off = np.zeros(n, bool)     # all four wheels off the road at some point
         self._lost = np.zeros(n, bool)         # lost control at some point: hit something, faced backwards, far off
+        # overlap_starts: envs waiting for their launch, launched but not answered yet, forced steps left of their kick,
+        # retries of their launch
+        self._pending = np.zeros(n, bool)
+        self._in_flight = np.zeros(n, bool)
+        self._kick_left = np.zeros(n, np.int64)
+        self._attempt = np.zeros(n, np.int64)
+        self._next = self.starts[np.arange(n)]  # the start each pending env launches next (valid where _queued)
+        self._queued = np.zeros(n, bool)
+
+    @property
+    def driving(self) -> np.ndarray:
+        """[n] bool: envs in an episode, driven by the actions (overlap_starts: false while an env is launching)."""
+        return ~self._pending & ~self._in_flight & (self._kick_left == 0)
+
+    def _settle(self) -> None:
+        """Wait for the launches still in flight (before anything synchronous: a reset, closing)."""
+        if self._in_flight.any():
+            self.client.wait(np.where(self._in_flight, CMD_RESET, CMD_NONE).astype(np.uint32))
+            self._overlap_landed(np.flatnonzero(self._in_flight), np.zeros(0, np.int64))
 
     # ---- starts ----
 
@@ -123,6 +147,10 @@ class RacingEnv(VectorEnv):
                 getattr(starts, f)[todo] = v
         for f, v in starts.to_columns().items():
             getattr(self.starts, f)[idx] = v
+        self._begin(idx)
+
+    def _begin(self, idx: np.ndarray) -> None:
+        """Envs idx are launched (and kicked): their episode starts at the current state."""
         self.reward.reset(idx, self._raw)
         self._last_raw[idx] = self._raw[idx]
         self._ret[idx] = self._len[idx] = self._comp[:, idx] = 0
@@ -141,10 +169,84 @@ class RacingEnv(VectorEnv):
             self.controls.apply(action, self._raw, self._act, active=on)
             self.client.exchange(np.where(on, CMD_STEP, CMD_NONE).astype(np.uint32))
 
+    def _overlap_launch(self, on: np.ndarray, cmds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """overlap_starts, before the exchange: pending envs get their launch and a RESET, sent right away (answered
+        later), kicking envs their forced action and a STEP in `cmds`. Returns (landed, kicked) env indices: the
+        launches answered since the last step, and the envs kicked in this one."""
+        n = self.num_envs
+        kicked = np.flatnonzero(on & (self._kick_left > 0))
+        if len(kicked):
+            action = np.zeros((n, 3), np.float32)
+            action[:, 0], action[:, 1], action[:, 2] = self.starts.kick_steer, self.starts.kick_pedal, HOLD
+            k = np.zeros(n, bool)
+            k[kicked] = True
+            self.controls.apply(action, self._raw, self._act, active=k)
+            cmds[kicked] = CMD_STEP
+        launched = np.flatnonzero(on & self._pending)
+        if len(launched):
+            fresh = launched[~self._queued[launched]]  # retries already have their start
+            if len(fresh):
+                for f, v in self.start_fn(fresh).to_columns().items():
+                    getattr(self._next, f)[fresh] = v
+            self._queued[launched] = False
+            starts = self._next[launched]
+            for f, v in starts.to_columns().items():
+                getattr(self.starts, f)[launched] = v
+            launch = self._act[launched].copy()
+            write_launch(starts, self.track[launched], self.table, launch)
+            self._act[launched] = launch
+            self._pending[launched] = False
+            due = launched[self.client.resets_since_spawn[launched] >= self.recycle_resets]
+            for i in due:
+                self.client.respawn(int(i))  # rare: blocks, and comes back launched
+            send = np.setdiff1d(launched, due)
+            reset = np.full(self.num_envs, CMD_NONE, np.uint32)
+            reset[send] = CMD_RESET
+            self.client.send(reset)
+            self._in_flight[send] = True
+            landed = due
+        else:
+            landed = np.zeros(0, np.int64)
+        return landed, kicked
+
+    def _overlap_landed(self, launched: np.ndarray, kicked: np.ndarray) -> None:
+        """overlap_starts, after the exchange: launches answered by now land and start their kick, and envs done
+        launching begin their episode, or retry if their state isn't finite (as in _start)."""
+        fl = np.flatnonzero(self._in_flight)
+        if len(fl):
+            done = fl[np.array([self.client.answered(int(i)) for i in fl], bool)]
+            self._in_flight[done] = False
+            launched = np.union1d(launched, done)
+        if len(launched):
+            self.controls.reset(launched, self._raw)
+            self._kick_left[launched] = self.starts.kick_steps[launched]
+        self._kick_left[kicked] -= 1
+        ready = np.concatenate([launched, kicked])
+        ready = ready[self._kick_left[ready] == 0]
+        if not len(ready):
+            return
+        bad = ~np.isfinite(self._raw[ready]).all(axis=1)
+        if bad.any():
+            b = ready[bad]
+            if (self._attempt[b] >= START_RETRIES).any():
+                raise RuntimeError(f"non-finite first observations after {START_RETRIES} retries: envs {b.tolist()}")
+            self.start_retries += len(b)
+            for a in np.unique(self._attempt[b]):  # retry_fn takes one attempt number per call
+                envs = b[self._attempt[b] == a]
+                for f, v in self.retry_fn(envs, int(a)).to_columns().items():
+                    getattr(self._next, f)[envs] = v
+            self._attempt[b] += 1
+            self._pending[b] = self._queued[b] = True  # relaunched at the next step
+        good = ready[~bad]
+        self._attempt[good] = 0
+        self._begin(good)
+
     # ---- gymnasium API ----
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+        self._settle()
+        self._pending[:], self._kick_left[:] = False, 0
         if seed is not None:
             self._rng = np.random.default_rng(seed)
         self._start(np.arange(self.num_envs))
@@ -157,9 +259,15 @@ class RacingEnv(VectorEnv):
         """actions [n, 3]. active [n] bool (default all): envs left out aren't simulated and can't end; their returned
         observation and reward are meaningless (evaluation pauses envs that have run out of scenarios)."""
         n = self.num_envs
-        on = np.ones(n, bool) if active is None else np.asarray(active, bool)
+        asked = np.ones(n, bool) if active is None else np.asarray(active, bool)
+        on = asked & self.driving  # simulated and driven by the actions
+        cmds = np.where(on, CMD_STEP, CMD_NONE).astype(np.uint32)
+        if self.overlap_starts:  # first: the kick's controls.apply would overwrite this step's shift flags
+            landed, kicked = self._overlap_launch(asked & ~on, cmds)
         self.controls.apply(np.asarray(actions, np.float32).reshape(n, 3), self._raw, self._act, on)
-        self.client.exchange(np.where(on, CMD_STEP, CMD_NONE).astype(np.uint32))
+        self.client.exchange(cmds)
+        if self.overlap_starts:
+            self._overlap_landed(landed, kicked)
         bad = ~np.isfinite(self._raw).all(axis=1) & on
         if bad.any():
             self._sim_error(np.flatnonzero(bad))
@@ -208,8 +316,11 @@ class RacingEnv(VectorEnv):
             "ever_off": at_end(self._ever_off), "lost_control": at_end(self._lost),
         } | {f"reward_{c}": at_end(self._comp[i]) for i, c in enumerate(COMPONENTS)}
         info = {"final_obs": obs.copy(), "_final_obs": done.copy(), "episode_end": stats, "_episode_end": done.copy()}
-        self._start(idx)
-        obs[idx] = self._observe()[idx]
+        if self.overlap_starts:
+            self._pending[idx] = True  # launched during the next steps
+        else:
+            self._start(idx)
+            obs[idx] = self._observe()[idx]
         return obs, reward, terminated, truncated, info
 
     def _sim_error(self, idx: np.ndarray) -> None:
@@ -223,4 +334,5 @@ class RacingEnv(VectorEnv):
         self.client.resets_since_spawn[idx] = self.recycle_resets  # respawn at the coming start
 
     def close_extras(self, **kwargs):
+        self._settle()
         self.client.close()

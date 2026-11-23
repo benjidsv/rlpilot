@@ -109,6 +109,9 @@ def _load_lib() -> C.CDLL:
     lib.rlp_destroy.argtypes = [C.c_void_p, C.c_char_p]
     lib.rlp_wait_ready.argtypes = [C.c_void_p, C.c_uint32, C.POINTER(C.c_int32)]
     lib.rlp_exchange.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.POINTER(C.c_int32)]
+    lib.rlp_send.argtypes = [C.c_void_p, C.c_void_p]
+    lib.rlp_wait.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.POINTER(C.c_int32)]
+    lib.rlp_answered.argtypes = [C.c_void_p, C.c_uint32]
     return lib
 
 
@@ -193,6 +196,28 @@ class Client:
         rc = self.lib.rlp_exchange(self._ptr, self._cmds.ctypes.data, self.timeout_ms, C.byref(self._bad))
         if rc:
             self._raise(rc, "exchange")
+
+    def send(self, cmds: np.ndarray) -> None:
+        """Send commands (CMD_NONE skips a worker) without waiting: `answered` polls each worker, `wait` collects
+        them. A worker must have answered before it gets another command (exchange, send or close)."""
+        cmds = np.ascontiguousarray(cmds, np.uint32)
+        self.resets_since_spawn += cmds == CMD_RESET
+        self.lib.rlp_send(self._ptr, cmds.ctypes.data)
+
+    def wait(self, cmds: np.ndarray) -> None:
+        """Wait for the answers of the workers `send` gave cmds (not CMD_NONE)."""
+        cmds = np.ascontiguousarray(cmds, np.uint32)
+        rc = self.lib.rlp_wait(self._ptr, cmds.ctypes.data, self.timeout_ms, C.byref(self._bad))
+        if rc:
+            self._raise(rc, "wait")
+
+    def answered(self, i: int) -> bool:
+        """Whether worker i has answered its last command, without blocking (raises if it died)."""
+        rc = self.lib.rlp_answered(self._ptr, i)
+        if rc < 0:
+            self._bad.value = i
+            self._raise(rc, "answer")
+        return rc == 1
 
     def stats(self) -> dict[str, float]:
         w = self.workers

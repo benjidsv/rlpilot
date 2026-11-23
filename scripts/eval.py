@@ -46,7 +46,7 @@ def main():
     p.add_argument("checkpoint", type=Path)
     p.add_argument("--splits", nargs="+", default=["validation"], choices=["train", "validation", "test"])
     p.add_argument("--test", action="store_true", help="required to touch the test split (once, at the very end)")
-    p.add_argument("--workers", type=int, default=48, help="keep the training eval's value to reproduce its results")
+    p.add_argument("--workers", type=int, default=48, help="results don't depend on it")
     p.add_argument("--grid-laps", action="store_true", help="also drive 2 laps from the grid on each track of the splits")
     a = p.parse_args()
     if "test" in a.splits and not a.test:

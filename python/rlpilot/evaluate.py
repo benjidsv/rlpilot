@@ -1,8 +1,9 @@
 """Evaluation on the fixed scenario suite (data/suite-v2.csv, see scripts/make_suite.py), and grid laps.
 
 A scenario is a start (track, place, tier, offsets, kick) and a task: drive SCENARIO_DISTANCE along the track. Every
-checkpoint of every run plays exactly the same list, with the same batch layout, so results are reproducible and two
-runs can be compared scenario by scenario (scripts/compare.py).
+checkpoint of every run plays exactly the same list, so results are reproducible and two runs can be compared scenario
+by scenario (scripts/compare.py). Each scenario is a fresh race, so its result doesn't depend on the worker layout
+(checked: 48 and 64 workers give the same CSV).
 
 Outcome of a scenario, best first:
 - clean:     reached the distance, never fully off the road, never lost control
@@ -24,7 +25,7 @@ import numpy as np
 from .client import DATA, F
 from .env import ENDS, RacingEnv
 from .starts import KINDS, Starts
-from .tracks import Track, allocate
+from .tracks import Track
 
 SUITE = DATA / "suite-v2.csv"
 SCENARIO_DISTANCE = 500.0  # m along the track
@@ -45,21 +46,36 @@ def load_suite(splits: tuple[str, ...] = ("validation",), path: Path = SUITE) ->
     return rows
 
 
+def spread(counts: dict[str, int], n_workers: int) -> list[str]:
+    """Workers per track for the suite: one each, then each next worker to the track whose workers have the most
+    scenarios to play each, so that the busiest worker, which sets the eval's length, has as few as possible. Returns
+    one track name per worker, grouped by track."""
+    names = sorted(counts)
+    workers = dict.fromkeys(names, 1)
+    for _ in range(n_workers - len(names)):
+        workers[max(names, key=lambda t: counts[t] / workers[t])] += 1
+    return [t for t in names for _ in range(workers[t])]
+
+
 class _Layout:
-    """The suite's fixed layout: workers spread over the tracks in proportion to their number of scenarios, each working
-    through its share in suite order. `start_fn` hands each env its next scenario (`running`, -1 = none left, then a
-    grid start and the env is paused)."""
+    """The suite's layout: workers spread over the tracks by `spread`, each working through its share in suite order.
+    `start_fn` hands each env its next scenario (`running`, -1 = none left, then a grid start and the env is paused);
+    `refill` queues the whole suite again."""
 
     def __init__(self, suite: list[dict], n_workers: int):
         counts = {}
         for r in suite:
             counts[r["track"]] = counts.get(r["track"], 0) + 1
-        self.suite, self.tracks = suite, allocate(counts, max(n_workers, len(counts)))
-        self.queues: list[list[int]] = [[] for _ in self.tracks]
+        self.suite, self.tracks = suite, spread(counts, max(n_workers, len(counts)))
+        self.plan: list[list[int]] = [[] for _ in self.tracks]
         for t in counts:  # a track's scenarios, dealt round-robin to its workers
             mine = [w for w, wt in enumerate(self.tracks) if wt == t]
             for j, i in enumerate([i for i, r in enumerate(suite) if r["track"] == t]):
-                self.queues[mine[j % len(mine)]].append(i)
+                self.plan[mine[j % len(mine)]].append(i)
+        self.refill()
+
+    def refill(self) -> None:
+        self.queues = [list(q) for q in self.plan]
         self.running = np.full(len(self.tracks), -1)
 
     def start_fn(self, idx: np.ndarray) -> Starts:
@@ -76,14 +92,22 @@ class _Layout:
         raise RuntimeError(f"suite scenarios with a non-finite launch: {ids} (make_suite.py checks launches: regenerate)")
 
 
-def run_suite(policy: Policy, suite: list[dict], n_workers: int = 48) -> list[dict]:
-    """Play every scenario once; returns one result row per scenario, in suite order."""
-    lay = _Layout(suite, n_workers)
-    results: list[dict | None] = [None] * len(suite)
-    lengths = {t: Track.load(t).length for t in set(lay.tracks)}
-    env = RacingEnv(lay.tracks, episode_seconds=SCENARIO_SECONDS, max_distance=SCENARIO_DISTANCE,
-                    start_fn=lay.start_fn, retry_fn=lay.bad_launch)
-    try:
+class Suite:
+    """A scenario suite with its workers, which stay up between runs: starting 48 workers takes ~12 s, so train.py
+    keeps one for all its evaluations. Each run plays every scenario once from a fresh race, so runs don't depend on
+    what the workers played before."""
+
+    def __init__(self, suite: list[dict], n_workers: int = 48):
+        self.suite, self.layout = suite, _Layout(suite, n_workers)
+        self.lengths = {t: Track.load(t).length for t in set(self.layout.tracks)}
+        self.env = RacingEnv(self.layout.tracks, episode_seconds=SCENARIO_SECONDS, max_distance=SCENARIO_DISTANCE,
+                             start_fn=self.layout.start_fn, retry_fn=self.layout.bad_launch, overlap_starts=True)
+
+    def run(self, policy: Policy) -> list[dict]:
+        """Play every scenario once; returns one result row per scenario, in suite order."""
+        suite, lay, env = self.suite, self.layout, self.env
+        lay.refill()
+        results: list[dict | None] = [None] * len(suite)
         obs, _ = env.reset()
         while (lay.running >= 0).any():
             before = lay.running.copy()
@@ -102,11 +126,22 @@ def run_suite(policy: Policy, suite: list[dict], n_workers: int = 48) -> list[di
                                       "distance": round(float(e["distance"][i]), 1),
                                       "seconds": round(float(e["seconds"][i]), 2), "bot_seconds": sc["bot_time"],
                                       "pace": round(sc["bot_time"] / e["seconds"][i], 4) if reached else "",
-                                      "end_s": round(float(np.mod(sc["s"] + e["distance"][i], lengths[sc["track"]])), 1)}
+                                      "end_s": round(float(np.mod(sc["s"] + e["distance"][i],
+                                                                  self.lengths[sc["track"]])), 1)}
+        assert all(r is not None for r in results)
+        return results
+
+    def close(self) -> None:
+        self.env.close()
+
+
+def run_suite(policy: Policy, suite: list[dict], n_workers: int = 48) -> list[dict]:
+    """Play every scenario once with workers of its own; returns one result row per scenario, in suite order."""
+    s = Suite(suite, n_workers)
+    try:
+        return s.run(policy)
     finally:
-        env.close()
-    assert all(r is not None for r in results)
-    return results
+        s.close()
 
 
 def check_launches(suite: list[dict], n_workers: int = 48) -> list[int]:
