@@ -16,7 +16,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from rlpilot import evaluate, obs
+from rlpilot import controls, evaluate, obs
 from rlpilot.tracks import load_split
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,6 +37,7 @@ def load_agent(path: Path):
     """The checkpoint's agent, its input normalization (raw observations -> what the agent takes), and the checkpoint."""
     ckpt = torch.load(path, weights_only=False)
     obs.configure(ckpt["args"].get("obs_height", "none"))  # the inputs it was trained with
+    controls.configure(ckpt["args"].get("gearbox", "manual"))  # and who shifted
     space = types.SimpleNamespace(single_observation_space=gym.spaces.Box(-np.inf, np.inf, (obs.DIM,), np.float32))
     agent = Agent(space, ckpt["args"]["hidden"], activation=ckpt["args"].get("activation", "tanh"),
                   learned_std=ckpt["args"].get("learned_std", False))
@@ -58,7 +59,8 @@ def main():
     p.add_argument("--splits", nargs="+", default=["validation"], choices=["train", "validation", "test"])
     p.add_argument("--test", action="store_true", help="required to touch the test split (once, at the very end)")
     p.add_argument("--workers", type=int, default=48, help="results don't depend on it")
-    p.add_argument("--grid-laps", action="store_true", help="also drive 2 laps from the grid on each track of the splits")
+    p.add_argument("--grid-laps", action="store_true", help="also drive laps from the grid on each track of the splits")
+    p.add_argument("--laps", type=int, default=2, help="laps per track for --grid-laps")
     a = p.parse_args()
     if "test" in a.splits and not a.test:
         raise SystemExit("the test split is for the final evaluation only: pass --test if this is it")
@@ -83,10 +85,16 @@ def main():
             f"{r[c]:13.0f}" if c == "median damage" else f"{r[c]:13d}" for c in cols))
     if a.grid_laps:
         tracks = [t for s in a.splits for t in load_split()[s]]
-        print("\n  grid laps (2 laps from a standing start):")
-        for r in evaluate.grid_laps(policy, tracks):
+        split_of = {t: s for s in a.splits for t in load_split()[s]}
+        rows = evaluate.grid_laps(policy, tracks, a.laps)
+        print(f"\n  grid laps ({a.laps} from a standing start; clean = before the first loss of control, pace = bot "
+              "time / car time over that stretch):")
+        for r in rows:
             times = ", ".join(f"{x:.2f}" for x in r["lap_times"])
-            print(f"  {r['track']:15s} {r['end']:12s} laps {r['laps']}  [{times}]  best / bot {r['best_vs_bot']:.3f}")
+            print(f"  {r['track']:15s} {r['end']:12s} completion {r['completion']:.2f}  clean {r['clean']:.2f}  "
+                  f"pace {r['pace']:.3f}  [{times}]")
+        for k, v in evaluate.summarize_laps(rows, split_of).items():
+            print(f"  {k:28s} {v:.3f}")
 
 
 if __name__ == "__main__":

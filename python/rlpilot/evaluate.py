@@ -33,7 +33,7 @@ from .client import DATA, F
 from .env import ENDS, RacingEnv
 from .reward import LOST_CAUSES
 from .starts import KINDS, Starts
-from .tracks import Track
+from .tracks import TRACE_COLUMNS, Track, _prefix
 
 SUITE = DATA / "suite-v2.csv"
 SCENARIO_DISTANCE = 500.0  # m along the track
@@ -265,36 +265,95 @@ def per_track(rows: list[dict]) -> list[dict]:
     return out
 
 
+def bot_standing(track: str) -> tuple[np.ndarray, np.ndarray]:
+    """The bot's race from the grid (setup_tracks.py's reference laps, standing start included): metres raced since
+    its start -> seconds. Interpolate with np.interp(distance, *bot_standing(track))."""
+    data = np.loadtxt(f"{_prefix(track)}_laps.csv", ndmin=2)
+    d, t = data[:, TRACE_COLUMNS.index("dist_raced")], data[:, TRACE_COLUMNS.index("time")]
+    step = np.diff(d)  # the engine's dist_raced can jump by a lap for a tick at the line (Spa): drop lap-sized jumps,
+    length = Track.load(track).length  # as reward.py does
+    step -= length * np.rint(step / length)
+    return np.maximum.accumulate(np.concatenate([[0.0], np.cumsum(step)])), t - t[0]
+
+
 def grid_laps(policy: Policy, tracks: list[str], laps: int = 2) -> list[dict]:
     """The real task: `laps` laps from a standing start on the grid, one episode per track (the sim and the policy are
-    deterministic, so more would be copies). Ends when the laps are done, or on a failure."""
+    deterministic, so more would be copies). Ends when the laps are done, or on a failure. Per track:
+    - completion: share of the laps' distance driven before the episode ended (1 = all laps; a car that recovers
+      from a spin and carries on keeps counting);
+    - clean: share driven before the first loss of control (the suite's test: a wall, facing backwards, far off);
+    - pace: the bot's time over that clean distance, from its own standing start, / the car's time over it
+      (> 1 = faster than the bot). Only the clean stretch counts, so a crash doesn't leave a hole, and the spin
+      that follows doesn't count as slowness.
+    Times are the sim's clock, not steps x env.dt: the engine calls the robots every 0.020 or 0.022 s (float rounding
+    of its 0.002 s physics steps), so an agent step lasts 0.040-0.044 s, ~0.042 on average."""
     def grid(idx):
         z = np.zeros(len(idx))
         return Starts(np.zeros(len(idx), np.int64), z, z, z, z, z, z, np.zeros(len(idx), np.int64))
-    bot = {t: Track.load(t).bot_lap for t in tracks}
-    env = RacingEnv(list(tracks), episode_seconds=laps * max(bot.values()) / 0.6 + 30, start_fn=grid)
-    out = []
+    info_t = {t: Track.load(t) for t in tracks}
+    env = RacingEnv(list(tracks), episode_seconds=laps * max(t.bot_lap for t in info_t.values()) / 0.6 + 30,
+                    start_fn=grid)
+    n = len(tracks)
+    times: list[list[float]] = [[] for _ in tracks]
+    end, distance = [""] * n, np.zeros(n)
+    clean_d, clean_s = np.full(n, np.nan), np.full(n, np.nan)  # at the first loss of control
     try:
         obs, _ = env.reset()
-        active = np.ones(len(tracks), bool)
-        times: list[list[float]] = [[] for _ in tracks]
+        t0, now = env._raw[:, F["time"]].astype(np.float64), env._raw[:, F["time"]].astype(np.float64)
+        active = np.ones(n, bool)
         prev_laps = env._raw[:, F["laps"]].copy()
-        end = [""] * len(tracks)
         while active.any():
             obs, _, term, trunc, info = env.step(policy(obs), active)
             raw = env._raw
             for i in np.flatnonzero(active):
                 done = term[i] or trunc[i]
-                if not done and raw[i, F["laps"]] > prev_laps[i] and raw[i, F["laps"]] >= 2:
-                    times[i].append(float(raw[i, F["last_lap_time"]]))
+                if done:  # the env has already moved on to its next start: read this episode from its stats
+                    e = info["episode_end"]
+                    distance[i] = e["distance"][i]
+                    now[i] += env.dt  # its last step (the raw state is the next start's): within 0.004 s
+                    if e["lost_control"][i] and np.isnan(clean_d[i]):
+                        clean_d[i], clean_s[i] = e["lost_at"][i], now[i] - t0[i]
+                else:
+                    now[i] = raw[i, F["time"]]
+                    if env._lost[i] and np.isnan(clean_d[i]):
+                        clean_d[i], clean_s[i] = env._lost_at[i], now[i] - t0[i]
+                    if raw[i, F["laps"]] > prev_laps[i] and raw[i, F["laps"]] >= 2:
+                        times[i].append(float(raw[i, F["last_lap_time"]]))
+                    distance[i] = env.reward.raced[i]
                 prev_laps[i] = raw[i, F["laps"]]
                 if len(times[i]) >= laps or done:
                     active[i] = False
                     end[i] = "laps_done" if len(times[i]) >= laps else ENDS[info["episode_end"]["end"][i]]
+                    if np.isnan(clean_d[i]):  # never lost control
+                        clean_d[i], clean_s[i] = distance[i], now[i] - t0[i]
     finally:
         env.close()
+    out = []
     for i, t in enumerate(tracks):
-        out.append({"track": t, "end": end[i], "laps": len(times[i]), "lap_times": times[i], "bot_lap": bot[t],
-                    "best_vs_bot": (min(times[i]) / bot[t]) if times[i] else float("nan")})
+        goal = laps * info_t[t].length
+        bot_s = float(np.interp(max(clean_d[i], 0.0), *bot_standing(t)))
+        out.append({"track": t, "end": end[i], "laps": len(times[i]), "lap_times": times[i],
+                    "bot_lap": info_t[t].bot_lap,
+                    "best_vs_bot": (min(times[i]) / info_t[t].bot_lap) if times[i] else float("nan"),
+                    "distance": float(distance[i]), "clean_distance": float(clean_d[i]),
+                    "clean_seconds": float(clean_s[i]), "bot_seconds": bot_s,
+                    "completion": float(min(1.0, max(distance[i], 0.0) / goal)),
+                    "clean": float(min(1.0, max(clean_d[i], 0.0) / goal)),
+                    "pace": bot_s / clean_s[i] if clean_s[i] > 0 else float("nan")})
     return out
+
+
+def summarize_laps(rows: list[dict], split_of: dict[str, str]) -> dict[str, float]:
+    """grid_laps rows -> metrics per split ("{split}/lap/..."): completion and clean averaged over tracks (each track
+    weighs the same), finished = share of tracks that did every lap, pace pooled = total bot seconds / total car
+    seconds over the clean stretches (long clean stretches weigh more, a crash after 200 m adds little noise)."""
+    m: dict[str, float] = {}
+    for split in sorted({split_of[r["track"]] for r in rows}):
+        sp = [r for r in rows if split_of[r["track"]] == split]
+        m[f"{split}/lap/completion"] = float(np.mean([r["completion"] for r in sp]))
+        m[f"{split}/lap/clean"] = float(np.mean([r["clean"] for r in sp]))
+        m[f"{split}/lap/finished"] = float(np.mean([r["end"] == "laps_done" for r in sp]))
+        car = sum(r["clean_seconds"] for r in sp if r["clean_seconds"] > 0)
+        m[f"{split}/lap/pace"] = sum(r["bot_seconds"] for r in sp if r["clean_seconds"] > 0) / car if car else float("nan")
+    return m
 

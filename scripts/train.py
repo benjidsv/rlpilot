@@ -23,7 +23,7 @@ from torch.distributions.normal import Normal
 from tqdm import tqdm  # rlpilot
 import wandb
 
-from rlpilot import evaluate, obs as observation  # rlpilot
+from rlpilot import controls, evaluate, obs as observation  # rlpilot
 from rlpilot.env import ENDS, RacingEnv  # rlpilot
 from rlpilot.starts import KINDS  # rlpilot
 from rlpilot.tracks import Track, allocate, load_split  # rlpilot
@@ -122,6 +122,11 @@ class Args:
     the mean"""
     obs_height: str = "none"
     """optional inputs (obs.py): the road's height at the edge points, "centre" (21), "edges" (42) or "none" (off)"""
+    gearbox: str = "manual"
+    """who shifts while the car moves: the policy ("manual") or an rpm rule ("auto", controls.auto_shift: up at 92% of
+    the redline, down when the lower gear stays under 70%). With auto, the policy still shifts when the car is nearly
+    stopped (1st <-> reverse), and its shift choice counts in the PPO loss only there. A diagnostic: is the car's 3rd
+    gear cap (2026-11-24) a gearbox trap?"""
     learned_std: bool = True
     """the std of steer and pedal is an output of the actor (a linear head on its body, per state, within
     [exp(LOGSTD_MIN), exp(LOGSTD_MAX)]) instead of one learned number for every state (CleanRL, --no-learned-std).
@@ -259,9 +264,11 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None, steer_scale=None):
+    def get_action_and_value(self, x, action=None, steer_scale=None, shift_mask=None):
         # rlpilot: steer_scale [n] multiplies the steering's std (steer_noise_scale); the update must pass the same
-        # scale the rollout sampled with, so it is stored with the actions
+        # scale the rollout sampled with, so it is stored with the actions. shift_mask [n] (0 / 1): whether the shift
+        # choice was used (--gearbox auto ignores it while moving): an unused choice adds nothing to the log-probability
+        # or the entropy
         h = self.actor_body(x)
         action_mean = self.actor_mean(h)
         if self.learned_std:  # rlpilot: squashed into [LOGSTD_MIN, LOGSTD_MAX], so no state's noise can vanish
@@ -276,10 +283,11 @@ class Agent(nn.Module):
         shift = Categorical(logits=self.shift_logits(h))
         if action is None:
             action = torch.cat([probs.sample(), shift.sample()[:, None].float()], 1)
+        mask = 1.0 if shift_mask is None else shift_mask  # rlpilot
         logprob = probs.log_prob(action[:, :2]).sum(1) + shift.log_prob(
             action[:, 2].long()
-        )
-        entropy = probs.entropy().sum(1) + shift.entropy()
+        ) * mask
+        entropy = probs.entropy().sum(1) + shift.entropy() * mask
         return action, logprob, entropy, self.critic(x)
 
     def act_deterministic(
@@ -300,6 +308,13 @@ def car_speed(norm, x):
     normalization: its statistics are the ones x was normalized with)"""
     m, s = norm.obs_rms.mean[SPEED], np.sqrt(norm.obs_rms.var[SPEED] + norm.epsilon)
     return (x[:, SPEED] * float(s) + float(m)).abs() * 50
+
+
+def shift_mask(norm, x):
+    """rlpilot: x [n, obs] normalized observations -> [n] 1 where the policy's shift choice is used, else 0
+    (controls.policy_shifts: always with the manual gearbox, only nearly stopped with the auto one)"""
+    return torch.as_tensor(controls.policy_shifts(car_speed(norm, x).cpu().numpy()), dtype=torch.float32,
+                           device=x.device)
 
 
 def steer_noise_scale(norm, x, args):
@@ -363,6 +378,7 @@ def run_eval(
 if __name__ == "__main__":
     args = tyro.cli(Args)
     observation.configure(args.obs_height)  # rlpilot: before any env or policy is made
+    controls.configure(args.gearbox)  # rlpilot
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -410,6 +426,7 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     steer_scales = torch.ones((args.num_steps, args.num_envs)).to(device)  # rlpilot: see steer_noise_scale
+    shift_masks = torch.ones((args.num_steps, args.num_envs)).to(device)  # rlpilot: see shift_mask
     stds = torch.zeros((args.num_steps, args.num_envs, 2)).to(device)  # rlpilot: the std applied, for the logs
     speeds = torch.zeros((args.num_steps, args.num_envs)).to(device)  # rlpilot: m/s, for the logs
     means = torch.zeros((args.num_steps, args.num_envs, 2)).to(device)  # rlpilot: the Gaussian's mean, for the logs
@@ -447,7 +464,9 @@ if __name__ == "__main__":
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 steer_scales[step] = steer_noise_scale(norm, next_obs, args)  # rlpilot
-                action, logprob, _, value = agent.get_action_and_value(next_obs, steer_scale=steer_scales[step])
+                shift_masks[step] = shift_mask(norm, next_obs)  # rlpilot
+                action, logprob, _, value = agent.get_action_and_value(next_obs, steer_scale=steer_scales[step],
+                                                                       shift_mask=shift_masks[step])
                 values[step] = value.flatten()
                 stds[step], speeds[step] = agent.last_std, car_speed(norm, next_obs)  # rlpilot
                 means[step] = agent.last_mean  # rlpilot
@@ -560,6 +579,7 @@ if __name__ == "__main__":
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
         b_steer_scales = steer_scales.reshape(-1)  # rlpilot
+        b_shift_masks = shift_masks.reshape(-1)  # rlpilot
 
         # Optimizing the policy and value network
         torch.set_num_threads(args.update_threads)  # rlpilot
@@ -572,8 +592,9 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds], steer_scale=b_steer_scales[mb_inds]
-                )  # rlpilot: the steering noise's scale the actions were sampled with
+                    b_obs[mb_inds], b_actions[mb_inds], steer_scale=b_steer_scales[mb_inds],
+                    shift_mask=b_shift_masks[mb_inds]
+                )  # rlpilot: the steering noise's scale the actions were sampled with, which shifts were used
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 

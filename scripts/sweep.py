@@ -38,7 +38,7 @@ SEEDS = (1, 2, 3)
 BASE = {"lost-control-cost": 0.0, "best-only-progress": False, "terminal": 10.0, "gamma": 0.995,
         "progress-units": "metres", "lost-control-causes": ("contact", "backwards", "far_off"),
         "steer-noise-power": 0.0, "steer-noise-speed": 20.0, "steer-noise-floor": 0.1,
-        "learned-std": False, "obs-height": "none"}
+        "learned-std": False, "obs-height": "none", "gearbox": "manual"}
 
 VARIANTS = {
     # the reference, and the noise between seeds
@@ -78,6 +78,9 @@ VARIANTS = {
     # never mix with the ones before: the new baseline (learned std), and the road's height in the observation
     "fix-learnedstd": {"learned-std": True},
     "fix-height-centre": {"learned-std": True, "obs-height": "centre"},
+    # 2026-11-24 diagnostic: the car sits in 3rd (its limiter caps it at 166 km/h) and barely brakes. With rpm-based
+    # shifting while moving, does it go flat out (the gearbox was the trap) or still hold ~166 (the reward's trade-off)?
+    "fix-autoshift": {"learned-std": True, "gearbox": "auto"},
 }
 
 

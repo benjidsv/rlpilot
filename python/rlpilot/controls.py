@@ -11,6 +11,9 @@ until SHIFT_COOLDOWN steps after the last one (the simulator takes 0.1 s to enga
 clutch on this car). Two refusals, like a real car's electronics: a downshift that would take the engine past its
 redline, and any move between 1st and reverse unless the car is nearly stopped. The worker only applies the gear it
 is sent, and slips the clutch when pulling away in 1st or reverse.
+
+configure("auto") (a diagnostic, --gearbox auto): while the car moves, auto_shift picks the shift and the policy's
+choice is ignored; when it is nearly stopped, the policy still chooses (1st <-> reverse, getting out of a stuck spot).
 """
 
 from __future__ import annotations
@@ -24,6 +27,21 @@ TOP_GEAR = 6           # sc-cavallo-360 (the worker clamps to the car's own gear
 SHIFT_COOLDOWN = 5     # agent steps (0.2 s at 25 Hz)
 STOPPED_SPEED = 1.0    # m/s: below this, 1st <-> reverse is allowed
 DOWN, HOLD, UP = 0, 1, 2
+GEARBOXES = ("manual", "auto")
+GEARBOX = "manual"
+
+
+def configure(gearbox: str = "manual") -> None:
+    """Who shifts while the car moves (before making envs): the policy ("manual") or auto_shift ("auto")."""
+    global GEARBOX
+    if gearbox not in GEARBOXES:
+        raise ValueError(f"gearbox: one of {GEARBOXES}, not {gearbox!r}")
+    GEARBOX = gearbox
+
+
+def policy_shifts(speed: np.ndarray) -> np.ndarray:
+    """[n] bool: whether the policy's shift choice is used at this speed (m/s, signed or not)."""
+    return np.ones(np.shape(speed), bool) if GEARBOX == "manual" else np.abs(speed) < STOPPED_SPEED
 
 
 class Controls:
@@ -53,7 +71,10 @@ class Controls:
         self.steer = np.where(on, steer, self.steer).astype(np.float32)
         self.pedal = np.where(on, np.clip(action[:, 1], -1, 1), self.pedal).astype(np.float32)
         cooldown = np.maximum(self.cooldown - 1, 0)  # a shift at step t allows the next one at t + SHIFT_COOLDOWN
-        gear, shifted, refused = shift_gear(self.gear, np.rint(action[:, 2]).astype(np.int64), cooldown, raw)
+        choice = np.rint(action[:, 2]).astype(np.int64)
+        if GEARBOX == "auto":
+            choice = np.where(policy_shifts(raw[:, F["speed_x"]]), choice, auto_shift(self.gear, raw))
+        gear, shifted, refused = shift_gear(self.gear, choice, cooldown, raw)
         self.gear = np.where(on, gear, self.gear)
         self.shifted, self.refused = shifted & on, refused & on
         self.cooldown = np.where(on, np.where(shifted, SHIFT_COOLDOWN, cooldown), self.cooldown)
