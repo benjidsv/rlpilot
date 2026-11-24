@@ -12,6 +12,7 @@ train = [
     "tqdm>=4.66",
     "wandb>=0.31.2",
     "wandb-workspaces>=0.4.13",
+    "matplotlib>=3.11.2",
 ]
 dev = ["pytest>=8"]
 

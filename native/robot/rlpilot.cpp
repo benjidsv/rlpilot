@@ -3,7 +3,9 @@
 // When loaded by the regular game (no host), it drives a simple centreline follower instead, which
 // keeps the module usable in rendered runs and as a smoke test. With RLP_REPLAY=<path> it replays the
 // controls recorded by a worker (scripts/record_lap.py), tick by tick, and logs its position against
-// the recording to <path>.check.csv: the engine is deterministic, so the two should match.
+// the recording to <path>.check.csv: the engine is deterministic, so the two should match. With RLP_REPLAY_BOT=<path>
+// (float32: the bot's lap time, then its time from the start line at each metre of the lap) the HUD's delta and best lap
+// are the bot's: the robot writes them into the car's best-lap fields on every tick (no physics reads them).
 
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +27,8 @@ static rlp_host_api *host;
 static std::vector<rlp_tick> replay;
 static size_t replayPos;
 static FILE *replayCheck;
+static std::vector<float> botTimes; // RLP_REPLAY_BOT: per metre from the start line
+static float botLap;
 
 static void newTrack(int index, tTrack *track, void *carHandle, void **carParmHandle, tSituation *)
 {
@@ -52,12 +56,44 @@ static void loadReplay(const char *path)
     GfLogInfo("rlpilot: replaying %zu ticks from %s\n", replay.size(), path);
 }
 
+static void loadBot(const char *path)
+{
+    botTimes.clear();
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        GfLogError("rlpilot: cannot open bot times %s\n", path);
+        return;
+    }
+    float v;
+    while (fread(&v, sizeof v, 1, f) == 1)
+        botTimes.push_back(v);
+    fclose(f);
+    if (botTimes.empty())
+        return;
+    botLap = botTimes.front();
+    botTimes.erase(botTimes.begin());
+}
+
+// The HUD's delta compares the current lap's time at each metre with the best lap's; it shows once there is a best lap.
+// From the first crossing of the start line (before it, the current lap is the run up from the grid).
+static void showBotDelta(tCarElt *car)
+{
+    if (botTimes.empty() || car->_laps < 1 || !car->_bestLapTimeAtTrackPosition)
+        return;
+    size_t n = std::min(botTimes.size(), (size_t)car->_trackPositionCount);
+    memcpy(car->_bestLapTimeAtTrackPosition, botTimes.data(), n * sizeof(float));
+    car->_bestLapTime = botLap;
+}
+
 static void newRace(int index, tCarElt *car, tSituation *s)
 {
     if (host)
         host->new_race(index, car, s);
-    else if (const char *path = getenv("RLP_REPLAY"))
+    else if (const char *path = getenv("RLP_REPLAY")) {
         loadReplay(path);
+        if (const char *bot = getenv("RLP_REPLAY_BOT"))
+            loadBot(bot);
+    }
 }
 
 // Same commands as the worker: braked with the clutch down until the start, then the recording, then stop.
@@ -100,8 +136,10 @@ static void drive(int index, tCarElt *car, tSituation *s)
 {
     if (host)
         host->drive(index, car, s);
-    else if (!replay.empty())
+    else if (!replay.empty()) {
         replayDrive(car, s);
+        showBotDelta(car);
+    }
     else
         fallbackDrive(car);
 }

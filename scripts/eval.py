@@ -24,6 +24,17 @@ from train import Agent  # noqa: E402  (the policy is defined in the single-file
 
 
 def load_policy(path: Path):
+    """The checkpoint's deterministic policy (raw observations -> actions), and the checkpoint."""
+    agent, normalize, ckpt = load_agent(path)
+
+    def policy(o):
+        with torch.no_grad():
+            return agent.act_deterministic(torch.as_tensor(normalize(o))).numpy()
+    return policy, ckpt
+
+
+def load_agent(path: Path):
+    """The checkpoint's agent, its input normalization (raw observations -> what the agent takes), and the checkpoint."""
     ckpt = torch.load(path, weights_only=False)
     obs.configure(ckpt["args"].get("obs_height", "none"))  # the inputs it was trained with
     space = types.SimpleNamespace(single_observation_space=gym.spaces.Box(-np.inf, np.inf, (obs.DIM,), np.float32))
@@ -36,11 +47,9 @@ def load_policy(path: Path):
     mean, std = np.where(fixed, 0.0, mean), np.where(fixed, 1.0, std)
     torch.set_num_threads(1)  # as in training's evals: the same thread count gives the same actions
 
-    def policy(o):
-        x = np.clip((o - mean) / std, -10, 10).astype(np.float32)
-        with torch.no_grad():
-            return agent.act_deterministic(torch.as_tensor(x)).numpy()
-    return policy, ckpt
+    def normalize(o):
+        return np.clip((o - mean) / std, -10, 10).astype(np.float32)
+    return agent, normalize, ckpt
 
 
 def main():
