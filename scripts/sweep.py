@@ -81,6 +81,9 @@ VARIANTS = {
     # 2026-11-24 diagnostic: the car sits in 3rd (its limiter caps it at 166 km/h) and barely brakes. With rpm-based
     # shifting while moving, does it go flat out (the gearbox was the trap) or still hold ~166 (the reward's trade-off)?
     "fix-autoshift": {"learned-std": True, "gearbox": "auto"},
+    # 2026-11-24 restart (old runs deleted): train.py's defaults, measured with the lean eval (nominal + crashed + a
+    # capped grid lap per track) and the sim-clock pace. Every later variant is compared with this
+    "baseline": {"learned-std": True},
 }
 
 

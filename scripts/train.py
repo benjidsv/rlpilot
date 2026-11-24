@@ -133,7 +133,11 @@ class Args:
     Starts at 1, like it. The steering round (3 seeds x 10M, docs/v2.md): it learns ~0.65 below 20 m/s and ~0.05
     above 40, with better nominal driving than one std"""
     eval_every: int = 10_000_000
-    """steps between two evaluations on the scenario suite (validation and training tracks)"""
+    """steps between two evaluations: the scenario suite's eval_tiers and 1 grid lap per track (capped at
+    evaluate.LAP_CAP), validation and training tracks. The last one plays the whole suite and 2 full laps too"""
+    eval_tiers: tuple[str, ...] = ("nominal", "crashed")
+    """tiers of the suite played during the run (the last eval plays all). Over 225 checkpoints of the sweeps, mild
+    tracked nominal at 0.97-0.98, perturbed and disturbed at 0.82-0.92; crashed is the one that differs (0.1)"""
     eval_workers: int = 48
     """workers of the eval env (results don't depend on it; 48 is the fastest on the Mac's 8 cores)"""
     rollout_threads: int = 1
@@ -331,8 +335,8 @@ def steer_noise_scale(norm, x, args):
 
 
 def run_eval(
-    agent, norm, args, step, run_dir, best, suite
-):  # rlpilot: the scenario suite, validation + train
+    agent, norm, args, step, run_dir, best, suite, laps, final
+):  # rlpilot: the scenario suite and grid laps, validation + train (final: the whole suite and 2 full laps too)
     torch.set_num_threads(
         1
     )  # a fixed thread count: the same checkpoint must always give the same actions
@@ -342,9 +346,24 @@ def run_eval(
             return agent.act_deterministic(torch.as_tensor(norm.normalize(o))).numpy()
 
     t0 = time.time()
-    rows = suite.run(policy)
+    if final:  # every tier: the scenarios eval_tiers shares play the same (each is a fresh race)
+        full = evaluate.Suite(evaluate.load_suite(("validation", "train")), args.eval_workers)
+        try:
+            rows = full.run(policy)
+        finally:
+            full.close()
+    else:
+        rows = suite.run(policy)
     evaluate.write_results(rows, run_dir / "eval" / f"{step:010d}.csv")
-    metrics = evaluate.summarize(rows)
+    split = load_split()
+    split_of = {t: s for s in ("validation", "train") for t in split[s]}
+    lap_rows = laps.run(policy)
+    evaluate.write_laps(lap_rows, run_dir / "eval" / f"{step:010d}-laps.csv")
+    metrics = evaluate.summarize(rows) | evaluate.summarize_laps(lap_rows, split_of)
+    if final:
+        laps2 = evaluate.grid_laps(policy, laps.tracks, laps=2, cap=None)
+        evaluate.write_laps(laps2, run_dir / "eval" / f"{step:010d}-laps2.csv")
+        metrics |= evaluate.summarize_laps(laps2, split_of, "laps2")
     wandb.log(
         {f"3_eval/{k}": v for k, v in metrics.items()}
         | {"5_perf/eval_seconds": time.time() - t0, "global_step": step}
@@ -367,9 +386,9 @@ def run_eval(
         torch.save(ckpt, run_dir / "checkpoints" / "best.pt")
         best = score
     tqdm.write(  # rlpilot: above the progress bar
-        f"eval at {step}: validation nominal survival {score:.3f} (best {best:.3f}), pace "
-        f"{metrics['validation/pace']:.3f}, train nominal survival {metrics['train/nominal/survival']:.3f}, "
-        f"{time.time() - t0:.0f} s"
+        f"eval at {step}: validation nominal survival {score:.3f} (best {best:.3f}), lap pace "
+        f"{metrics['validation/lap/pace']:.3f}, lap clean {metrics['validation/lap/clean']:.3f}; train nominal survival "
+        f"{metrics['train/nominal/survival']:.3f}, lap pace {metrics['train/lap/pace']:.3f}; {time.time() - t0:.0f} s"
     )
     torch.set_num_threads(args.rollout_threads)
     return best
@@ -440,8 +459,9 @@ if __name__ == "__main__":
     torch.set_num_threads(args.rollout_threads)  # rlpilot
     next_eval, best = args.eval_every, -1.0  # rlpilot
     suite = evaluate.Suite(
-        evaluate.load_suite(("validation", "train")), args.eval_workers
+        [r for r in evaluate.load_suite(("validation", "train")) if r["tier"] in args.eval_tiers], args.eval_workers
     )  # rlpilot: the eval's workers, up for the whole run (starting them takes ~12 s)
+    laps = evaluate.GridLaps(load_split()["validation"] + load_split()["train"], laps=1)  # rlpilot: same
     bar = tqdm(total=args.num_iterations * args.batch_size, unit="step", unit_scale=True, desc="train",
                dynamic_ncols=True, smoothing=0.05)  # rlpilot: replaces the SPS print
 
@@ -675,7 +695,8 @@ if __name__ == "__main__":
         ):  # rlpilot: evaluate and checkpoint
             bar.set_description("eval")  # rlpilot
             best = run_eval(
-                agent.cpu(), norm, args, global_step, run_dir, best, suite
+                agent.cpu(), norm, args, global_step, run_dir, best, suite, laps,
+                final=iteration == args.num_iterations,
             )
             bar.set_description("train")
             agent.to(device)
@@ -684,4 +705,5 @@ if __name__ == "__main__":
     bar.close()  # rlpilot
     envs.close()
     suite.close()  # rlpilot
+    laps.close()  # rlpilot
     wandb.finish()  # rlpilot: waits for the last uploads

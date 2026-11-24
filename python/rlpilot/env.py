@@ -85,6 +85,9 @@ class RacingEnv(VectorEnv):
         # per-episode accumulators
         self._ret = np.zeros(n)
         self._len = np.zeros(n, np.int64)
+        # sim time at the episode's start: its length is the sim's clock, not steps x dt (the engine calls the robots
+        # every 0.020 or 0.022 s, float rounding of its 0.002 s physics steps: a step lasts 0.040-0.044 s)
+        self._t0 = np.zeros(n)
         self._comp = np.zeros((len(COMPONENTS), n))
         self._shifts = np.zeros(n, np.int64)
         self._refused = np.zeros(n, np.int64)
@@ -171,12 +174,18 @@ class RacingEnv(VectorEnv):
         self.reward.reset(idx, self._raw)
         self._last_raw[idx] = self._raw[idx]
         self._ret[idx] = self._len[idx] = self._comp[:, idx] = 0
+        self._t0[idx] = self._raw[idx, F["time"]]
         self._shifts[idx] = self._refused[idx] = self._off_steps[idx] = self._speed[idx] = 0
         self._ever_off[idx] = self._lost[idx] = False
         self._lost_first[idx], self._lost_count[:, idx], self._damage[idx] = -1, 0, 0
         self._lost_at[idx] = self._lost_s[idx] = self._lost_speed[idx] = self._last_lost_at[idx] = np.nan
         self._wall_dmg[idx] = self._ground_dmg[idx] = 0
         self._ground_at[idx] = self._ground_off[idx] = np.nan
+
+    def seconds(self, raw: np.ndarray | None = None) -> np.ndarray:
+        """[n] sim seconds since each episode started (steps x dt where the clock isn't finite, e.g. a sim error)."""
+        t = (self._raw if raw is None else raw)[:, F["time"]] - self._t0
+        return np.where(np.isfinite(t) & (t >= 0), t, self._len * self.dt)
 
     def _kick(self, envs: np.ndarray, starts: Starts) -> None:
         """Forced actions of disturbed starts, stepped inside the reset (no reward, no observation)."""
@@ -340,7 +349,7 @@ class RacingEnv(VectorEnv):
         steps = np.maximum(self._len, 1)
         at_end = lambda v: np.where(done, v, 0)
         stats = {
-            "return": at_end(self._ret), "steps": at_end(self._len), "seconds": at_end(self._len * self.dt),
+            "return": at_end(self._ret), "steps": at_end(self._len), "seconds": at_end(self.seconds(raw)),
             "distance": at_end(self.reward.raced), "end": np.where(done, end, -1), "kind": at_end(self.starts.kind),
             "track": at_end(self.track), "failed_near_start": at_end(terminated & (self.reward.best < NEAR_START)),
             "shifts_per_min": at_end(self._shifts / (steps * self.dt / 60)), "refused_shifts": at_end(self._refused),
