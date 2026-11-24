@@ -17,3 +17,4 @@ reports/
 .pytest_cache/
 runs/
 wandb/
+v1-archive/

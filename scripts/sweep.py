@@ -12,10 +12,17 @@ Runs are runs/sw-<variant>__<seed>__<time>/ (3M) or runs/sw<N>m-<variant>__<seed
 runs/sweep/<prefix>-<variant>-s<seed>.log (3M: <variant>-s<seed>.log) and one line per finished run to
 runs/sweep/status.tsv. Every variant spells out every reward argument, so the sweep doesn't
 depend on train.py's defaults.
+
+On a terminal, each run's header is followed by train.py's progress bar (live for the current run, kept with its final
+numbers for the finished ones); the log gets the whole output. The sweep's end time comes from the runs it timed.
 """
 
 import argparse
+import codecs
 import glob
+import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -99,6 +106,37 @@ def finished(variant: str, seed: int, steps: int = STEPS) -> list[str]:
             if Path(p).stem.isdigit() and int(Path(p).stem) >= steps - 20_000]
 
 
+def run(cmd: list[str], log_path: Path) -> int:
+    """Runs one training: its whole output to the log and, on a terminal, its progress bar (train.py's tqdm, desc
+    "train") redrawn on the current line. Returns the exit code."""
+    show = sys.stdout.isatty()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")  # a bar's blocks are 3 bytes, chunks can split them
+    pending, shown = "", False
+    env = os.environ | {"PYTHONUNBUFFERED": "1"}  # the log in the order it was written, the bar as soon as it changes
+    with open(log_path, "wb") as log, subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                       env=env) as p:
+        try:
+            while chunk := os.read(p.stdout.fileno(), 65536):
+                log.write(chunk)
+                log.flush()
+                if not show:
+                    continue
+                *done, pending = re.split(r"[\r\n]", pending + decoder.decode(chunk))
+                bars = [s for s in (*done, pending) if s.startswith("train:")]  # tqdm writes each redraw in one go
+                if bars:
+                    width = shutil.get_terminal_size().columns
+                    sys.stdout.write("\r\x1b[K" + bars[-1][: width - 1])
+                    sys.stdout.flush()
+                    shown = True
+            return p.wait()
+        except BaseException:  # as subprocess.call does: don't leave the training running
+            p.kill()
+            raise
+        finally:
+            if shown:
+                sys.stdout.write("\n")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--only", nargs="+", choices=list(VARIANTS), help="variants to run (default: all)")
@@ -110,8 +148,9 @@ def main():
     todo = [(v, s) for s in a.seeds for v in variants if not finished(v, s, a.steps)]
     out = Path("runs/sweep")
     out.mkdir(parents=True, exist_ok=True)
-    per_run = 8.5 * a.steps / STEPS  # minutes
+    per_run = 8.5 * a.steps / STEPS  # minutes, a guess until this sweep has timed a run
     print(f"{len(todo)} runs to go ({len(variants) * len(a.seeds) - len(todo)} done), ~{len(todo) * per_run / 60:.1f} h")
+    timed = []  # minutes of this sweep's finished runs
     for i, (v, s) in enumerate(todo):
         cmd = command(v, s, a.steps)
         if a.dry_run:
@@ -119,10 +158,13 @@ def main():
             continue
         t0 = time.time()
         name = v if a.steps == STEPS else f"{prefix(a.steps)}-{v}"
-        print(f"[{time.strftime('%H:%M')}] {i + 1}/{len(todo)} {name} seed {s}", flush=True)
-        with open(out / f"{name}-s{s}.log", "w") as log:
-            code = subprocess.call(cmd, stdout=log, stderr=subprocess.STDOUT)
+        estimate = sum(timed) / len(timed) if timed else per_run
+        end = time.strftime("%H:%M", time.localtime(t0 + (len(todo) - i) * estimate * 60))
+        print(f"[{time.strftime('%H:%M')}] {i + 1}/{len(todo)} {name} seed {s}   (sweep done ~{end})", flush=True)
+        code = run(cmd, out / f"{name}-s{s}.log")
         minutes = (time.time() - t0) / 60
+        if code == 0:  # a crash's minutes say nothing about a run's length
+            timed.append(minutes)
         with open(out / "status.tsv", "a") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M')}\t{name}\t{s}\t{code}\t{minutes:.1f}\n")
         print(f"         exit {code}, {minutes:.1f} min" + ("  <- FAILED, see the log" if code else ""), flush=True)
