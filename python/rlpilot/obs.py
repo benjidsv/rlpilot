@@ -16,6 +16,11 @@ runs/obs-variants-2026-11-23.py):
 - 24 compact extras at fixed scales (129 inputs) trained better but evaluated worse than this (0.46): fewer clean
   scenarios, more lost control, slower. Left for later ablations. The track table still has all of it (tracks.py).
 
+Optional, `configure(height=...)` (train.py --obs-height; saved in checkpoints): the road's height at the same POINTS,
+against the road's height at the car, in m / 10. "centre": the centreline's (21 inputs: slopes, crests and dips);
+"edges": each edge's (42: also the banking). The failure map (docs/v2.md) found a downhill approach makes a corner
+harder, and the policy can't see slopes otherwise. Off by default.
+
 FIXED marks inputs already at a fixed scale, which the trainer's running normalization must skip (it would blow up
 the noise of near-constant inputs). None for now.
 """
@@ -32,7 +37,7 @@ POINTS = np.array([-20, -10, -5, -2, 0, 2, 5, 10, 15, 20, 30, 40, 55, 70, 90, 11
                   np.float64)  # m along the centreline from the car
 GEARS = (-1,) + tuple(range(1, TOP_GEAR + 1))
 
-NAMES = (
+_BASE_NAMES = (
     ["speed_x / 50", "speed_y / 10", "yaw_rate / 2", "accel_x / 10", "accel_y / 10", "accel_z / 10"]  # car frame
     + ["angle / pi", "to_middle / half width"]  # heading to the road (+ = road points left), offset (+ = left)
     + ["rpm / redline", "rpm_up / redline", "rpm_down / redline"]
@@ -40,8 +45,21 @@ NAMES = (
     + ["steer command", "pedal"]  # the controls applied at the previous step
     + [f"{side} {xy} @{d:g}m" for side in ("left", "right") for xy in ("x / 100", "y / 50") for d in POINTS]
 )
-DIM = len(NAMES)
-FIXED = np.zeros(DIM, bool)  # inputs at a fixed scale, which the normalization skips: none for now
+HEIGHTS = ("none", "centre", "edges")
+HEIGHT = "none"
+NAMES, DIM, FIXED = _BASE_NAMES, len(_BASE_NAMES), np.zeros(len(_BASE_NAMES), bool)
+
+
+def configure(height: str = "none") -> None:
+    """Set the optional inputs (before making envs or a policy): NAMES, DIM and FIXED follow."""
+    global HEIGHT, NAMES, DIM, FIXED
+    if height not in HEIGHTS:
+        raise ValueError(f"height: one of {HEIGHTS}, not {height!r}")
+    extra = {"none": [], "centre": [f"height @{d:g}m / 10" for d in POINTS],
+             "edges": [f"{side} height @{d:g}m / 10" for side in ("left", "right") for d in POINTS]}[height]
+    HEIGHT, NAMES = height, _BASE_NAMES + extra
+    DIM = len(NAMES)
+    FIXED = np.zeros(DIM, bool)  # inputs at a fixed scale, which the normalization skips: none for now
 
 
 def observe(raw: np.ndarray, track: np.ndarray, controls: Controls, table: TrackTable) -> np.ndarray:
@@ -58,13 +76,19 @@ def observe(raw: np.ndarray, track: np.ndarray, controls: Controls, table: Track
     prev = np.stack([controls.steer, controls.pedal], 1)
 
     s = raw[:, F["dist_from_start"]].astype(np.float64)[:, None] + POINTS[None, :]
-    world = table.at(track, s, ("left_x", "left_y", "right_x", "right_y"))  # [n, k, 4]
+    world = table.at(track, s, ("left_x", "left_y", "right_x", "right_y", "left_z", "right_z"))  # [n, k, 6]
     x, y, yaw = (raw[:, F[k]].astype(np.float64)[:, None] for k in ("pos_x", "pos_y", "yaw"))
     c, si = np.cos(yaw), np.sin(yaw)
     edges = []
     for o in (0, 2):  # left, right
         dx, dy = world[..., o] - x, world[..., o + 1] - y
         edges += [(c * dx + si * dy) / 100, (c * dy - si * dx) / 50]  # forward, left
+    if HEIGHT != "none":
+        z0 = 0.5 * (world[:, POINTS == 0, 4] + world[:, POINTS == 0, 5])  # [n, 1]: the road's height at the car
+        if HEIGHT == "centre":
+            edges.append((0.5 * (world[..., 4] + world[..., 5]) - z0) / 10)
+        else:
+            edges += [(world[..., 4] - z0) / 10, (world[..., 5] - z0) / 10]
     out = np.concatenate([car, gear, shift, prev, *edges], 1).astype(np.float32)
     assert out.shape == (n, DIM)
     return out

@@ -120,6 +120,8 @@ class Args:
     """the steering std's multiplier never goes below this: at power 2 it reaches 0.1 at 63 m/s (the base runs' fastest
     1% of validation driving is above 58 m/s). A std near 0 would also make PPO's ratio explode for tiny changes of
     the mean"""
+    obs_height: str = "none"
+    """optional inputs (obs.py): the road's height at the edge points, "centre" (21), "edges" (42) or "none" (off)"""
     learned_std: bool = True
     """the std of steer and pedal is an output of the actor (a linear head on its body, per state, within
     [exp(LOGSTD_MIN), exp(LOGSTD_MAX)]) instead of one learned number for every state (CleanRL, --no-learned-std).
@@ -360,6 +362,7 @@ def run_eval(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    observation.configure(args.obs_height)  # rlpilot: before any env or policy is made
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size

@@ -6,10 +6,14 @@ by scenario (scripts/compare.py). Each scenario is a fresh race, so its result d
 (checked: 48 and 64 workers give the same CSV).
 
 Outcome of a scenario, best first:
-- clean:     reached the distance, never fully off the road, never lost control
-- survived:  reached it, went fully off the road at some point but kept control
-- recovered: reached it, but lost control on the way (hit something, faced backwards, or got far off the road)
+- clean:     reached the distance, never fully off the road, never scraped the ground, never lost control
+- survived:  reached it, went fully off the road or scraped the ground at some point, but kept control
+- recovered: reached it, but lost control on the way (hit a wall, faced backwards, or got far off the road)
 - failed:    didn't reach it (no progress for 10 s, wrecked, or out of time)
+A scrape is damage from the ground (bottoming out in a dip, a kerb, a landing), not from a wall: the car kept control,
+but it isn't clean. Caveat: the bot scrapes too, at a few dips (2026-11-24: 33 times in 599 km, at fixed spots on
+Charmey, Ole-road-1, Brondehach, Spring, E-track-4 and Ruudskogen), so a scrape there is the track, not the driving,
+and "clean" is slightly too strict on those tracks.
 Losing control uses the reward's tests (reward.LOST_CAUSES): `lost_first` is the first cause seen, `contact`,
 `backwards` and `far_off` count how often each was entered (a state the launch began in isn't counted), `damage` is in
 points.
@@ -47,6 +51,7 @@ def load_suite(splits: tuple[str, ...] = ("validation",), path: Path = SUITE) ->
             r[k] = float(r[k])
         r["kick_steps"] = int(r["kick_steps"])
         r["kind"] = KINDS.index(r["tier"])
+        r["goal"] = float(r.get("goal") or SCENARIO_DISTANCE)  # m to drive (corner scenarios set their own)
     return rows
 
 
@@ -72,6 +77,7 @@ class _Layout:
             counts[r["track"]] = counts.get(r["track"], 0) + 1
         self.suite, self.tracks = suite, spread(counts, max(n_workers, len(counts)))
         self.plan: list[list[int]] = [[] for _ in self.tracks]
+        self.goal = np.full(len(self.tracks), SCENARIO_DISTANCE)  # per worker: its current scenario's distance
         for t in counts:  # a track's scenarios, dealt round-robin to its workers
             mine = [w for w, wt in enumerate(self.tracks) if wt == t]
             for j, i in enumerate([i for i, r in enumerate(suite) if r["track"] == t]):
@@ -87,6 +93,7 @@ class _Layout:
         for j, e in enumerate(idx):
             self.running[e] = self.queues[e].pop(0) if self.queues[e] else -1
             if self.running[e] >= 0:
+                self.goal[e] = self.suite[self.running[e]].get("goal", SCENARIO_DISTANCE)
                 for k in STARTS_COLUMNS:
                     cols[k][j] = self.suite[self.running[e]][k]
         return Starts(**cols)
@@ -104,7 +111,7 @@ class Suite:
     def __init__(self, suite: list[dict], n_workers: int = 48):
         self.suite, self.layout = suite, _Layout(suite, n_workers)
         self.lengths = {t: Track.load(t).length for t in set(self.layout.tracks)}
-        self.env = RacingEnv(self.layout.tracks, episode_seconds=SCENARIO_SECONDS, max_distance=SCENARIO_DISTANCE,
+        self.env = RacingEnv(self.layout.tracks, episode_seconds=SCENARIO_SECONDS, max_distance=self.layout.goal,
                              start_fn=self.layout.start_fn, retry_fn=self.layout.bad_launch, overlap_starts=True)
 
     def run(self, policy: Policy) -> list[dict]:
@@ -123,7 +130,8 @@ class Suite:
                 sc = suite[before[i]]
                 end = ENDS[e["end"][i]]
                 reached = end == "distance"
-                outcome = ("recovered" if e["lost_control"][i] else "survived" if e["ever_off"][i] else "clean") \
+                outcome = ("recovered" if e["lost_control"][i] else
+                           "survived" if e["ever_off"][i] or e["scraped"][i] else "clean") \
                     if reached else "failed"
                 results[before[i]] = {"id": sc["id"], "split": sc["split"], "track": sc["track"], "tier": sc["tier"],
                                       "s": sc["s"], "outcome": outcome, "end": end,
@@ -134,12 +142,22 @@ class Suite:
                                                                   self.lengths[sc["track"]])), 1),
                                       "lost_first": LOST_CAUSES[e["lost_first"][i]] if e["lost_first"][i] >= 0 else "",
                                       **{c: int(e[f"lost_{c}"][i]) for c in LOST_CAUSES},
-                                      "damage": round(float(e["damage"][i]), 1)}
+                                      "damage": round(float(e["damage"][i]), 1),
+                                      **{k: _r(e[k][i]) for k in ("lost_at", "lost_s", "lost_speed", "last_lost_at",
+                                                                  "peak", "end_speed", "end_angle", "end_offset",
+                                                                  "wall_damage", "ground_damage", "ground_at",
+                                                                  "ground_off")},
+                                      "end_wheels_off": int(e["end_wheels_off"][i])}
         assert all(r is not None for r in results)
         return results
 
     def close(self) -> None:
         self.env.close()
+
+
+def _r(x: float, digits: int = 2):
+    """A float for the CSV: rounded, empty when nan (e.g. never lost control)."""
+    return "" if not np.isfinite(x) else round(float(x), digits)
 
 
 def run_suite(policy: Policy, suite: list[dict], n_workers: int = 48) -> list[dict]:
@@ -200,6 +218,8 @@ def summarize(rows: list[dict], n_boot: int = 2000) -> dict[str, float]:
         for c in LOST_CAUSES:  # nominal scenarios that entered this loss-of-control state (absent from old CSVs)
             if nom and c in nom[0]:
                 m[f"{split}/nominal/lost_{c}"] = float(np.mean([int(r[c]) > 0 for r in nom]))
+        if nom and "ground_at" in nom[0]:  # nominal scenarios that scraped the ground (CSVs from 2026-11-24 on)
+            m[f"{split}/nominal/scraped"] = float(np.mean([r["ground_at"] != "" for r in nom]))
         if not nom:
             continue
         paces = [float(r["pace"]) for r in nom if r["outcome"] in ("clean", "survived")]

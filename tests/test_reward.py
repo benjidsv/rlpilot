@@ -7,9 +7,11 @@ from rlpilot.reward import COMPONENTS, DAMAGE, LOST_CAUSES, PROGRESS, Reward
 P, D, C = (COMPONENTS.index(c) for c in ("progress", "damage", "control"))
 
 
-def state(dist=0.0, damage=0.0, angle=0.0, to_middle=0.0, wheels_off=0, width=10.0):
+def state(dist=0.0, damage=0.0, angle=0.0, to_middle=0.0, wheels_off=0, width=10.0, walls=0):
+    """walls: the engine's count of wall collisions so far (damage without a new one is a scrape on the ground)."""
     raw = np.zeros((1, OBS_DIM), np.float32)
     raw[0, F["dist_raced"]], raw[0, F["damage"]], raw[0, F["angle"]] = dist, damage, angle
+    raw[0, F["coll_count"]] = walls
     raw[0, F["to_middle"]], raw[0, F["wheels_off"]] = to_middle, wheels_off
     raw[0, F["track_width"]], raw[0, F["track_length"]] = width, 5000.0
     return raw
@@ -48,9 +50,11 @@ def test_losing_control_is_charged_once_per_entry():
     r = Reward(1, 0.04, lost_cost=2.0)
     r.reset(np.array([0]), state(0))
     hits = [0, 50, 50, 80, 80, 80]                           # one contact over two steps, then nothing more
+    walls = [0, 1, 1, 2, 2, 2]                              # both from walls
     angle = [0, 0, 0, 3.0, 3.0, 0]                          # backwards for two steps
     mid = [0, 0, 0, 0, 9.0, 9.0]                            # beyond the edge (5 m half width + 3) from step 4
-    comps, onsets = drive(r, [state(10 * (i + 1), h, a, m) for i, (h, a, m) in enumerate(zip(hits, angle, mid))])
+    comps, onsets = drive(r, [state(10 * (i + 1), h, a, m, walls=w)
+                              for i, (h, w, a, m) in enumerate(zip(hits, walls, angle, mid))])
     expect = np.array([[0, 0, 0], [1, 0, 0], [0, 0, 0], [1, 1, 0], [0, 0, 1], [0, 0, 0]], bool)
     assert (onsets == expect).all()
     assert np.allclose(comps[:, C], -2.0 * expect.sum(axis=1))
@@ -70,10 +74,20 @@ def test_a_launch_already_out_of_control_isnt_charged():
 def test_charged_causes_terminal_and_metre_weight():
     r = Reward(1, 0.04, lost_cost=2.0, lost_causes=("contact",), terminal=20.0, metre_weight=lambda raw: np.full(1, 0.5))
     r.reset(np.array([0]), state(0))
-    comps, onsets = drive(r, [state(10, angle=3.0), state(20, damage=5, angle=3.0)])
+    comps, onsets = drive(r, [state(10, angle=3.0), state(20, damage=5, angle=3.0, walls=1)])
     assert onsets[0, LOST_CAUSES.index("backwards")] and comps[0, C] == 0  # tracked, not charged
     assert comps[1, C] == -2.0
     assert np.allclose(comps[:, P], [0.5, 0.5])  # 10 m at weight 0.5
     r.since_best[:] = 100.0  # the no-progress rule
-    comps, _ = drive(r, [state(20, damage=5)])
+    comps, _ = drive(r, [state(20, damage=5, walls=1)])
     assert comps[0, COMPONENTS.index("terminal")] == -20.0
+
+
+def test_a_scrape_isnt_losing_control():
+    r = Reward(1, 0.04, lost_cost=2.0)
+    r.reset(np.array([0]), state(0))
+    # damage from the ground (the wall count doesn't move), then from a wall
+    comps, onsets = drive(r, [state(10, damage=4), state(20, damage=4), state(30, damage=10, walls=1)])
+    assert list(onsets[:, LOST_CAUSES.index("contact")]) == [False, False, True]
+    assert np.allclose(comps[:, C], [0, 0, -2.0])
+    assert np.allclose(comps[:, D], -DAMAGE * np.array([4, 0, 6]))  # a scrape still costs its damage

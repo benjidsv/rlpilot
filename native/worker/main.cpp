@@ -466,7 +466,8 @@ int runTrace(const std::string &prefix, int laps)
     FILE *f = fopen((prefix + "_laps.csv").c_str(), "w");
     if (!f)
         fatal("cannot write the trace file");
-    fprintf(f, "# time laps dist_from_start dist_raced speed_x x y last_lap_time steer accel brake\n");
+    fprintf(f, "# time laps dist_from_start dist_raced speed_x x y last_lap_time steer accel brake damage collisions "
+               "wheels_off\n");
     double next = 0;
     while (!H.quit && re->_reState == RE_STATE_RACE) {
         H.engine->updateState();
@@ -475,9 +476,12 @@ int runTrace(const std::string &prefix, int laps)
             continue;
         next += RCM_MAX_DT_ROBOTS;
         tCarElt *car = s->cars[0];
-        fprintf(f, "%.3f %d %.3f %.3f %.3f %.3f %.3f %.3f %.4f %.4f %.4f\n", s->currentTime, car->_laps,
+        int off = 0;  // wheels on a side segment (a kerb, the grass...), as the agent's wheels_off
+        for (int i = 0; i < 4; i++)
+            off += car->_wheelSeg(i) && car->_wheelSeg(i)->type2 != TR_MAIN;
+        fprintf(f, "%.3f %d %.3f %.3f %.3f %.3f %.3f %.3f %.4f %.4f %.4f %d %d %d\n", s->currentTime, car->_laps,
                 car->_distFromStartLine, car->_distRaced, car->_speed_x, car->_pos_X, car->_pos_Y,
-                car->_lastLapTime, car->_steerCmd, car->_accelCmd, car->_brakeCmd);
+                car->_lastLapTime, car->_steerCmd, car->_accelCmd, car->_brakeCmd, car->_dammage, car->_collCount, off);
         if (car->_laps > laps || (car->_state & RM_CAR_STATE_NO_SIMU) || s->currentTime > 3600)
             break;
     }

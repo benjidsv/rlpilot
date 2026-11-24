@@ -8,7 +8,10 @@ Reward per step, split into components so each can be logged:
   is gained while all four wheels are off the road (no shortcuts across the grass).
 - damage:   -DAMAGE per point of damage taken.
 - control:  -lost_cost (default 0: off) each time the car loses control, by any of LOST_CAUSES: a new contact (damage
-  taken this step and not the last), starting to face backwards, or going more than FAR_OFF beyond the road's edge.
+  from hitting a wall this step and not the last), starting to face backwards, or going more than FAR_OFF beyond the
+  road's edge. Damage from the ground (bottoming out in a dip, a kerb, a landing: the engine's collision counter
+  doesn't move) isn't a loss of control but a *scrape*: the damage component still charges it, and the evaluation
+  counts it against a clean scenario (evaluate.py).
   Charged once, when the car enters the state, not for as long as it lasts: a long recovery mustn't cost more than
   giving up. A cause already true at the launch (a crashed start facing backwards) isn't charged. These are the
   evaluation's tests: a scenario that reached its distance but lost control is "recovered" (evaluate.py).
@@ -41,10 +44,11 @@ LOST_CAUSES = ("contact", "backwards", "far_off")
 FAILURES = ("no_progress", "damage", "race_over", "sim_error")  # reason codes 0.. of terminated episodes
 
 
-def lost_states(raw: np.ndarray, damage_taken: np.ndarray) -> np.ndarray:
-    """[len(LOST_CAUSES), n] bool: which loss-of-control states each car is in."""
+def lost_states(raw: np.ndarray, wall_hit: np.ndarray) -> np.ndarray:
+    """[len(LOST_CAUSES), n] bool: which loss-of-control states each car is in (wall_hit: damage from a wall this
+    step)."""
     hw = np.maximum(raw[:, F["track_width"]], 1.0) * 0.5
-    return np.stack([damage_taken, np.cos(raw[:, F["angle"]]) < 0, np.abs(raw[:, F["to_middle"]]) > hw + FAR_OFF])
+    return np.stack([wall_hit, np.cos(raw[:, F["angle"]]) < 0, np.abs(raw[:, F["to_middle"]]) > hw + FAR_OFF])
 
 
 class Reward:
@@ -64,8 +68,10 @@ class Reward:
         self.since_best = np.zeros(n, np.float64)  # s since `best` last improved
         self.prev_dist = np.zeros(n, np.float64)
         self.prev_damage = np.zeros(n, np.float64)
+        self.prev_coll = np.zeros(n, np.float64)
         self.d_damage = np.zeros(n, np.float64)    # damage taken this step
-        self.damage_taken = np.zeros(n, bool)      # this step
+        self.wall_hit = np.zeros(n, bool)          # this step: damage, and the engine counted a wall collision
+        self.ground_hit = np.zeros(n, bool)        # this step: damage without a wall collision (a scrape)
         self.lost = np.zeros((len(LOST_CAUSES), n), bool)   # loss-of-control states, this step
         self.onset = np.zeros((len(LOST_CAUSES), n), bool)  # entered this step
         self.components = np.zeros((len(COMPONENTS), n), np.float32)  # this step
@@ -74,6 +80,7 @@ class Reward:
         self.raced[idx] = self.peak[idx] = self.best[idx] = self.since_best[idx] = 0
         self.prev_dist[idx] = raw[idx, F["dist_raced"]]
         self.prev_damage[idx] = raw[idx, F["damage"]]
+        self.prev_coll[idx] = raw[idx, F["coll_count"]]
         self.lost[:, idx] = lost_states(raw[idx], np.zeros(len(idx), bool))  # the launch's states aren't onsets
         self.onset[:, idx] = False
 
@@ -91,12 +98,16 @@ class Reward:
         progress, d_damage = progress * on, d_damage * on
         self.prev_dist = np.where(on, dist, self.prev_dist)
         self.prev_damage = np.where(on, damage, self.prev_damage)
-        self.d_damage, self.damage_taken = d_damage, d_damage > 0
+        coll = raw[:, F["coll_count"]].astype(np.float64)
+        walled = (coll > self.prev_coll) & on
+        self.prev_coll = np.where(on, coll, self.prev_coll)
+        self.d_damage = d_damage
+        self.wall_hit, self.ground_hit = (d_damage > 0) & walled, (d_damage > 0) & ~walled
         self.raced += progress
         gained = np.maximum(self.raced - self.peak, 0)
         self.peak = np.maximum(self.peak, self.raced)
 
-        lost = np.where(on, lost_states(raw, self.damage_taken), self.lost)
+        lost = np.where(on, lost_states(raw, self.wall_hit), self.lost)
         self.onset = lost & ~self.lost & on
         self.lost = lost
 

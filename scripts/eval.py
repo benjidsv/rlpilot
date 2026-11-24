@@ -25,6 +25,7 @@ from train import Agent  # noqa: E402  (the policy is defined in the single-file
 
 def load_policy(path: Path):
     ckpt = torch.load(path, weights_only=False)
+    obs.configure(ckpt["args"].get("obs_height", "none"))  # the inputs it was trained with
     space = types.SimpleNamespace(single_observation_space=gym.spaces.Box(-np.inf, np.inf, (obs.DIM,), np.float32))
     agent = Agent(space, ckpt["args"]["hidden"], activation=ckpt["args"].get("activation", "tanh"),
                   learned_std=ckpt["args"].get("learned_std", False))

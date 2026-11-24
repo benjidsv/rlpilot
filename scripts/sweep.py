@@ -31,7 +31,7 @@ SEEDS = (1, 2, 3)
 BASE = {"lost-control-cost": 0.0, "best-only-progress": False, "terminal": 10.0, "gamma": 0.995,
         "progress-units": "metres", "lost-control-causes": ("contact", "backwards", "far_off"),
         "steer-noise-power": 0.0, "steer-noise-speed": 20.0, "steer-noise-floor": 0.1,
-        "learned-std": False}
+        "learned-std": False, "obs-height": "none"}
 
 VARIANTS = {
     # the reference, and the noise between seeds
@@ -67,6 +67,10 @@ VARIANTS = {
     # the learned std with progress in the bot's seconds: more reward pressure where the car is slow, where the learned
     # std stays high (no pressure on it there)
     "learnedstd-botsec": {"learned-std": True, "progress-units": "bot_seconds"},
+    # 2026-11-24: new names after the launch fix (speed along the road's slope) and wall-only contacts, so these runs
+    # never mix with the ones before: the new baseline (learned std), and the road's height in the observation
+    "fix-learnedstd": {"learned-std": True},
+    "fix-height-centre": {"learned-std": True, "obs-height": "centre"},
 }
 
 
