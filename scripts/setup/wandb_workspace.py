@@ -1,6 +1,6 @@
 """The W&B workspace views of project RLPilot, kept in code: run it again after editing to update them in place.
 
-    uv run python scripts/wandb_workspace.py            # creates or updates both views, prints their links
+    uv run python scripts/setup/wandb_workspace.py            # creates or updates both views, prints their links
 
 - "Compare setups": runs grouped by --exp-name (the seeds of one setup), each chart one metric as the mean over seeds
   with a min-max band, most telling first.

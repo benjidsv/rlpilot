@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build Speed Dreams on macOS (Apple Silicon, Homebrew), then the rlpilot native layer and Python env.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"  # the repo: this script is in scripts/setup/
 SD="$ROOT/speed-dreams-code"; DEPS="$ROOT/deps"; PREFIX="$ROOT/sd-install"
 
 brew install cmake sdl2 sdl2_mixer sdl2_ttf open-scene-graph openal-soft enet expat jpeg \

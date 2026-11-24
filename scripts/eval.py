@@ -4,7 +4,7 @@
     python scripts/eval.py runs/<run>/checkpoints/best.pt --splits test --test   # the final exam, once
 
 Writes the per-scenario results next to the checkpoint's run (runs/<run>/eval/<checkpoint>-<splits>.csv), and prints the
-metrics and a per-track table. Compare two result files with scripts/compare.py.
+metrics and a per-track table. Compare two result files with scripts/analysis/compare.py.
 """
 
 import argparse

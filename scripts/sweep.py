@@ -6,7 +6,7 @@ covers every variant. Resumable: a run whose final eval CSV exists is skipped, s
     caffeinate -i uv run python scripts/sweep.py                  # the whole sweep (~8.5 min per run)
     uv run python scripts/sweep.py --dry-run                      # list the runs and their commands
     caffeinate -i uv run python scripts/sweep.py --only base --seeds 1 --steps 10000000   # one 10M run
-    uv run python scripts/sweep_report.py [--steps 10000000]      # the results, per variant over seeds
+    uv run python scripts/analysis/sweep_report.py [--steps 10000000]      # the results, per variant over seeds
 
 Runs are runs/sw-<variant>__<seed>__<time>/ (3M) or runs/sw<N>m-<variant>__<seed>__<time>/; each run's output goes to
 runs/sweep/<prefix>-<variant>-s<seed>.log (3M: <variant>-s<seed>.log) and one line per finished run to

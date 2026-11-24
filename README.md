@@ -47,21 +47,21 @@ The Python package is about 1.2k lines. Design and decisions: [docs/v2.md](docs/
 
 ## Quick start
 
-Requires macOS 14.4+ on Apple Silicon with [Homebrew](https://brew.sh), or Linux (`build-linux.sh`), and
+Requires macOS 14.4+ on Apple Silicon with [Homebrew](https://brew.sh), or Linux (`./scripts/setup/build-linux.sh`), and
 [uv](https://docs.astral.sh/uv/).
 
 ```sh
 git clone --recurse-submodules -b v2 https://github.com/benjidsv/rlpilot.git
 cd rlpilot
-./build-macos.sh
+./scripts/setup/build-macos.sh
 
 # Initialize the game's settings dir once. The race name doesn't exist on purpose:
 # the game populates the dir, prints "No such race type" and exits.
 ./sd-install/games/speed-dreams-2 -lc "$PWD/sd-local/" -s init -x
 
 # Tracks and their bot references (41 tracks), then the tests and a run
-uv run python scripts/download_tracks.py --categories circuit road gprix
-uv run python scripts/setup_tracks.py
+uv run python scripts/setup/download_tracks.py --categories circuit road gprix
+uv run python scripts/setup/setup_tracks.py
 uv run pytest
 uv run wandb login   # once; metrics go to W&B, project RLPilot
 uv run python scripts/train.py --exp-name first --total-timesteps 50000000
@@ -72,7 +72,9 @@ uv run python scripts/train.py --exp-name first --total-timesteps 50000000
 | Path | What it is |
 |---|---|
 | `python/rlpilot/` | Env (`env.py`, `starts.py`, `controls.py`, `obs.py`, `reward.py`), tracks (`tracks.py`), scenario suite (`evaluate.py`), simulator client (`client.py`) |
-| `scripts/` | `train.py` (CleanRL PPO), `eval.py`, `compare.py`, split and suite generation, track setup |
+| `scripts/` | `train.py` (CleanRL PPO), `eval.py`, `sweep.py` (variants x seeds), `watch.py` (a checkpoint in the game, with live telemetry against the bot) |
+| `scripts/analysis/` | Reading results: `compare.py` (two evaluations), `sweep_report.py` (a sweep), `corner_map.py` (where policies lose control) |
+| `scripts/setup/` | Run once or rarely: the builds, track download and setup, the frozen split, suite and corner scenarios, the W&B views |
 | `data/` | Race configs, the frozen track split (`split-v2.json`) and scenario suite (`suite-v2.csv`) |
 | `native/` | C++ worker host, robot shim, shared-memory protocol, client library, C benchmark |
 | `speed-dreams-code/` | Submodule: [my fork](https://github.com/benjidsv/speed-dreams-code) of [Speed Dreams](https://forge.a-lec.org/speed-dreams/speed-dreams-code), upstream plus build fixes and launch hooks |

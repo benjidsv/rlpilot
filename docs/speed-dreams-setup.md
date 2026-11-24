@@ -13,13 +13,13 @@ rlpilot/
 ├── deps/                   plib (static), built from source; not in Homebrew
 ├── sd-install/             `cmake --install` prefix: binary, modules, data
 ├── sd-local/               game's user/settings dir, passed with `-lc`; downloads land here too
-└── build-macos.sh          full reproducible build: brew deps → plib → configure → build → install
+└── scripts/setup/build-macos.sh   full reproducible build: brew deps → plib → configure → build → install
 ```
 
 ## Build
 
 ```sh
-./build-macos.sh
+./scripts/setup/build-macos.sh
 ```
 
 Things that differ from the Linux README. The "(patch)" fixes are committed on the fork's `rlpilot` branch:
@@ -110,12 +110,12 @@ git push --force-with-lease
 git submodule update --init --recursive     # upstream may have moved the data/freesolid pins
 cd .. && git add speed-dreams-code && git commit -m "Rebase engine on upstream"
 ```
-Then rebuild with `./build-macos.sh`.
+Then rebuild with `./scripts/setup/build-macos.sh`.
 
 **Fresh clone.**
 ```sh
 git clone --recurse-submodules https://github.com/benjidsv/rlpilot.git
-cd rlpilot && ./build-macos.sh
+cd rlpilot && ./scripts/setup/build-macos.sh
 ```
 
 **After pulling `rlpilot` on another machine:** run `git submodule update --init --recursive`.

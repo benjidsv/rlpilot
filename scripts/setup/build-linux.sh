@@ -2,7 +2,7 @@
 # Build Speed Dreams on Debian/Ubuntu (also inside WSL2), then the rlpilot native layer and Python env.
 # In WSL2, keep the repo on the Linux filesystem (~/...), not under /mnt/c.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"  # the repo: this script is in scripts/setup/
 SD="$ROOT/speed-dreams-code"; PREFIX="$ROOT/sd-install"
 
 sudo apt-get update

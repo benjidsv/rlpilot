@@ -5,7 +5,7 @@ from pathlib import Path
 from conftest import scripted
 from rlpilot import evaluate
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "analysis"))
 from compare import sign_test  # noqa: E402
 
 

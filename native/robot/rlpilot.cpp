@@ -2,7 +2,7 @@
 // dlsym) so that the agent's state survives the dlclose/reload done on every race restart.
 // When loaded by the regular game (no host), it drives a simple centreline follower instead, which
 // keeps the module usable in rendered runs and as a smoke test. With RLP_REPLAY=<path> it replays the
-// controls recorded by a worker (scripts/record_lap.py), tick by tick, and logs its position against
+// controls recorded by a worker (scripts/watch.py), tick by tick, and logs its position against
 // the recording to <path>.check.csv: the engine is deterministic, so the two should match. With RLP_REPLAY_BOT=<path>
 // (float32: the bot's lap time, then its time from the start line at each metre of the lap) the HUD's delta and best lap
 // are the bot's: the robot writes them into the car's best-lap fields on every tick (no physics reads them).

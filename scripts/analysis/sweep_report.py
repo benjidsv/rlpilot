@@ -1,7 +1,7 @@
 """Results of the reward sweep (scripts/sweep.py): each variant's metrics over its seeds, and its difference from `base`
 measured against the noise between seeds.
 
-    uv run python scripts/sweep_report.py [--steps 10000000] [--split train] [--base learnedstd] [--tsv report.tsv]
+    uv run python scripts/analysis/sweep_report.py [--steps 10000000] [--split train] [--base learnedstd] [--tsv report.tsv]
 
 How to read it: one run's result moves a lot from seed to seed (the overnight 3M sweep, 14 variants x 3 seeds: sd 0.055
 in validation nominal survival, 0.11 in crashed completion, 0.027 in pace). A scenario-by-scenario sign test between two
@@ -20,12 +20,15 @@ rather than more caution. Without two reward-only variants at these steps, the c
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 
-from sweep import SEEDS, STEPS, VARIANTS, finished
 from rlpilot.evaluate import read_results, summarize
+
+sys.path.insert(0, str(Path(__file__).parents[1]))  # scripts/: sweep.py
+from sweep import SEEDS, STEPS, VARIANTS, finished  # noqa: E402
 
 METRICS = [  # (column, summarize key with {s} = split)
     ("nominal surv", "{s}/nominal/survival"),

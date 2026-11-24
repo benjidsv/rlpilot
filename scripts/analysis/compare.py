@@ -1,6 +1,6 @@
 """Paired comparison of two evaluations on the same scenario suite (CSV files written by training or scripts/eval.py).
 
-    python scripts/compare.py runs/A/eval/0050003968.csv runs/B/eval/0050003968.csv [--tracks]
+    python scripts/analysis/compare.py runs/A/eval/0050003968.csv runs/B/eval/0050003968.csv [--tracks]
 
 Both played exactly the same scenarios, so instead of comparing two averages, it counts the scenarios one passes and
 the other fails. Pass = survived (clean or survived) for every tier except crashed, where it is completed (anything but
@@ -10,7 +10,7 @@ guide; --tracks shows whether a difference is spread out or comes from one track
 
 It compares two *policies*, not two setups: two seeds of the same setup already differ (in the 3M reward sweep, p < 0.05
 in 11 of 42 same-setup pairs on validation, 18 of 42 on train). To say a change is better, run 3 seeds of each and read
-scripts/sweep_report.py, which measures the difference against the noise between seeds.
+scripts/analysis/sweep_report.py, which measures the difference against the noise between seeds.
 """
 
 import argparse

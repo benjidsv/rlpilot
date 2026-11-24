@@ -1,4 +1,4 @@
-# Out-of-tree build of the rlpilot native pieces against an installed Speed Dreams (./build-macos.sh, ./build-linux.sh).
+# Out-of-tree build of the rlpilot native pieces against an installed Speed Dreams (./scripts/setup/build-macos.sh, ./scripts/setup/build-linux.sh).
 #   cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release && cmake --build native/build -j && cmake --install native/build
 cmake_minimum_required(VERSION 3.20)
 project(rlpilot C CXX)

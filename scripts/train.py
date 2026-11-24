@@ -312,7 +312,7 @@ def steer_noise_scale(norm, x, args):
 
 
 # rlpilot: the metrics are logged to W&B in numbered sections: 2_ppo (health), 3_eval (every tier of both splits),
-# 4_driving (training episodes), 5_perf. The workspace's charts are laid out by scripts/wandb_workspace.py.
+# 4_driving (training episodes), 5_perf. The workspace's charts are laid out by scripts/setup/wandb_workspace.py.
 
 
 def run_eval(

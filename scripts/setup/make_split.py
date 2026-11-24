@@ -1,6 +1,6 @@
 """Draw the v2 track split once and write data/split-v2.json. Don't redraw: the test tracks must stay unseen.
 
-    python scripts/make_split.py [--force]
+    python scripts/setup/make_split.py [--force]
 
 Test: the Nordschleife (21 km, very varied; driving it never seen is the headline goal) + one short circuit + one short
 road track, so that the test isn't decided by one track's character. Validation (selects checkpoints, guides the work):

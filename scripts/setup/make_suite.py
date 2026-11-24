@@ -1,7 +1,7 @@
 """Generate the evaluation scenario suite once and write data/suite-v2.csv. Commit it; don't regenerate it after any
 result has been compared with it (scenario ids would change meaning).
 
-    python scripts/make_suite.py [--force]
+    python scripts/setup/make_suite.py [--force]
 
 Start points along each track, every SPACING[split] m from 100 m after the start line, and one scenario per tier at
 each (see rlpilot.starts): nominal, mild, perturbed, disturbed, crashed. Each scenario is drawn from its own seed (suite

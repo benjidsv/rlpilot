@@ -1,7 +1,7 @@
 """The corners of the validation and train tracks (data/corners-v2.csv, see rlpilot.corners) and scenarios aimed at
-them (data/corner-suite-v2.csv), for the failure map (scripts/corner_map.py).
+them (data/corner-suite-v2.csv), for the failure map (scripts/analysis/corner_map.py).
 
-    python scripts/make_corners.py [--force]
+    python scripts/setup/make_corners.py [--force]
 
 The suite's start points (every 200 m on validation, 600 m on train) reach corners unevenly: some get several
 scenarios per tier, some none, and on train tracks a corner is in ~1-2 per tier. Here every corner gets the same: a

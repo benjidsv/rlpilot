@@ -1,7 +1,7 @@
 """Download tracks from the Speed Dreams asset index into sd-local/tracks, like the in-game download manager
 (same index, sha256 check, layout tracks/<category>/<directory>/ with a .revision file).
 
-    python scripts/download_tracks.py --categories circuit road [--dry-run]
+    python scripts/setup/download_tracks.py --categories circuit road [--dry-run]
 
 One track at a time (download, verify, extract, delete the archive), so the extra disk space is one archive.
 Tracks already installed at the same revision are skipped.
@@ -17,7 +17,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]  # the repo: this script is in scripts/setup/
 TRACKS = ROOT / "sd-local" / "tracks"
 INDEX = "https://www.speed-dreams.net/assets.json"
 

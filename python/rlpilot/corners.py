@@ -1,6 +1,6 @@
 """Corners of a track, found from the road's curvature, with features from the track table: shape, the bot's speed
 through it (braking zone or flat out), elevation, banking, runoff, and the corner before it. Used by the failure map
-(scripts/corner_map.py) and the corner scenarios (scripts/make_corners.py).
+(scripts/analysis/corner_map.py) and the corner scenarios (scripts/setup/make_corners.py).
 
 A corner is a stretch where the centreline's curvature (smoothed over ~SMOOTH m) stays above 1 / MAX_RADIUS on one
 side, turning at least MIN_TURN in total. Stretches of the same direction closer than MERGE_GAP are one corner; a change

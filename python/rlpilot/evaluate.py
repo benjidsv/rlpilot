@@ -1,8 +1,8 @@
-"""Evaluation on the fixed scenario suite (data/suite-v2.csv, see scripts/make_suite.py), and grid laps.
+"""Evaluation on the fixed scenario suite (data/suite-v2.csv, see scripts/setup/make_suite.py), and grid laps.
 
 A scenario is a start (track, place, tier, offsets, kick) and a task: drive SCENARIO_DISTANCE along the track. Every
 checkpoint of every run plays exactly the same list, so results are reproducible and two runs can be compared scenario
-by scenario (scripts/compare.py). Each scenario is a fresh race, so its result doesn't depend on the worker layout
+by scenario (scripts/analysis/compare.py). Each scenario is a fresh race, so its result doesn't depend on the worker layout
 (checked: 48 and 64 workers give the same CSV).
 
 Outcome of a scenario, best first:

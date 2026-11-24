@@ -1,7 +1,7 @@
-"""The failure map: where policies lose control, by corner (data/corners-v2.csv, made by scripts/make_corners.py).
+"""The failure map: where policies lose control, by corner (data/corners-v2.csv, made by scripts/setup/make_corners.py).
 
-    uv run python scripts/corner_map.py run      # play the policies below on the suite + the corner scenarios
-    uv run python scripts/corner_map.py report   # the map, from runs/corner-map/*.csv
+    uv run python scripts/analysis/corner_map.py run      # play the policies below on the suite + the corner scenarios
+    uv run python scripts/analysis/corner_map.py report   # the map, from runs/corner-map/*.csv
 
 `run` plays each policy's final checkpoint on the validation + train suite and on data/corner-suite-v2.csv (one
 Suite, workers kept up between policies) and writes runs/corner-map/<run>.csv. Test tracks are never played.
@@ -19,7 +19,7 @@ from rlpilot import evaluate
 from rlpilot.client import DATA
 from rlpilot.tracks import Track
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1]))  # scripts/: eval.py
 from eval import load_policy  # noqa: E402
 
 OUT = Path("runs/corner-map")

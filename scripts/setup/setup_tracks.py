@@ -1,6 +1,6 @@
 """Create race configs for every installed track and run the built-in bot reference on each.
 
-    python scripts/setup_tracks.py [--categories circuit road gprix] [--jobs 5]
+    python scripts/setup/setup_tracks.py [--categories circuit road gprix] [--jobs 5]
 
 For track t in sd-local/tracks/<category>/<t>/: data/raceman/rlpilot-<t>.xml (the agent) and rlref-<t>.xml (the
 bot), copies of rlpilot.xml / rlref.xml with only the track changed. Then reference.load() runs the bot for

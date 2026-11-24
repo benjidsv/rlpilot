@@ -61,7 +61,7 @@ def all_tracks() -> list[str]:
 
 
 def load_split() -> dict[str, list[str]]:
-    """{"train": [...], "validation": [...], "test": [...]}, drawn once by scripts/make_split.py."""
+    """{"train": [...], "validation": [...], "test": [...]}, drawn once by scripts/setup/make_split.py."""
     return json.loads(SPLIT_FILE.read_text())["tracks"]
 
 
