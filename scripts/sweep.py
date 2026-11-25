@@ -38,7 +38,9 @@ SEEDS = (1, 2, 3)
 BASE = {"lost-control-cost": 0.0, "best-only-progress": False, "terminal": 10.0, "gamma": 0.995,
         "progress-units": "metres", "lost-control-causes": ("contact", "backwards", "far_off"),
         "steer-noise-power": 0.0, "steer-noise-speed": 20.0, "steer-noise-floor": 0.1,
-        "learned-std": False, "obs-height": "none", "gearbox": "manual"}
+        "learned-std": False, "obs-height": "none", "gearbox": "manual", "gae-lambda": 0.95,
+        "fixed-gear-inputs": False, "pedal-std-floor": 0.0, "noise-beta": 0.0, "noise-dims": ("pedal",),
+        "wall-cost": 0.0, "offroad-cost": 0.0, "width-bonus": 0.0, "width-fade": 0, "auto-upshift": 0.92}
 
 VARIANTS = {
     # the reference, and the noise between seeds
@@ -84,6 +86,55 @@ VARIANTS = {
     # 2026-11-24 restart (old runs deleted): train.py's defaults, measured with the lean eval (nominal + crashed + a
     # capped grid lap per track) and the sim-clock pace. Every later variant is compared with this
     "baseline": {"learned-std": True},
+    # 2026-11-24 speed round, each lever alone on top of baseline (the car won't accelerate into high speed)
+    # GAE lambda 0.95 credits ~0.76 s ahead, 0.98 ~1.6 s: braking and the gain from accelerating play out over seconds
+    "lambda98": {"learned-std": True, "gae-lambda": 0.98},
+    # the gear one-hots and the shift cooldown skip the input normalization (a rare gear read +7 sd when it engaged)
+    "gearfixed": {"learned-std": True, "fixed-gear-inputs": True},
+    # the pedal's learned std never below 0.1 (it collapsed to ~0.05 at speed; pace followed how fast it did)
+    "pedalfloor": {"learned-std": True, "pedal-std-floor": 0.1},
+    # colored pedal noise, beta 0.5 (Hollenstein et al. 2024): a 1 s average of the noise is 2x white noise's
+    "colored": {"learned-std": True, "noise-beta": 0.5, "noise-dims": ("pedal",)},
+    # a wall costs speed^2 (Fuchs et al. 2021): 1 per step of wall damage at 40 m/s = 10 m of progress
+    "wallcost": {"learned-std": True, "wall-cost": 1.0},
+    # follow-ups, picked from the seed-1 results: stronger / broader colored noise, a higher pedal floor, the wall
+    # cost halved or doubled
+    "colored-pink": {"learned-std": True, "noise-beta": 1.0, "noise-dims": ("pedal",)},
+    "colored-both": {"learned-std": True, "noise-beta": 0.5, "noise-dims": ("steer", "pedal")},
+    "pedalfloor02": {"learned-std": True, "pedal-std-floor": 0.2},
+    "wallcost05": {"learned-std": True, "wall-cost": 0.5},
+    "wallcost2": {"learned-std": True, "wall-cost": 2.0},
+    # 2026-11-24 combination (user's pick): the rpm gearbox (the policies' shift habits govern speed; correct upshifts
+    # alone are worth ~0-0.025 pace), colored pedal noise (flat out, bot-like braking), the wall cost (walls ~free)
+    # colored-both weaves on straights (steer sd 2x, lateral sd 1.0 vs 0.45 m) but is the best in corners: its
+    # correlated steering noise faded with speed, std x min(1, 30 / v): full below 108 km/h, half at 216
+    "colored-both-fade": {"learned-std": True, "noise-beta": 0.5, "noise-dims": ("steer", "pedal"),
+                          "steer-noise-power": 1.0, "steer-noise-speed": 30.0},
+    # the rpm gearbox + colored pedal noise: autoshift alone moved the speed governor to the pedal (lifting), colored
+    # noise is what stopped the lifting
+    "auto-colored": {"learned-std": True, "gearbox": "auto", "noise-beta": 0.5, "noise-dims": ("pedal",)},
+    # colored pedal noise that can't collapse either: colored kept its pedal std ~0.19 by itself, floor 0.2 alone was
+    # the safest arm (crashed completion +0.15) without colored's driving
+    "colored-floor02": {"learned-std": True, "noise-beta": 0.5, "noise-dims": ("pedal",), "pedal-std-floor": 0.2},
+    # 2026-11-25: sw30m-colored-floor02 s1 was ahead of every 10M arm already at its 10M checkpoint, where its
+    # learning rate was still 2/3 of the start. Two 10M tests: the floor on top of colored (colored-floor02 at 10M),
+    # and the 30M run's schedule cut at 10M (seed 1 = that run's first 10M: the learning rate stays above 2e-4)
+    "colored-floor02-a30": {"learned-std": True, "noise-beta": 0.5, "noise-dims": ("pedal",), "pedal-std-floor": 0.2,
+                            "anneal-timesteps": 30_000_000},
+    # more pressure (user's pick): the auto gearbox + colored + floor, walls cost speed^2, and each metre driven with
+    # four wheels off costs 0.01 per metre beyond the edge (Spa's runoffs; reward.py "offroad")
+    "auto-colored-pressure": {"learned-std": True, "gearbox": "auto", "noise-beta": 0.5, "noise-dims": ("pedal",),
+                              "pedal-std-floor": 0.2, "wall-cost": 1.0, "offroad-cost": 0.01},
+    # 2026-11-25: every policy enters corners from the middle; a bonus for using the width, fading out at mid-run
+    # (meant for 30M: --width-fade 15M). And the auto box's upshift at 0.995 of the redline instead of 0.92
+    "auto-colored-pressure-width": {"learned-std": True, "gearbox": "auto", "noise-beta": 0.5, "noise-dims": ("pedal",),
+                                    "pedal-std-floor": 0.2, "wall-cost": 1.0, "offroad-cost": 0.01,
+                                    "width-bonus": 0.004, "width-fade": 15_000_000},
+    "auto-colored-pressure-up995": {"learned-std": True, "gearbox": "auto", "noise-beta": 0.5, "noise-dims": ("pedal",),
+                                    "pedal-std-floor": 0.2, "wall-cost": 1.0, "offroad-cost": 0.01,
+                                    "auto-upshift": 0.995},
+    "auto-colored-wall": {"learned-std": True, "gearbox": "auto", "noise-beta": 0.5, "noise-dims": ("pedal",),
+                          "wall-cost": 1.0},
 }
 
 
@@ -93,10 +144,13 @@ def prefix(steps: int) -> str:
 
 def command(variant: str, seed: int, steps: int) -> list[str]:
     cmd = [sys.executable, "scripts/train.py", "--exp-name", f"{prefix(steps)}-{variant}", "--seed", str(seed),
-           "--total-timesteps", str(steps), "--anneal-timesteps", str(max(ANNEAL, steps))]
+           "--total-timesteps", str(steps),
+           "--anneal-timesteps", str(VARIANTS[variant].get("anneal-timesteps", max(ANNEAL, steps)))]
     if steps > STEPS:
         cmd += ["--eval-every", str(LONG_EVAL_EVERY)]
     for k, v in (BASE | VARIANTS[variant]).items():
+        if k == "anneal-timesteps":  # a variant's own learning-rate schedule, set above
+            continue
         if isinstance(v, bool):
             cmd.append(f"--{k}" if v else f"--no-{k}")
         elif isinstance(v, tuple):

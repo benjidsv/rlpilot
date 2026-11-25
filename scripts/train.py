@@ -132,6 +132,42 @@ class Args:
     [exp(LOGSTD_MIN), exp(LOGSTD_MAX)]) instead of one learned number for every state (CleanRL, --no-learned-std).
     Starts at 1, like it. The steering round (3 seeds x 10M, docs/v2.md): it learns ~0.65 below 20 m/s and ~0.05
     above 40, with better nominal driving than one std"""
+    fixed_gear_inputs: bool = False
+    """the gear one-hots and the shift cooldown skip the running input normalization (obs.FIXED): with it, a gear the
+    car rarely uses reads +7 sd or more when it engages (2026-11-24 speed round, arm A)"""
+    pedal_std_floor: float = 0.0
+    """the pedal's std never goes below this (learned std: the squashing's lower end, per dimension; it still starts at
+    1). 0 = off (the steer and pedal floor is exp(LOGSTD_MIN) = 0.03). The pedal std at speed collapses to ~0.05, and
+    past seeds' pace was ordered by how fast it did (2026-11-24 speed round, arm B)"""
+    noise_beta: float = 0.0
+    """colored exploration noise (Hollenstein et al., AAAI 2024): the Gaussian's standard normal draws z for
+    `noise_dims` come from a per-env sequence with power spectrum 1 / f^beta, fresh at each episode, instead of white
+    noise. Each step is still N(mean, std), so the log-probability is unchanged. 0 = off (white, as CleanRL); 1 = pink;
+    the paper's best for PPO is 0.5. White noise at 25 Hz averages out within a second, so it barely tries "faster on
+    this straight" (2026-11-24 speed round, arm C)"""
+    noise_dims: tuple[str, ...] = ("pedal",)
+    """which actions get the colored noise (steer, pedal): correlated steering noise drifts the car off the road at speed"""
+    offroad_cost: float = 0.0
+    """reward lost per metre driven and per metre beyond the road's edge, while all four wheels are off (progress
+    already pays nothing there): 0.01 = a metre driven 10 m off (the cap) costs a metre of progress (reward.py)"""
+    width_bonus: float = 0.0
+    """reward per metre of progress at the road's edge, x |offset| / half width: a bonus for using the road's width
+    (every policy so far enters corners from the middle). 0.004 = progress at the edge pays 4% more. 0 = off (reward.py)"""
+    width_fade: int = 0
+    """steps over which width_bonus fades linearly to 0 (0 = it doesn't fade): the bonus gets the car to wide lines,
+    then the true reward decides whether it keeps them"""
+    line_bonus: float = 0.0
+    """reward per metre of progress on the bot's line, x closeness to it (1 on it, 0 a half width away): a curriculum
+    towards the whole racing line (wide entry, apex, run-out on the exit). Training only: never an input. 0 = off"""
+    line_fade: int = 0
+    """steps over which line_bonus fades linearly to 0 (0 = it doesn't fade)"""
+    auto_upshift: float = 0.92
+    """with --gearbox auto, the upshift point, as a share of the redline (controls.configure). The gears are tall:
+    0.995 is ~2% faster at the end of the long straights than 0.92 (2026-11-25)"""
+    wall_cost: float = 0.0
+    """reward lost per step of wall damage, at 40 m/s: scales with the speed squared (Fuchs et al. 2021: -c |v|^2 in
+    wall contact; without it their car grinded along the walls, a fixed cost made it freeze). 1 = 10 m of progress
+    at 40 m/s, 2.5 m at 20. 0 = off (reward.py)"""
     eval_every: int = 10_000_000
     """steps between two evaluations: the scenario suite's eval_tiers and 1 grid lap per track (capped at
     evaluate.LAP_CAP), validation and training tracks. The last one plays the whole suite and 2 full laps too"""
@@ -204,6 +240,10 @@ def make_env(
         terminal=args.terminal,
         lost_causes=tuple(args.lost_control_causes),
         progress_units=args.progress_units,
+        wall_cost=args.wall_cost,  # rlpilot
+        offroad_cost=args.offroad_cost,  # rlpilot
+        width_bonus=args.width_bonus,  # rlpilot
+        line_bonus=args.line_bonus,  # rlpilot
     )
     env = norm = NormalizeObservation(
         env, fixed=observation.FIXED
@@ -227,13 +267,19 @@ LOGSTD_MIN, LOGSTD_MAX = -3.5, 0.5  # rlpilot: a learned std stays in [0.03, 1.6
 LOGSTD_BIAS = float(np.log(-LOGSTD_MIN / LOGSTD_MAX))  # rlpilot: sigmoid(bias) = 3.5 / 4, so the std starts at 1
 
 
+def logstd_min(pedal_std_floor=0.0):
+    """rlpilot: [steer, pedal] lower ends of the learned log std (Args.pedal_std_floor raises the pedal's)"""
+    return np.array([LOGSTD_MIN, max(LOGSTD_MIN, float(np.log(pedal_std_floor)) if pedal_std_floor > 0 else LOGSTD_MIN)])
+
+
 class Agent(nn.Module):
     # rlpilot: a hybrid policy. Actions are [steer, pedal, shift]: a Gaussian over steer and pedal (as in CleanRL) and a
     # categorical over the shift (down / hold / up), from the same actor body. The log-probability of an action is the
     # sum of the two, and so is the entropy.
     def __init__(
-        self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2), learned_std=False
-    ):  # rlpilot: activation, first_gain and learned_std are our arguments (see Args)
+        self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2), learned_std=False,
+        pedal_std_floor=0.0,
+    ):  # rlpilot: activation, first_gain, learned_std and pedal_std_floor are our arguments (see Args)
         super().__init__()
         n_obs = np.array(envs.single_observation_space.shape).prod()
         act = {"tanh": nn.Tanh, "relu": nn.ReLU}[activation]
@@ -262,13 +308,18 @@ class Agent(nn.Module):
         with torch.no_grad():
             self.shift_logits.bias[1] = hold_bias
         self.learned_std = learned_std  # rlpilot: a per-state std (Args.learned_std), created last: off = as before
+        self.logstd_min = torch.tensor(logstd_min(pedal_std_floor), dtype=torch.float32)  # rlpilot: not a parameter
         if learned_std:
             self.logstd_head = layer_init(nn.Linear(hidden, 2), std=0.01, bias_const=LOGSTD_BIAS)
+            if pedal_std_floor > 0:  # rlpilot: a higher lower end for the pedal, its bias moved so its std still starts at 1
+                lo = float(self.logstd_min[1])
+                with torch.no_grad():
+                    self.logstd_head.bias[1] = float(np.log(-lo / LOGSTD_MAX))
 
     def get_value(self, x):
         return self.critic(x)
 
-    def get_action_and_value(self, x, action=None, steer_scale=None, shift_mask=None):
+    def get_action_and_value(self, x, action=None, steer_scale=None, shift_mask=None, noise=None):
         # rlpilot: steer_scale [n] multiplies the steering's std (steer_noise_scale); the update must pass the same
         # scale the rollout sampled with, so it is stored with the actions. shift_mask [n] (0 / 1): whether the shift
         # choice was used (--gearbox auto ignores it while moving): an unused choice adds nothing to the log-probability
@@ -276,9 +327,15 @@ class Agent(nn.Module):
         h = self.actor_body(x)
         action_mean = self.actor_mean(h)
         if self.learned_std:  # rlpilot: squashed into [LOGSTD_MIN, LOGSTD_MAX], so no state's noise can vanish
-            action_logstd = LOGSTD_MIN + (LOGSTD_MAX - LOGSTD_MIN) * torch.sigmoid(self.logstd_head(h))
+            if self.logstd_min[1] > LOGSTD_MIN:  # rlpilot: --pedal-std-floor
+                lo = self.logstd_min.to(h.device)
+                action_logstd = lo + (LOGSTD_MAX - lo) * torch.sigmoid(self.logstd_head(h))
+            else:
+                action_logstd = LOGSTD_MIN + (LOGSTD_MAX - LOGSTD_MIN) * torch.sigmoid(self.logstd_head(h))
         else:
             action_logstd = self.actor_logstd.expand_as(action_mean)
+            if self.logstd_min[1] > LOGSTD_MIN:  # rlpilot: --pedal-std-floor without a learned std: a clamp
+                action_logstd = torch.maximum(action_logstd, self.logstd_min.to(h.device))
         action_std = torch.exp(action_logstd)
         if steer_scale is not None:  # rlpilot
             action_std = action_std * torch.stack([steer_scale, torch.ones_like(steer_scale)], 1)
@@ -286,7 +343,10 @@ class Agent(nn.Module):
         probs = Normal(action_mean, action_std)
         shift = Categorical(logits=self.shift_logits(h))
         if action is None:
-            action = torch.cat([probs.sample(), shift.sample()[:, None].float()], 1)
+            if noise is None:
+                action = torch.cat([probs.sample(), shift.sample()[:, None].float()], 1)
+            else:  # rlpilot: colored noise, noise [n, 2] standard normal draws (ColoredNoise)
+                action = torch.cat([action_mean + action_std * noise, shift.sample()[:, None].float()], 1)
         mask = 1.0 if shift_mask is None else shift_mask  # rlpilot
         logprob = probs.log_prob(action[:, :2]).sum(1) + shift.log_prob(
             action[:, 2].long()
@@ -305,6 +365,57 @@ class Agent(nn.Module):
 
 
 SPEED = observation.NAMES.index("speed_x / 50")  # rlpilot
+
+
+def powerlaw_noise(beta, n, size, rng):
+    """rlpilot: [size, n] Gaussian sequences with power spectrum 1 / f^beta along the last axis, unit variance
+    (Timmer & Koenig 1995, as in the colorednoise package that Hollenstein et al. use). beta 0 = white."""
+    f = np.fft.rfftfreq(n)
+    f[0] = 1.0 / n  # the lowest frequency stands in for f = 0 (no infinite power)
+    scale = f ** (-beta / 2.0)
+    w = scale[1:].copy()
+    w[-1] *= (1 + (n % 2)) / 2.0
+    sigma = 2 * np.sqrt(np.sum(w**2)) / n  # the sequences' theoretical std
+    sr, si = rng.normal(size=(size, len(f))) * scale, rng.normal(size=(size, len(f))) * scale
+    if n % 2 == 0:  # the Nyquist component is real
+        si[:, -1] = 0
+        sr[:, -1] *= np.sqrt(2)
+    si[:, 0] = 0  # so is the mean
+    sr[:, 0] *= np.sqrt(2)
+    return np.fft.irfft(sr + 1j * si, n=n, axis=-1) / sigma
+
+
+class ColoredNoise:
+    """rlpilot: per-env standard normal draws for [steer, pedal] (Args.noise_beta): colored along time for the
+    dimensions in `dims`, white for the others. Each env reads its own sequence, a fresh one at the start of each
+    episode (and when it runs out). Its own generator, so the policy's torch draws don't change."""
+
+    LENGTH = 1024  # steps per sequence: ~43 s, longer than a 30 s training episode
+
+    def __init__(self, n_envs, beta, dims, seed):
+        self.n, self.beta = n_envs, beta
+        if set(dims) - {"steer", "pedal"}:
+            raise ValueError(f"noise_dims: steer and/or pedal, not {dims}")
+        self.colored = np.array([d in dims for d in ("steer", "pedal")])
+        self.rng = np.random.default_rng(seed)
+        self.seq = np.zeros((n_envs, 2, self.LENGTH))
+        self.pos = np.zeros(n_envs, np.int64)
+        self.refresh(np.arange(n_envs))
+
+    def refresh(self, envs):
+        if len(envs) == 0:
+            return
+        self.seq[envs] = self.rng.normal(size=(len(envs), 2, self.LENGTH))
+        for d in np.flatnonzero(self.colored):
+            self.seq[envs, d] = powerlaw_noise(self.beta, self.LENGTH, len(envs), self.rng)
+        self.pos[envs] = 0
+
+    def draw(self):
+        """[n, 2] this step's draws (call once per step)"""
+        self.refresh(np.flatnonzero(self.pos >= self.LENGTH))
+        z = self.seq[np.arange(self.n), :, self.pos]
+        self.pos += 1
+        return z
 
 
 def car_speed(norm, x):
@@ -396,8 +507,8 @@ def run_eval(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    observation.configure(args.obs_height)  # rlpilot: before any env or policy is made
-    controls.configure(args.gearbox)  # rlpilot
+    observation.configure(args.obs_height, args.fixed_gear_inputs)  # rlpilot: before any env or policy is made
+    controls.configure(args.gearbox, args.auto_upshift)  # rlpilot
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
@@ -428,7 +539,8 @@ if __name__ == "__main__":
     # env setup
     envs, norm = make_env(args)  # rlpilot
 
-    agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain, args.learned_std).to(
+    agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain, args.learned_std,
+                  args.pedal_std_floor).to(
         device
     )  # rlpilot: hidden width, hold bias
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -456,6 +568,8 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
+    colored = ColoredNoise(args.num_envs, args.noise_beta, args.noise_dims, args.seed) if args.noise_beta > 0 \
+        else None  # rlpilot: off = probs.sample(), as CleanRL
     torch.set_num_threads(args.rollout_threads)  # rlpilot
     next_eval, best = args.eval_every, -1.0  # rlpilot
     suite = evaluate.Suite(
@@ -473,6 +587,12 @@ if __name__ == "__main__":
             )  # rlpilot: was / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
+        if args.width_fade > 0:  # rlpilot: --width-fade, set before the rollout (the env computes the reward)
+            norm.env.reward.width_bonus = args.width_bonus * max(0.0, 1.0 - (iteration - 1) * args.batch_size
+                                                                 / args.width_fade)
+        if args.line_fade > 0:  # rlpilot: --line-fade, the same way
+            norm.env.reward.line_bonus = args.line_bonus * max(0.0, 1.0 - (iteration - 1) * args.batch_size
+                                                               / args.line_fade)
 
         ended = []  # rlpilot: statistics of the episodes that ended during this rollout
         logs = {}  # rlpilot: this iteration's metrics, one wandb.log at its end
@@ -485,8 +605,10 @@ if __name__ == "__main__":
             with torch.no_grad():
                 steer_scales[step] = steer_noise_scale(norm, next_obs, args)  # rlpilot
                 shift_masks[step] = shift_mask(norm, next_obs)  # rlpilot
+                noise = None if colored is None else torch.as_tensor(colored.draw(), dtype=torch.float32,
+                                                                     device=device)  # rlpilot
                 action, logprob, _, value = agent.get_action_and_value(next_obs, steer_scale=steer_scales[step],
-                                                                       shift_mask=shift_masks[step])
+                                                                       shift_mask=shift_masks[step], noise=noise)
                 values[step] = value.flatten()
                 stds[step], speeds[step] = agent.last_std, car_speed(norm, next_obs)  # rlpilot
                 means[step] = agent.last_mean  # rlpilot
@@ -498,6 +620,8 @@ if __name__ == "__main__":
                 action.cpu().numpy()
             )
             next_done = np.logical_or(terminations, truncations)
+            if colored is not None:  # rlpilot: a fresh noise sequence for each new episode
+                colored.refresh(np.flatnonzero(next_done))
             # rlpilot: a time-limit cut isn't the end of the task: bootstrap from the value of the state it cut at.
             # CleanRL treats it like a crash (done = terminated | truncated, no value after it). infos["final_obs"]
             # is the last observation (the returned one is already the next episode's first).
@@ -536,6 +660,10 @@ if __name__ == "__main__":
                 "reward_damage",
                 "reward_control",
                 "reward_terminal",
+                "reward_wall",
+                "reward_offroad",
+                "reward_width",
+                "reward_line",
                 "lost_contact",
                 "lost_backwards",
                 "lost_far_off",
@@ -673,6 +801,8 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         # rlpilot: grouped under 2_ppo and 5_perf, logged to W&B; old_approx_kl dropped
         logs["2_ppo/learning_rate"] = optimizer.param_groups[0]["lr"]
+        logs["2_ppo/width_bonus"] = norm.env.reward.width_bonus  # rlpilot
+        logs["2_ppo/line_bonus"] = norm.env.reward.line_bonus  # rlpilot
         logs["2_ppo/value_loss"] = v_loss.item()
         logs["2_ppo/policy_loss"] = pg_loss.item()
         logs["2_ppo/entropy"] = entropy_loss.item()

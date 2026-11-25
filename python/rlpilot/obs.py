@@ -22,7 +22,10 @@ against the road's height at the car, in m / 10. "centre": the centreline's (21 
 harder, and the policy can't see slopes otherwise. Off by default.
 
 FIXED marks inputs already at a fixed scale, which the trainer's running normalization must skip (it would blow up
-the noise of near-constant inputs). None for now.
+the noise of near-constant inputs). Off by default. `configure(fixed_gears=True)` (train.py --fixed-gear-inputs, the
+mask is saved in checkpoints as `obs_fixed`): the gear one-hots and the shift cooldown pass through as 0 / 1. Under the
+running normalization a gear the car rarely uses reads as a huge input when it engages (2026-11-24, baseline s1 at 10M:
+5th +7.2 sd, 6th +7.7, R +13.3 and clipped to 10, against +0.6 for 3rd): a jump at the very upshifts the car avoids.
 """
 
 from __future__ import annotations
@@ -50,8 +53,9 @@ HEIGHT = "none"
 NAMES, DIM, FIXED = _BASE_NAMES, len(_BASE_NAMES), np.zeros(len(_BASE_NAMES), bool)
 
 
-def configure(height: str = "none") -> None:
-    """Set the optional inputs (before making envs or a policy): NAMES, DIM and FIXED follow."""
+def configure(height: str = "none", fixed_gears: bool = False) -> None:
+    """Set the optional inputs (before making envs or a policy): NAMES, DIM and FIXED follow. fixed_gears: the gear
+    one-hots and the shift cooldown skip the running normalization."""
     global HEIGHT, NAMES, DIM, FIXED
     if height not in HEIGHTS:
         raise ValueError(f"height: one of {HEIGHTS}, not {height!r}")
@@ -59,7 +63,7 @@ def configure(height: str = "none") -> None:
              "edges": [f"{side} height @{d:g}m / 10" for side in ("left", "right") for d in POINTS]}[height]
     HEIGHT, NAMES = height, _BASE_NAMES + extra
     DIM = len(NAMES)
-    FIXED = np.zeros(DIM, bool)  # inputs at a fixed scale, which the normalization skips: none for now
+    FIXED = np.array([fixed_gears and (n.startswith("gear ") or n.startswith("shift cooldown")) for n in NAMES], bool)
 
 
 def observe(raw: np.ndarray, track: np.ndarray, controls: Controls, table: TrackTable) -> np.ndarray:

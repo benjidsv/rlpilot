@@ -3,6 +3,7 @@
     uv run python scripts/watch.py sw10m-fix-learnedstd torino             # the run's last checkpoint, 2 laps
     uv run python scripts/watch.py runs/<run> torino --best --laps 3       # its best/ checkpoint instead
     uv run python scripts/watch.py runs/<run>/checkpoints/0004000000.pt torino --no-game   # lap times + summary only
+    uv run python scripts/watch.py sw10m-colored torino --shift hazard     # the gear choice read another way (eval.Driver)
 
 The run is a run dir, a checkpoint file, or an experiment name (runs/<name>__<seed>__*, --seed when there are several).
 The policy only runs in the headless worker, so the laps are driven there first (a few seconds). The worker records the
@@ -42,7 +43,7 @@ from rlpilot.starts import Starts
 from rlpilot.tracks import TRACE_COLUMNS, Track, _prefix, lap_times, load_split, race_for
 
 sys.path.insert(0, str(Path(__file__).parent))
-from eval import load_agent  # noqa: E402
+from eval import SHIFT_MODES, Driver, load_agent  # noqa: E402
 
 GAME = ROOT / "sd-install/games/speed-dreams-2"
 AGENT, BOT, ROAD, MUTED = "#2a78d6", "#eb6834", "#d9d8d2", "#8a8984"
@@ -74,12 +75,14 @@ def find_checkpoint(arg: str, seed: int | None, best: bool) -> Path:
     return numbered[-1]
 
 
-def drive(checkpoint: Path, track: str, laps: int, controls: Path) -> dict:
+def drive(checkpoint: Path, track: str, laps: int, controls: Path, shift: str = "argmax", seed: int = 0) -> dict:
     """`laps` laps from the grid in a headless worker that writes its controls, tick by tick, to `controls`; returns
-    the drive per policy step (COLUMNS) and how it went. As evaluate.grid_laps, plus the policy's outputs."""
+    the drive per policy step (COLUMNS) and how it went. As evaluate.grid_laps, plus the policy's outputs. `shift`:
+    how the gear choice is read from the policy (eval.Driver); `seed` for shift = sample."""
     agent, normalize, ckpt = load_agent(checkpoint)
+    driver = Driver(agent, shift, seed)
     bot_lap = Track.load(track).bot_lap
-    print(f"{checkpoint} (step {ckpt['step']:,}) on {track}, {laps} laps from the grid")
+    print(f"{checkpoint} (step {ckpt['step']:,}) on {track}, {laps} laps from the grid, shift: {shift}")
 
     def grid(idx):
         z = np.zeros(len(idx))
@@ -96,9 +99,9 @@ def drive(checkpoint: Path, track: str, laps: int, controls: Path) -> dict:
             state = [env._raw[0, F[k]] for k in STATE]
             x = torch.as_tensor(normalize(obs))
             with torch.no_grad():
-                action = agent.act_deterministic(x).numpy()
                 _, _, _, value = agent.get_action_and_value(x)  # sets agent.last_std
             std = agent.last_std[0].numpy()
+            action = driver(x, env.controls.gear)
             obs, _, term, trunc, info = env.step(action)
             act = env._act[0]
             rows.append(state + [act[A["steer"]], act[A["accel"]], act[A["brake"]], float(value[0, 0]), *std])
@@ -533,6 +536,10 @@ def main():
     p.add_argument("--seed", type=int, help="with an experiment name that has several seeds")
     p.add_argument("--no-game", action="store_true", help="only drive the laps: lap times and the summary image")
     p.add_argument("--test", action="store_true", help="allow a test track (what you see there can bias later choices)")
+    p.add_argument("--shift", choices=SHIFT_MODES, default="argmax",
+                   help="the gear choice: argmax (as the in-run eval), sample (as in training), hazard (deterministic, "
+                        "the median of the sampled timing); see eval.Driver")
+    p.add_argument("--shift-seed", type=int, default=0, help="with --shift sample")
     a = p.parse_args()
     split = {t: s for s, ts in load_split().items() for t in ts}
     if a.track not in split:
@@ -542,20 +549,21 @@ def main():
     checkpoint = find_checkpoint(a.run, a.seed, a.best)
     out = checkpoint.parent.parent / "watch"
     out.mkdir(exist_ok=True)
-    stem = (out / f"{a.track}-{checkpoint.stem}").resolve()  # absolute: the worker and the game chdir
+    mode = "" if a.shift == "argmax" else f"-{a.shift}" + (f"{a.shift_seed}" if a.shift == "sample" else "")
+    stem = (out / f"{a.track}-{checkpoint.stem}{mode}").resolve()  # absolute: the worker and the game chdir
     controls = stem.with_suffix(".controls")
-    d = drive(checkpoint, a.track, a.laps, controls)
+    d = drive(checkpoint, a.track, a.laps, controls, a.shift, a.shift_seed)
     bot = Bot(a.track)
     add_delta(d, bot)
     np.savez_compressed(stem.with_suffix(".npz"), **d)
     times = ", ".join(f"{t:.2f}" for t in d["lap_times"]) or "no lap"
     title = (f"{checkpoint.parent.parent.name} {checkpoint.stem} (step {d['step']:,}) on {a.track} ({split[a.track]}): "
-             f"{times} s, bot {bot.lap:.2f} s, {d['end']}")
+             f"{times} s, bot {bot.lap:.2f} s, {d['end']}, shift {a.shift}")
     summary(d, bot, title, stem.with_suffix(".png"))
     if not a.no_game:
         run = checkpoint.parent.parent.name
         exp, seed = (run.split("__") + ["?"])[:2]  # runs/<exp>__<seed>__<time>
-        header = f"{exp} seed {seed}\n{checkpoint.stem}, step {d['step'] / 1e6:.2f}M\n{a.track} ({split[a.track]})"
+        header = f"{exp} seed {seed}\n{checkpoint.stem}, step {d['step'] / 1e6:.2f}M\n{a.track} ({split[a.track]}), shift {a.shift}"
         play(d, bot, a.track, controls, run, header)
 
 

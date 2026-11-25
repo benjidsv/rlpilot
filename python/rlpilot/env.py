@@ -44,12 +44,13 @@ class RacingEnv(VectorEnv):
                  retry_fn: Callable[[np.ndarray, int], Starts] | None = None, seed: int = 0, frame_skip: int = 2,
                  spin_us: int = 50, recycle_resets: int = 2000, run_dir=None, overlap_starts: bool = False,
                  lost_cost: float = LOST_COST, best_only_progress: bool = False, terminal: float = TERMINAL,
-                 lost_causes: tuple[str, ...] = LOST_CAUSES, progress_units: str = "metres"):
+                 lost_causes: tuple[str, ...] = LOST_CAUSES, progress_units: str = "metres", wall_cost: float = 0.0,
+                 offroad_cost: float = 0.0, width_bonus: float = 0.0, line_bonus: float = 0.0):
         """tracks: one per worker. start_fn(env indices) -> their next Starts (default: random training starts).
         retry_fn(env indices, attempt) -> replacements for starts whose first observation wasn't finite (default: new
         random starts, then the grid). max_distance: one for all envs, or an array [n] the caller may update
         between episodes (the eval's corner scenarios each have their own). lost_cost, best_only_progress, terminal,
-        lost_causes: see reward.py. progress_units: "metres", or "bot_seconds": each metre pays REF_SPEED / the bot's speed
+        lost_causes, wall_cost, offroad_cost, width_bonus, line_bonus (on the bot's line): see reward.py. progress_units: "metres", or "bot_seconds": each metre pays REF_SPEED / the bot's speed
         there, so a second at the bot's pace pays the same everywhere (and a metre at REF_SPEED as much as in metres)."""
         self.track_names = sorted(set(tracks))
         self.table = TrackTable([Track.load(t) for t in self.track_names])
@@ -79,7 +80,8 @@ class RacingEnv(VectorEnv):
         if progress_units not in ("metres", "bot_seconds"):
             raise ValueError(f"progress_units: metres or bot_seconds, not {progress_units!r}")
         weight = self._bot_second_weight if progress_units == "bot_seconds" else None
-        self.reward = Reward(n, self.dt, lost_cost, best_only_progress, terminal, lost_causes, weight)
+        self.reward = Reward(n, self.dt, lost_cost, best_only_progress, terminal, lost_causes, weight, wall_cost,
+                             offroad_cost, width_bonus, line_bonus, self._bot_offset)
         self.starts = draw(np.zeros(n, np.int64), self.track, np.zeros(n), self.table, self._rng)  # current, per env
         self.start_retries = 0
         # per-episode accumulators
@@ -373,6 +375,10 @@ class RacingEnv(VectorEnv):
             self._start(idx)
             obs[idx] = self._observe()[idx]
         return obs, reward, terminated, truncated, info
+
+    def _bot_offset(self, raw: np.ndarray) -> np.ndarray:
+        """The bot's offset from the middle (to_middle's sign) where each car is on its track."""
+        return self.table.at(self.track, raw[:, F["dist_from_start"]].astype(np.float64)[:, None], "bot_offset")[:, 0]
 
     def _bot_second_weight(self, raw: np.ndarray) -> np.ndarray:
         v = self.table.at(self.track, raw[:, F["dist_from_start"]].astype(np.float64)[:, None], "bot_speed")[:, 0]

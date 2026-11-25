@@ -17,15 +17,23 @@ column is each run's survival minus the line at its pace: > 0 = safer than its p
 rather than more caution. Without two reward-only variants at these steps, the column is left out.
 
 --curve prints the mean over seeds at every evaluation of the run (runs longer than 3M are evaluated every 2M).
+
+Laps (runs from 2026-11-24 on: eval/<step>-laps.csv, 1 lap from the grid per track, capped at 7.5 km): lap completion,
+clean (share driven before the first loss of control) and pace (the bot's time over the clean distance / the car's,
+sim clock). `--split all` pools the 38 non-test tracks (suite scenarios and laps): with validation saturated (nominal
+survival ~0.9, 6/6 laps at 10M), the training tracks are where setups still differ. `--only` limits the report (and the
+pooled seed sd) to some variants: runs from before the launch fix (2026-11-24) live in another regime.
 """
 
 import argparse
+import warnings
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from rlpilot.evaluate import read_results, summarize
+from rlpilot.evaluate import read_results, summarize, summarize_laps
+from rlpilot.tracks import load_split
 
 sys.path.insert(0, str(Path(__file__).parents[1]))  # scripts/: sweep.py
 from sweep import SEEDS, STEPS, VARIANTS, finished  # noqa: E402
@@ -40,11 +48,28 @@ METRICS = [  # (column, summarize key with {s} = split)
     ("pace", "{s}/pace"),
     ("lost contact", "{s}/nominal/lost_contact"),
     ("lost far off", "{s}/nominal/lost_far_off"),
+    ("lap compl", "{s}/lap/completion"),
+    ("lap clean", "{s}/lap/clean"),
+    ("lap pace", "{s}/lap/pace"),
 ]
-Z_METRICS = ("nominal surv", "nominal compl", "disturbed surv", "crashed compl", "pace")
+Z_METRICS = ("nominal surv", "nominal compl", "disturbed surv", "crashed compl", "pace", "lap clean", "lap pace")
 MATCHED = ("surv vs pace", "{s}/nominal/survival_vs_pace")
 NOISE_KEYS = {"steer-noise-power", "steer-noise-speed", "steer-noise-floor", "learned-std"}
 REWARD_ONLY = [v for v, cfg in VARIANTS.items() if not NOISE_KEYS & cfg.keys()]  # the training noise as in base
+
+
+def run_metrics(path: Path) -> dict[str, float]:
+    """One eval's metrics: the suite (per split, and "all" = both pooled) and, if its laps CSV exists, the laps."""
+    rows = read_results(path)
+    m = summarize(rows) | summarize([r | {"split": "all"} for r in rows])
+    laps = path.with_name(f"{path.stem}-laps.csv")
+    if laps.exists():
+        split = load_split()
+        split_of = {t: s for s in ("validation", "train") for t in split[s]}
+        lap_rows = [{k: (float(v) if k in ("completion", "clean", "clean_seconds", "bot_seconds") else v)
+                     for k, v in r.items()} for r in read_results(laps)]
+        m |= summarize_laps(lap_rows, split_of) | summarize_laps(lap_rows, dict.fromkeys(split_of, "all"))
+    return m
 
 
 def cell(x: np.ndarray) -> str:
@@ -52,28 +77,30 @@ def cell(x: np.ndarray) -> str:
 
 
 def main():
+    warnings.simplefilter("ignore", RuntimeWarning)  # nan means and sds of runs without laps
     p = argparse.ArgumentParser()
     p.add_argument("--steps", type=int, default=STEPS, help="which runs: the 3M sweep (default) or longer ones")
-    p.add_argument("--split", default="validation", choices=["validation", "train"])
+    p.add_argument("--split", default="validation", choices=["validation", "train", "all"])
+    p.add_argument("--only", nargs="+", choices=list(VARIANTS), help="variants to report (default: every one run)")
     p.add_argument("--curve", action="store_true", help="also show every evaluation along the runs")
-    p.add_argument("--base", default="base", choices=list(VARIANTS), help="the reference of the differences")
+    p.add_argument("--base", default="baseline", choices=list(VARIANTS), help="the reference of the differences")
     p.add_argument("--tsv", type=Path, help="also write the per-seed metrics here")
     a = p.parse_args()
     runs = {}  # (variant, seed) -> final eval CSV
-    for v in VARIANTS:
+    for v in a.only or VARIANTS:
         for s in SEEDS:
             csvs = sorted(finished(v, s, a.steps))
             if csvs:
                 runs[v, s] = Path(csvs[-1])  # the latest run if a seed was run twice
     if not runs:
         raise SystemExit(f"no finished runs of {a.steps} steps yet")
-    metrics = {k: summarize(read_results(path)) for k, path in runs.items()}
+    metrics = {k: run_metrics(path) for k, path in runs.items()}
     variants = [v for v in VARIANTS if any((v, s) in metrics for s in SEEDS)]
 
     lines = {}  # split -> (slope, intercept) of nominal survival over pace, fitted on the reward-only runs
     fitted = [v for v in variants if v in REWARD_ONLY]
     if len(fitted) >= 2:
-        for split in ("validation", "train"):
+        for split in ("validation", "train", "all"):
             pts = np.array([(m[f"{split}/pace"], m[f"{split}/nominal/survival"]) for (v, _), m in metrics.items()
                             if v in fitted])
             lines[split] = np.polyfit(pts[:, 0], pts[:, 1], 1)
@@ -120,14 +147,15 @@ def main():
             print(f"  {v:18s} " + " ".join(f"{c:>20s}" for c in cells))
 
     if a.curve:
-        print(f"\n  {a.split} along the runs, mean over seeds: nominal survival / crashed completion / pace\n")
+        print(f"\n  {a.split} along the runs, mean over seeds: nominal survival / crashed completion / lap clean / lap pace\n")
         curves = {}
         for (v, s), path in runs.items():
             for csv in sorted(path.parent.glob("*.csv")):
                 if csv.stem.isdigit():
-                    m = summarize(read_results(csv))
+                    m = run_metrics(csv)
                     curves.setdefault(v, {}).setdefault(int(csv.stem), []).append(
-                        [m[k.format(s=a.split)] for k in (keys["nominal surv"], keys["crashed compl"], keys["pace"])])
+                        [m.get(keys[c].format(s=a.split), np.nan)
+                         for c in ("nominal surv", "crashed compl", "lap clean", "lap pace")])
         for v in variants:
             row = [f"{step / 1e6:.1f}M " + "/".join(f"{x:.3f}" for x in np.nanmean(np.array(vals), axis=0))
                    for step, vals in sorted(curves[v].items())]

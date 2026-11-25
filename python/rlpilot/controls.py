@@ -29,14 +29,20 @@ STOPPED_SPEED = 1.0    # m/s: below this, 1st <-> reverse is allowed
 DOWN, HOLD, UP = 0, 1, 2
 GEARBOXES = ("manual", "auto")
 GEARBOX = "manual"
+UP_AT = 0.92  # auto_shift's upshift point while GEARBOX is "auto" (configure)
 
 
-def configure(gearbox: str = "manual") -> None:
-    """Who shifts while the car moves (before making envs): the policy ("manual") or auto_shift ("auto")."""
-    global GEARBOX
+def configure(gearbox: str = "manual", up_at: float = 0.92) -> None:
+    """Who shifts while the car moves (before making envs): the policy ("manual") or auto_shift ("auto"), and where
+    auto_shift upshifts (a share of the redline). 0.92 was the first default; the gears are tall (each pulls harder than
+    the next up to its limiter), and on the long straights, flat out on the bot's line, 0.92 ends at 0.974 of the bot's
+    speed and 0.995 at 0.992 (2026-11-25): most of the auto runs' top-end deficit."""
+    global GEARBOX, UP_AT
     if gearbox not in GEARBOXES:
         raise ValueError(f"gearbox: one of {GEARBOXES}, not {gearbox!r}")
-    GEARBOX = gearbox
+    if not 0.5 < up_at <= 1.0:
+        raise ValueError(f"up_at: a share of the redline in (0.5, 1], not {up_at}")
+    GEARBOX, UP_AT = gearbox, up_at
 
 
 def policy_shifts(speed: np.ndarray) -> np.ndarray:
@@ -73,7 +79,7 @@ class Controls:
         cooldown = np.maximum(self.cooldown - 1, 0)  # a shift at step t allows the next one at t + SHIFT_COOLDOWN
         choice = np.rint(action[:, 2]).astype(np.int64)
         if GEARBOX == "auto":
-            choice = np.where(policy_shifts(raw[:, F["speed_x"]]), choice, auto_shift(self.gear, raw))
+            choice = np.where(policy_shifts(raw[:, F["speed_x"]]), choice, auto_shift(self.gear, raw, UP_AT))
         gear, shifted, refused = shift_gear(self.gear, choice, cooldown, raw)
         self.gear = np.where(on, gear, self.gear)
         self.shifted, self.refused = shifted & on, refused & on

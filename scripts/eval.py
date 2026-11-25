@@ -33,14 +33,60 @@ def load_policy(path: Path):
     return policy, ckpt
 
 
+SHIFT_MODES = ("argmax", "sample", "hazard")
+
+
+class Driver:
+    """The checkpoint's policy for watching and telemetry: steer and pedal at the mean, the shift picked by `mode`:
+    - argmax: the most likely shift at each step (the in-run eval, Agent.act_deterministic). A policy trained by
+      sampling can hold P(up) at ~0.3 per step on the rev limiter: sampled it upshifts within ~3 steps, argmax never.
+    - sample: drawn from the policy's shift probabilities, as in training (seeded; another seed, another drive).
+    - hazard: deterministic, the median of the sampled timing: shift once the chance that sampling would have shifted
+      since the last gear change passes 1/2 (down and up each keep their own; the likelier one goes first).
+    Call it with the normalized observations [n, obs] and the cars' current gears [n] (hazard restarts its clocks when
+    a car's gear changes)."""
+
+    def __init__(self, agent, mode: str = "argmax", seed: int = 0):
+        if mode not in SHIFT_MODES:
+            raise ValueError(f"shift mode {mode!r} not in {SHIFT_MODES}")
+        self.agent, self.mode = agent, mode
+        self.gen = torch.Generator().manual_seed(seed)
+        self.stay = None  # hazard: per car, P(sampling would not have shifted down / up since the last gear change)
+        self.prev_gear = None
+
+    def __call__(self, x: torch.Tensor, gear: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            if self.mode == "argmax":
+                return self.agent.act_deterministic(x).numpy()
+            h = self.agent.actor_body(x)
+            mean = self.agent.actor_mean(h).numpy()
+            p = torch.softmax(self.agent.shift_logits(h), 1)
+        if self.mode == "sample":
+            shift = torch.multinomial(p, 1, generator=self.gen)[:, 0].numpy()
+        else:
+            p = p.numpy()
+            if self.stay is None or len(self.stay) != len(p):
+                self.stay, self.prev_gear = np.ones((len(p), 2)), None
+            if self.prev_gear is not None:
+                self.stay[gear != self.prev_gear] = 1.0
+            self.prev_gear = np.array(gear, copy=True)
+            self.stay[:, 0] *= 1 - p[:, 0]
+            self.stay[:, 1] *= 1 - p[:, 2]
+            shift = np.ones(len(p), np.int64)  # hold
+            shift[self.stay[:, 1] < 0.5] = 2
+            shift[(self.stay[:, 0] < 0.5) & (self.stay[:, 0] <= self.stay[:, 1])] = 0
+        return np.concatenate([mean, shift[:, None].astype(np.float32)], 1)
+
+
 def load_agent(path: Path):
     """The checkpoint's agent, its input normalization (raw observations -> what the agent takes), and the checkpoint."""
     ckpt = torch.load(path, weights_only=False)
     obs.configure(ckpt["args"].get("obs_height", "none"))  # the inputs it was trained with
-    controls.configure(ckpt["args"].get("gearbox", "manual"))  # and who shifted
+    controls.configure(ckpt["args"].get("gearbox", "manual"), ckpt["args"].get("auto_upshift", 0.92))  # who shifted
     space = types.SimpleNamespace(single_observation_space=gym.spaces.Box(-np.inf, np.inf, (obs.DIM,), np.float32))
     agent = Agent(space, ckpt["args"]["hidden"], activation=ckpt["args"].get("activation", "tanh"),
-                  learned_std=ckpt["args"].get("learned_std", False))
+                  learned_std=ckpt["args"].get("learned_std", False),
+                  pedal_std_floor=ckpt["args"].get("pedal_std_floor", 0.0))
     agent.load_state_dict(ckpt["agent"])
     agent.eval()
     mean, std = ckpt["obs_mean"], np.sqrt(ckpt["obs_var"] + ckpt["epsilon"])
