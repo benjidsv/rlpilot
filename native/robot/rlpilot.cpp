@@ -6,6 +6,9 @@
 // the recording to <path>.check.csv: the engine is deterministic, so the two should match. With RLP_REPLAY_BOT=<path>
 // (float32: the bot's lap time, then its time from the start line at each metre of the lap) the HUD's delta and best lap
 // are the bot's: the robot writes them into the car's best-lap fields on every tick (no physics reads them).
+// With RLP_REPLAY_LAUNCH="<lap fraction>,<to right fraction>,<yaw offset>,<speed>" the replayed car starts there instead
+// of on the grid, as the worker launched it (a scenario: scripts/watch.py --scenario). The engine finds rlp_launch with
+// dlsym(RTLD_DEFAULT): in the worker its own (in the executable, searched first) wins, so this one only serves the game.
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +31,36 @@ static std::vector<rlp_tick> replay;
 static size_t replayPos;
 static FILE *replayCheck;
 static std::vector<float> botTimes; // RLP_REPLAY_BOT: per metre from the start line
+static float launchSpeed = 0;        // RLP_REPLAY_LAUNCH's speed: sets the pre-start gear as the worker does
+
+static bool replayLaunch(float v[4])
+{
+    const char *spec = getenv("RLP_REPLAY_LAUNCH");
+    return !host && spec && sscanf(spec, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]) == 4 && v[0] > 0 && v[0] < 1;
+}
+
+extern "C" __attribute__((visibility("default"))) bool rlp_launch(const tCarElt *, float *lapFraction,
+                                                                  float *toRightFraction, float *yawOffset, float *speed)
+{
+    float v[4];
+    if (!replayLaunch(v))
+        return false;
+    *lapFraction = v[0];
+    *toRightFraction = v[1];
+    *yawOffset = v[2];
+    *speed = launchSpeed = v[3];
+    return true;
+}
+
+// The worker's launchGear: the highest gear that keeps the engine above half its redline at the launch speed.
+static int launchGear(const tCarElt *car)
+{
+    float spin = launchSpeed / car->_wheelRadius(2), red = car->_enginerpmRedLine;
+    int gear = 1;
+    while (gear < car->_gearNb - 1 && spin * car->_gearRatio[gear + car->_gearOffset + 1] >= 0.5f * red)
+        gear++;
+    return gear;
+}
 static float botLap;
 
 static void newTrack(int index, tTrack *track, void *carHandle, void **carParmHandle, tSituation *)
@@ -105,7 +138,7 @@ static void replayDrive(tCarElt *car, tSituation *s)
         c.accelCmd = 0;
         c.brakeCmd = 1;
         c.clutchCmd = s->currentTime < 0 ? 1 : 0;
-        c.gear = s->currentTime < 0 ? 1 : car->_gear;
+        c.gear = s->currentTime < 0 ? launchGear(car) : car->_gear;
         return;
     }
     const rlp_tick &t = replay[replayPos++];

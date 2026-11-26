@@ -4,6 +4,9 @@
     uv run python scripts/watch.py runs/<run> torino --best --laps 3       # its best/ checkpoint instead
     uv run python scripts/watch.py runs/<run>/checkpoints/0004000000.pt torino --no-game   # lap times + summary only
     uv run python scripts/watch.py sw10m-colored torino --shift hazard     # the gear choice read another way (eval.Driver)
+    uv run python scripts/watch.py sw10m-colored torino --from-start       # lap 1 in real time (default: fast-forward)
+    uv run python scripts/watch.py sw10m-colored --scenario spring:1200:crashed   # one scenario of the eval suite
+    uv run python scripts/watch.py sw10m-colored --failed crashed          # list the run's failed crashed scenarios
 
 The run is a run dir, a checkpoint file, or an experiment name (runs/<name>__<seed>__*, --seed when there are several).
 The policy only runs in the headless worker, so the laps are driven there first (a few seconds). The worker records the
@@ -16,7 +19,9 @@ critic's value and the policy's std. Then:
 - a telemetry window follows the game (it reads the replay's race time as the game writes it, so it follows pauses):
   the map, a zoomed map with the bot's line and ghost (the bot at the same lap time), the delta to the bot, and the last
   300 m of speed, pedals, steering, delta, value and std against the bot's at the same place on the track.
-After the drive the car stays braked; quit the game to finish. Closing the game prints how far the replay strayed from
+A scenario (--scenario, an id of data/suite-v2.csv as in the eval's CSVs) starts where the suite launches it and drives
+its distance (500 m); the game launches the replayed car there too (RLP_REPLAY_LAUNCH, robot/rlpilot.cpp), and the
+delta and ghost count from the scenario's start. After the drive the car stays braked; quit the game to finish. Closing the game prints how far the replay strayed from
 the recording (it should be 0). Test tracks need --test.
 """
 
@@ -39,8 +44,9 @@ from matplotlib.figure import Figure
 
 from rlpilot.client import A, F, ROOT, prepare_dir
 from rlpilot.env import ENDS, RacingEnv
-from rlpilot.starts import Starts
-from rlpilot.tracks import TRACE_COLUMNS, Track, _prefix, lap_times, load_split, race_for
+from rlpilot.evaluate import SCENARIO_SECONDS, load_suite
+from rlpilot.starts import Starts, write_launch
+from rlpilot.tracks import TRACE_COLUMNS, Track, TrackTable, _prefix, lap_times, load_split, race_for
 
 sys.path.insert(0, str(Path(__file__).parent))
 from eval import SHIFT_MODES, Driver, load_agent  # noqa: E402
@@ -75,21 +81,41 @@ def find_checkpoint(arg: str, seed: int | None, best: bool) -> Path:
     return numbered[-1]
 
 
-def drive(checkpoint: Path, track: str, laps: int, controls: Path, shift: str = "argmax", seed: int = 0) -> dict:
-    """`laps` laps from the grid in a headless worker that writes its controls, tick by tick, to `controls`; returns
-    the drive per policy step (COLUMNS) and how it went. As evaluate.grid_laps, plus the policy's outputs. `shift`:
-    how the gear choice is read from the policy (eval.Driver); `seed` for shift = sample."""
+def scenario_start(sc: dict) -> Starts:
+    return Starts(np.array([sc["kind"]]), *(np.array([sc[k]], np.float64) for k in ("s", "lateral", "yaw", "speed",
+                  "kick_steer", "kick_pedal")), np.array([sc["kick_steps"]], np.int64))
+
+
+def launch_spec(sc: dict) -> str:
+    """RLP_REPLAY_LAUNCH for the game: the launch slots the worker got (starts.write_launch)."""
+    act = np.zeros((1, A["launch_speed"] + 1), np.float32)
+    write_launch(scenario_start(sc), np.zeros(1, np.int64), TrackTable([Track.load(sc["track"])]), act)
+    return ",".join(f"{v:.9g}" for v in act[0, A["launch_pos"]:A["launch_speed"] + 1])
+
+
+def drive(checkpoint: Path, track: str, laps: int, controls: Path, shift: str = "argmax", seed: int = 0,
+          scenario: dict | None = None) -> dict:
+    """`laps` laps from the grid (or the suite `scenario`: its start, then its distance) in a headless worker that
+    writes its controls, tick by tick, to `controls`; returns the drive per policy step (COLUMNS) and how it went. As
+    evaluate.grid_laps (or the suite), plus the policy's outputs. `shift`: how the gear choice is read from the policy
+    (eval.Driver); `seed` for shift = sample."""
     agent, normalize, ckpt = load_agent(checkpoint)
     driver = Driver(agent, shift, seed)
     bot_lap = Track.load(track).bot_lap
-    print(f"{checkpoint} (step {ckpt['step']:,}) on {track}, {laps} laps from the grid, shift: {shift}")
+    what = f"scenario {scenario['id']}" if scenario else f"{laps} laps from the grid"
+    print(f"{checkpoint} (step {ckpt['step']:,}) on {track}, {what}, shift: {shift}")
 
     def grid(idx):
         z = np.zeros(len(idx))
         return Starts(np.zeros(len(idx), np.int64), z, z, z, z, z, z, np.zeros(len(idx), np.int64))
 
     os.environ["RLP_RECORD_CONTROLS"] = str(controls)  # the worker inherits it; it records its first episode
-    env = RacingEnv([track], episode_seconds=laps * bot_lap / 0.6 + 30, start_fn=grid)
+    if scenario:
+        env = RacingEnv([track], episode_seconds=SCENARIO_SECONDS, max_distance=scenario["goal"],
+                        start_fn=lambda idx: scenario_start(scenario))
+        laps = 10**6  # only the scenario's end stops it
+    else:
+        env = RacingEnv([track], episode_seconds=laps * bot_lap / 0.6 + 30, start_fn=grid)
     del os.environ["RLP_RECORD_CONTROLS"]
     rows, times = [], []
     try:
@@ -162,10 +188,20 @@ class Bot:
         np.concatenate([[self.lap], np.interp(metres, self.s, self.by_s["time"])]).astype(np.float32).tofile(path)
 
 
-def add_delta(d: dict, bot: Bot) -> None:
+def add_delta(d: dict, bot: Bot, s0: float | None = None) -> None:
     """d["delta"]: the lap time minus the bot's at the same place, from the first crossing of the start line (nan
-    before: the run up from the grid isn't a lap)."""
-    d["delta"] = np.where(d["laps"] >= 1, d["cur_lap_time"] - bot.at("time", d["dist_from_start"]), np.nan)
+    before: the run up from the grid isn't a lap). From a scenario's start s0: the time since the start minus the
+    bot's from s0 to the same place, and cur_lap_time made the bot's lap time there (for the ghost)."""
+    if s0 is None:
+        d["delta"] = np.where(d["laps"] >= 1, d["cur_lap_time"] - bot.at("time", d["dist_from_start"]), np.nan)
+        return
+    elapsed = d["time"] - d["time"][0]
+    x = s0 + d["dist_raced"] - d["dist_raced"][0]
+    bot_elapsed = bot.at("time", x) + np.floor(x / bot.length) * bot.lap - bot.at("time", s0)
+    d["delta"] = elapsed - bot_elapsed
+    d["elapsed"] = elapsed
+    d["cur_lap_time"] = np.mod(bot.at("time", s0) + elapsed, bot.lap)
+    d["laps"] = np.ones_like(d["laps"])
 
 
 def quads(bot: Bot) -> np.ndarray:
@@ -205,7 +241,7 @@ def summary(d: dict, bot: Bot, title: str, path: Path) -> None:
     ax.autoscale_view()
     cb = fig.colorbar(lines, ax=ax, orientation="horizontal", shrink=0.6, pad=0.01)
     cb.set_label("s lost (+) or gained (-) per 100 m against the bot")
-    if d["end"] != "laps_done":
+    if d["end"] not in ("laps_done", "distance"):
         ax.plot(*pts[-1], "x", color="k", ms=12, mew=3)
         ax.annotate(d["end"], pts[-1], textcoords="offset points", xytext=(8, 8), fontsize=11)
     ax.plot(*bot.edges[0, :2], "s", color="k", ms=5)  # the start line
@@ -219,6 +255,8 @@ def summary(d: dict, bot: Bot, title: str, path: Path) -> None:
         m = d["laps"] == n
         shade = 0.35 + 0.65 * (i + 1) / len(laps)
         done = f"{d['lap_times'][i]:.2f} s" if i < len(d["lap_times"]) else "unfinished"
+        if "elapsed" in d:
+            done = f"scenario, {d['elapsed'][-1]:.2f} s"
         axes[0].plot(d["dist_from_start"][m], d["speed_x"][m] * 3.6, color=AGENT, alpha=shade, lw=1.2,
                      label=f"lap {n} ({done})")
         axes[1].plot(d["dist_from_start"][m], d["delta"][m], color=AGENT, alpha=shade, lw=1.2, label=f"lap {n}")
@@ -391,11 +429,14 @@ class Telemetry:
         self.near.set_verts(self.quads[np.hypot(*(self.mid - [x, y]).T) < 250])
 
         done = "  ".join(f"{t:.2f}" for t in d["lap_times"][: max(0, int(d["laps"][k]) - 1)])
+        timing = (f"time    {d['elapsed'][k]:7.2f} s\ndelta   {d['delta'][k]:+7.2f} s\nend     {d['end']}\n"
+                  if "elapsed" in d else
+                  f"lap {int(d['laps'][k])}     {d['cur_lap_time'][k]:7.2f} s\n"
+                  f"bot lap   {bot.lap:7.2f} s\n"
+                  f"done      {done or '-'}\n")
         self.text.set_text(
             f"{self.header}\n\n"
-            f"lap {int(d['laps'][k])}     {d['cur_lap_time'][k]:7.2f} s\n"
-            f"bot lap   {bot.lap:7.2f} s\n"
-            f"done      {done or '-'}\n"
+            f"{timing}"
             f"speed  {d['speed_x'][k] * 3.6:4.0f} km/h (bot {bot.at('speed_x', s) * 3.6:3.0f})\n"
             f"gear {int(d['gear'][k])}   damage {int(d['damage'][k])}")
 
@@ -452,10 +493,12 @@ def arrange(game_pid: int, area: tuple[int, int, int, int]) -> None:
         print(f"  the game's window never showed up to be placed: {hint}")
 
 
-def play(d: dict, bot: Bot, track: str, controls: Path, name: str, header: str) -> None:
+def play(d: dict, bot: Bot, track: str, controls: Path, name: str, header: str, launch: str | None = None,
+         fast_until: float | None = None) -> None:
     """The game, in a window, on a fresh local dir: the race file switched to a rendered race, a GAME_W x GAME_H
     window, the HUD's driver inputs on, the robot replaying `controls` and showing the delta to the bot; the telemetry
-    window around it."""
+    window around it. `fast_until`: the game fast-forwards (x16) up to that race time (RLP_REPLAY_FAST_UNTIL, the
+    patched race engine), same drive."""
     race = race_for(track)
     check_path = Path(f"{controls}.check.csv")
     check_path.unlink(missing_ok=True)  # the robot writes a new one when the replay starts
@@ -479,7 +522,9 @@ def play(d: dict, bot: Bot, track: str, controls: Path, name: str, header: str) 
         log = open(controls.with_suffix(".game.log"), "wb")
         game = subprocess.Popen([str(GAME), "-lc", f"{lc}/", "-s", race, "-nr"], cwd=ROOT, stdout=log,
                                 stderr=subprocess.STDOUT,
-                                env=os.environ | {"RLP_REPLAY": str(controls), "RLP_REPLAY_BOT": str(bot_times)})
+                                env=os.environ | {"RLP_REPLAY": str(controls)}
+                                | ({"RLP_REPLAY_LAUNCH": launch} if launch else {"RLP_REPLAY_BOT": str(bot_times)})
+                                | ({"RLP_REPLAY_FAST_UNTIL": f"{fast_until:.3f}"} if fast_until else {}))
         threading.Thread(target=arrange, args=(game.pid, area), daemon=True).start()
         f, pending, last = None, "", None
         try:
@@ -527,10 +572,42 @@ def check(controls: Path) -> None:
           f"(tick {worst})" + ("" if gap[worst] < 0.5 else "  <- the replay strayed: it isn't the policy's drive"))
 
 
+def suite_eval(checkpoint: Path) -> Path | None:
+    """The suite eval of this checkpoint's step (runs/<run>/eval/<step>.csv), else the run's last one."""
+    evals = sorted(p for p in (checkpoint.parent.parent / "eval").glob("*.csv") if p.stem.isdigit())
+    same = [p for p in evals if p.stem == checkpoint.stem]
+    return (same or evals[-1:] or [None])[0]
+
+
+def eval_outcome(checkpoint: Path, scenario_id: str) -> str:
+    path = suite_eval(checkpoint)
+    if path is None:
+        return ""
+    with open(path) as f:
+        row = next((r for r in csv.DictReader(f) if r.get("id") == scenario_id), None)
+    return f"{row['outcome']}, {row['end']} in {path.name}" if row else ""
+
+
+def list_failed(checkpoint: Path, tier: str) -> None:
+    path = suite_eval(checkpoint)
+    if path is None:
+        raise SystemExit(f"no suite eval in {checkpoint.parent.parent / 'eval'}")
+    suite = {r["id"]: r for r in load_suite(("train", "validation", "test"))}
+    with open(path) as f:
+        rows = [r for r in csv.DictReader(f) if "tier" in r and r["outcome"] == "failed" and tier in ("all", r["tier"])]
+    print(f"{len(rows)} failed in {path}  (yaw: the start's heading against the road, deg)")
+    for r in rows:
+        yaw = np.degrees(suite[r["id"]]["yaw"]) if r["id"] in suite else float("nan")
+        print(f"  {r['id']:36s} {r['split']:10s} {r['end']:12s} {float(r['distance']):6.0f} m  yaw {yaw:+5.0f}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("run", help="run dir, checkpoint file, or experiment name")
-    p.add_argument("track")
+    p.add_argument("track", nargs="?", help="a track (laps from the grid); not with --scenario")
+    p.add_argument("--scenario", help="a suite scenario id instead, e.g. spring:1200:crashed (track:s:tier)")
+    p.add_argument("--failed", metavar="TIER", help="list the checkpoint's failed scenarios of TIER (or 'all') in its "
+                   "last suite eval, and stop")
     p.add_argument("--laps", type=int, default=2)
     p.add_argument("--best", action="store_true", help="the run's best.pt instead of its last checkpoint")
     p.add_argument("--seed", type=int, help="with an experiment name that has several seeds")
@@ -540,31 +617,62 @@ def main():
                    help="the gear choice: argmax (as the in-run eval), sample (as in training), hazard (deterministic, "
                         "the median of the sampled timing); see eval.Driver")
     p.add_argument("--shift-seed", type=int, default=0, help="with --shift sample")
+    p.add_argument("--from-start", action="store_true", help="watch lap 1 in real time too (by default the game "
+                   "fast-forwards to --lead seconds before the end of lap 1, so the flying lap starts right away)")
+    p.add_argument("--lead", type=float, default=10.0, help="seconds of lap 1 shown in real time before the flying lap")
     a = p.parse_args()
     split = {t: s for s, ts in load_split().items() for t in ts}
+    checkpoint = find_checkpoint(a.run, a.seed, a.best)
+    if a.failed:
+        list_failed(checkpoint, a.failed)
+        return
+    scenario = None
+    if a.scenario:
+        found = [r for r in load_suite(tuple(set(split.values()))) if r["id"] == a.scenario]
+        if not found:
+            raise SystemExit(f"no scenario {a.scenario!r} in the suite (ids: track:s:tier, see --failed)")
+        scenario = found[0]
+        a.track = scenario["track"]
+    if a.track is None:
+        raise SystemExit("give a track, or --scenario")
     if a.track not in split:
         raise SystemExit(f"unknown track {a.track!r}; tracks: {', '.join(sorted(split))}")
     if split[a.track] == "test" and not a.test:
         raise SystemExit(f"{a.track} is a test track: pass --test to watch it anyway")
-    checkpoint = find_checkpoint(a.run, a.seed, a.best)
     out = checkpoint.parent.parent / "watch"
     out.mkdir(exist_ok=True)
     mode = "" if a.shift == "argmax" else f"-{a.shift}" + (f"{a.shift_seed}" if a.shift == "sample" else "")
-    stem = (out / f"{a.track}-{checkpoint.stem}{mode}").resolve()  # absolute: the worker and the game chdir
+    name = a.scenario.replace(":", "-") if scenario else a.track
+    stem = (out / f"{name}-{checkpoint.stem}{mode}").resolve()  # absolute: the worker and the game chdir
     controls = stem.with_suffix(".controls")
-    d = drive(checkpoint, a.track, a.laps, controls, a.shift, a.shift_seed)
+    d = drive(checkpoint, a.track, a.laps, controls, a.shift, a.shift_seed, scenario)
     bot = Bot(a.track)
-    add_delta(d, bot)
+    add_delta(d, bot, scenario["s"] if scenario else None)
     np.savez_compressed(stem.with_suffix(".npz"), **d)
     times = ", ".join(f"{t:.2f}" for t in d["lap_times"]) or "no lap"
+    if scenario:
+        times = f"{a.scenario}, {d['elapsed'][-1]:.2f}"
+        in_eval = eval_outcome(checkpoint, a.scenario)
+        print(f"  scenario: {d['end']} after {d['elapsed'][-1]:.1f} s, {d['dist_raced'][-1] - d['dist_raced'][0]:.0f} m"
+              + (f" (the suite eval: {in_eval})" if in_eval else ""))
     title = (f"{checkpoint.parent.parent.name} {checkpoint.stem} (step {d['step']:,}) on {a.track} ({split[a.track]}): "
              f"{times} s, bot {bot.lap:.2f} s, {d['end']}, shift {a.shift}")
     summary(d, bot, title, stem.with_suffix(".png"))
     if not a.no_game:
         run = checkpoint.parent.parent.name
         exp, seed = (run.split("__") + ["?"])[:2]  # runs/<exp>__<seed>__<time>
-        header = f"{exp} seed {seed}\n{checkpoint.stem}, step {d['step'] / 1e6:.2f}M\n{a.track} ({split[a.track]}), shift {a.shift}"
-        play(d, bot, a.track, controls, run, header)
+        where = a.scenario if scenario else a.track
+        header = f"{exp} seed {seed}\n{checkpoint.stem}, step {d['step'] / 1e6:.2f}M\n{where} ({split[a.track]}), shift {a.shift}"
+        fast_until = None
+        if not scenario and not a.from_start and len(d["lap_times"]):  # lap 1 ends when the lap count reaches 2
+            lap1_end = float(d["time"][np.argmax(d["laps"] >= 2)])
+            fast_until = lap1_end - a.lead
+            hits = d["time"][1:][(np.diff(d["damage"]) > 0) & (d["time"][1:] < lap1_end)]
+            if len(hits) and hits[-1] > fast_until - 3.0:  # don't open on a wall contact: skip past it
+                fast_until = min(float(hits[-1]) + 3.0, lap1_end - 0.5)
+            print(f"  fast-forwarding to {fast_until:.1f} s ({lap1_end - fast_until:.1f} s before the flying lap; "
+                  "--from-start to watch lap 1)")
+        play(d, bot, a.track, controls, run, header, launch_spec(scenario) if scenario else None, fast_until)
 
 
 if __name__ == "__main__":

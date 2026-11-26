@@ -607,8 +607,8 @@ int main(int argc, char *argv[])
             H.engine->restartRace();
             H.w->reset_seconds += (rlp_now_ns() - t0) * 1e-9;
             H.w->n_resets++;
-            if (H.record) { // only the first episode is recorded
-                fclose(H.record);
+            if (H.record && ftell(H.record) > 0) { // only the first episode that drove is recorded (a launched
+                fclose(H.record);                    // start restarts the race before it drives: keep recording)
                 H.record = nullptr;
             }
             H.reset_requested = H.race_over = false;
