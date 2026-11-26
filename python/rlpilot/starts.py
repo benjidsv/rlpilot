@@ -111,7 +111,15 @@ def write_launch(starts: Starts, track: np.ndarray, table: TrackTable, act: np.n
     act[:, A["launch_pos"]:A["launch_speed"] + 1] = np.where(grid[:, None], 0.0, slots).astype(np.float32)
 
 
-def train_kinds(n: int, rng: np.random.Generator) -> np.ndarray:
-    names = list(TRAIN_SHARES)
-    p = np.array([TRAIN_SHARES[k] for k in names])
+def train_kinds(n: int, rng: np.random.Generator, crashed_share: float = 0.0) -> np.ndarray:
+    """n kinds drawn by TRAIN_SHARES. crashed_share > 0: crashed starts get that share instead, the difference taken
+    from nominal (2026-11-25: backward-facing crashed starts, ~4% of training, are a skill learnt then lost)."""
+    shares = dict(TRAIN_SHARES)
+    if crashed_share > 0:
+        shares["nominal"] -= crashed_share - shares["crashed"]
+        shares["crashed"] = crashed_share
+        if shares["nominal"] < 0:
+            raise ValueError(f"crashed_share {crashed_share} leaves no nominal starts")
+    names = list(shares)
+    p = np.array([shares[k] for k in names])
     return np.array([K[k] for k in names])[rng.choice(len(names), n, p=p / p.sum())]

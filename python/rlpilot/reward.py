@@ -49,6 +49,23 @@ Reward per step, split into components so each can be logged:
   an input, so the policy still drives any track from its geometry. Meant to fade (train.py --line-fade) like width.
   Not potential-based on purpose: a potential (gamma Phi(s') - Phi(s)) leaves the advantages unchanged once the critic
   has learnt it, so it can't move a policy out of a local optimum; this is a curriculum, then the true reward decides.
+- weave:    -weave_cost x (yaw rate / WEAVE_YAW)^2 x the step's seconds, on a long straight only (corners.straight_map;
+  default 0: off). Colored steering noise gave the best corners yet but a policy that weaves on the straights
+  (2026-11-25, Spa straights, yaw rate rms: colored-both 0.149 rad/s, pressure 0.043, baseline 0.019). Squared, so a
+  weave costs far more than one smooth move across the road (a 5 m move over 2.5 s at 60 m/s peaks at ~0.066 rad/s),
+  and the corner approaches aren't long straights, so setting up the line there is free. 0.5: a second at
+  colored-both's weave costs ~1.1, ~18% of the progress paid at 60 m/s; pressure's ~0.09 (1.5%).
+- stuck:    -stuck_cost per second without a new best distance for more than STUCK_GRACE s (default 0: off). The
+  no-progress terminal alone is far away when a car sits: at 10 s it is worth 0.995^250 ~ 0.29 of itself. Crashed
+  starts facing backwards end with the car never moving (2026-11-25 cap05 30M: 176 of the 202 failed crashed
+  scenarios, ok 0.03 at 150-180 deg vs 0.45 at the 14M checkpoint). Only charged while not progressing, so normal
+  driving never pays it; a turnaround (~5-7 s) pays it too, but less than sitting out the 10 s plus the terminal.
+  0.5: ~10% of the progress paid per second at 50 m/s. The 10M run (2026-11-25): backwards starts 0 -> 0.19-0.39 ok,
+  but ~7% slower: most crashes are followed by seconds without a new best, so it is a crash cost too (caution).
+- idle:     -idle_cost per second while the car stands still (speed under IDLE_SPEED) for more than IDLE_GRACE s
+  (default 0: off). What stuck_cost meant to charge, without charging the way out: a three-point turn or a reverse
+  gains no new best distance for seconds, but it moves. Sitting pays, trying to get going doesn't; a crash only pays
+  the seconds it stands still after it.
 
 Termination (fails the episode): no new best distance along the track for NO_PROGRESS_SECONDS (a spin, a reverse out
 of the grass or a three-point turn are all fine, as long as the car gets going again), damage over MAX_DAMAGE, or the
@@ -72,9 +89,13 @@ NO_PROGRESS_SECONDS = 10.0
 PROGRESS_STEP = 1.0     # m: a new best distance must beat the last one by this (jitter against a wall isn't progress)
 MAX_DAMAGE = 5000.0
 WALL_SPEED = 40.0       # m/s: wall_cost is the cost of a step of wall damage at this speed
+WEAVE_YAW = 0.1         # rad/s: weave_cost is the cost of a second at this yaw rate on a long straight
+IDLE_SPEED = 0.5        # m/s: under this the car is standing still (idle_cost)
+IDLE_GRACE = 1.0        # s standing still before idle_cost charges (a launch, a gear change into reverse)
+STUCK_GRACE = 2.0       # s without a new best distance before stuck_cost charges (a standing start gets going in ~1 s)
 OFF_MARGIN = 1.0        # m: the car's half width: with all four wheels off its centre is ~1 m past the edge
 OFF_CAP = 10.0          # m: offroad_cost stops growing here (a car stranded 30 m out isn't 3x worse off)
-COMPONENTS = ("progress", "damage", "control", "terminal", "wall", "offroad", "width", "line")
+COMPONENTS = ("progress", "damage", "control", "terminal", "wall", "offroad", "width", "line", "weave", "stuck", "idle")
 LOST_CAUSES = ("contact", "backwards", "far_off")
 FAILURES = ("no_progress", "damage", "race_over", "sim_error")  # reason codes 0.. of terminated episodes
 
@@ -91,16 +112,26 @@ class Reward:
                  terminal: float = TERMINAL, lost_causes: tuple[str, ...] = LOST_CAUSES,
                  metre_weight: Callable[[np.ndarray], np.ndarray] | None = None, wall_cost: float = 0.0,
                  offroad_cost: float = 0.0, width_bonus: float = 0.0, line_bonus: float = 0.0,
-                 line_target: Callable[[np.ndarray], np.ndarray] | None = None):
+                 line_target: Callable[[np.ndarray], np.ndarray] | None = None, weave_cost: float = 0.0,
+                 straight: Callable[[np.ndarray], np.ndarray] | None = None, stuck_cost: float = 0.0,
+                 idle_cost: float = 0.0):
         """metre_weight(raw) -> [n]: what each metre of progress is worth, relative to the others (None: 1).
         wall_cost: reward lost per step of wall damage at WALL_SPEED, x (speed / WALL_SPEED)^2. offroad_cost: reward
         lost per metre driven and per metre beyond the edge, with all four wheels off. width_bonus: reward per metre of
         progress at the road's edge, x |offset| / half width (the trainer may change it between steps to fade it; see
         the module docstring). line_bonus: reward per metre of progress on the bot's line, x closeness to it;
         line_target(raw) -> [n]: the bot's offset from the middle where each car is (needed when line_bonus > 0; the
-        trainer may fade line_bonus too)."""
+        trainer may fade line_bonus too). weave_cost: reward lost per second at a yaw rate of WEAVE_YAW on a long
+        straight, x (yaw rate / WEAVE_YAW)^2; straight(raw) -> [n]: 1 where each car is on a long straight, else 0
+        (needed when weave_cost > 0). stuck_cost: reward lost per second without progress, after STUCK_GRACE s.
+        idle_cost: reward lost per second standing still, after IDLE_GRACE s."""
         if line_bonus > 0 and line_target is None:
             raise ValueError("line_bonus needs line_target")
+        if weave_cost > 0 and straight is None:
+            raise ValueError("weave_cost needs straight")
+        self.weave_cost, self.straight = weave_cost, straight
+        self.stuck_cost, self.idle_cost = stuck_cost, idle_cost
+        self.idle_for = np.zeros(n, np.float64)  # s the car has been standing still
         self.dt = step_seconds
         self.line_bonus, self.line_target = line_bonus, line_target
         self.wall_cost, self.offroad_cost, self.width_bonus = wall_cost, offroad_cost, width_bonus
@@ -124,7 +155,7 @@ class Reward:
         self.components = np.zeros((len(COMPONENTS), n), np.float32)  # this step
 
     def reset(self, idx: np.ndarray, raw: np.ndarray) -> None:
-        self.raced[idx] = self.peak[idx] = self.best[idx] = self.since_best[idx] = 0
+        self.raced[idx] = self.peak[idx] = self.best[idx] = self.since_best[idx] = self.idle_for[idx] = 0
         self.prev_dist[idx] = raw[idx, F["dist_raced"]]
         self.prev_damage[idx] = raw[idx, F["damage"]]
         self.prev_coll[idx] = raw[idx, F["coll_count"]]
@@ -191,4 +222,13 @@ class Reward:
             self.components[7] = self.line_bonus * close * np.where(off, 0.0, np.maximum(paid, 0.0))
         else:
             self.components[7] = 0.0
+        if self.weave_cost > 0:
+            yaw = raw[:, F["yaw_rate"]].astype(np.float64) / WEAVE_YAW
+            self.components[8] = -self.weave_cost * yaw**2 * self.dt * self.straight(raw) * on
+        if self.stuck_cost > 0:
+            self.components[9] = -self.stuck_cost * self.dt * ((self.since_best > STUCK_GRACE) & on)
+        if self.idle_cost > 0:
+            speed = np.hypot(raw[:, F["speed_x"]].astype(np.float64), raw[:, F["speed_y"]].astype(np.float64))
+            self.idle_for = np.where(on, np.where(speed < IDLE_SPEED, self.idle_for + self.dt, 0.0), self.idle_for)
+            self.components[10] = -self.idle_cost * self.dt * ((self.idle_for > IDLE_GRACE) & on)
         return self.components.sum(axis=0), terminated, reason

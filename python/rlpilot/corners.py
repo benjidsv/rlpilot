@@ -28,6 +28,12 @@ BRAKING = 5.0        # m/s the bot loses from its approach speed to its slowest 
 APPROACH = 300.0     # m before the corner where the bot's braking point is looked for
 LEAD = 50.0          # m before a flat-out corner where its window begins
 EXIT = 50.0          # m after the corner where its window ends
+# A long straight (straight_map): no bend tighter than STRAIGHT_RADIUS from STRAIGHT_BEHIND m behind to STRAIGHT_AHEAD
+# m ahead. ~16% of a training track's length (median; 0-50% by track): the corner approaches, where a car sets up its
+# line, are never part of one (2026-11-25).
+STRAIGHT_RADIUS = 800.0
+STRAIGHT_BEHIND = 30.0
+STRAIGHT_AHEAD = 150.0
 
 
 def _circ_smooth(x: np.ndarray, sd_cells: float) -> np.ndarray:
@@ -57,6 +63,19 @@ def profiles(track: Track) -> dict[str, np.ndarray]:
             "side_left": t[:, C["side_left"]], "side_right": t[:, C["side_right"]],
             "grass_left": t[:, C["grass_left"]], "grass_right": t[:, C["grass_right"]],
             "loose_left": t[:, C["loose_left"]], "loose_right": t[:, C["loose_right"]]}
+
+
+def straight_map(track: Track) -> np.ndarray:
+    """[cells + 1] float32, per grid cell like Track.table (the last row is the start line again): 1 on a long
+    straight (see STRAIGHT_RADIUS), else 0."""
+    k = np.abs(profiles(track)["kappa"])
+    n, ds = len(k), track.spacing
+    window = np.arange(-int(STRAIGHT_BEHIND / ds), int(STRAIGHT_AHEAD / ds) + 1)
+    tightest = np.zeros(n)
+    for w in window:  # max over the window, without an [n, window] array
+        np.maximum(tightest, np.roll(k, -w), out=tightest)
+    straight = (tightest < 1.0 / STRAIGHT_RADIUS).astype(np.float32)
+    return np.concatenate([straight, straight[:1]])
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:

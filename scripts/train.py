@@ -25,6 +25,7 @@ import wandb
 
 from rlpilot import controls, evaluate, obs as observation  # rlpilot
 from rlpilot.env import ENDS, RacingEnv  # rlpilot
+from rlpilot.reward import COMPONENTS  # rlpilot
 from rlpilot.starts import KINDS  # rlpilot
 from rlpilot.tracks import Track, allocate, load_split  # rlpilot
 
@@ -120,6 +121,11 @@ class Args:
     """the steering std's multiplier never goes below this: at power 2 it reaches 0.1 at 63 m/s (the base runs' fastest
     1% of validation driving is above 58 m/s). A std near 0 would also make PPO's ratio explode for tiny changes of
     the mean"""
+    steer_noise_straight: float = 0.0
+    """training's steering noise on a long straight (corners.straight_map: no bend tighter than 800 m radius from 30 m
+    behind to 150 m ahead): its std is multiplied by this there (1 elsewhere, so corner approaches keep it all).
+    0 = off. Colored steering noise gave the best corners but weaving straights; fading it with speed lost the corner
+    gain (it needs the noise at 30-50 m/s), this fades it where the road is straight instead (2026-11-25)"""
     obs_height: str = "none"
     """optional inputs (obs.py): the road's height at the edge points, "centre" (21), "edges" (42) or "none" (off)"""
     gearbox: str = "manual"
@@ -173,6 +179,19 @@ class Args:
     auto_upshift: float = 0.92
     """with --gearbox auto, the upshift point, as a share of the redline (controls.configure). The gears are tall:
     0.995 is ~2% faster at the end of the long straights than 0.92 (2026-11-25)"""
+    weave_cost: float = 0.0
+    """reward lost per second on a long straight at a yaw rate of 0.1 rad/s, x (yaw rate / 0.1)^2: against weaving
+    (colored steering noise). 0.5 = ~18% of the progress at 60 m/s at colored-both's weave, ~1.5% at pressure's.
+    0 = off (reward.py)"""
+    stuck_cost: float = 0.0
+    """reward lost per second without a new best distance, after 2 s: against sitting still after a crash (crashed
+    starts facing backwards never move). 0 = off (reward.py)"""
+    idle_cost: float = 0.0
+    """reward lost per second standing still (under 0.5 m/s), after 1 s: against sitting after a crash, without
+    charging a turnaround or a reverse (which gain no distance for a while, unlike stuck_cost). 0 = off (reward.py)"""
+    crashed_share: float = 0.0
+    """share of training starts that are crashed (nearly stopped, facing any way), taken from nominal. 0 = the
+    default 0.08 (starts.TRAIN_SHARES)"""
     wall_cost: float = 0.0
     """reward lost per step of wall damage, at 40 m/s: scales with the speed squared (Fuchs et al. 2021: -c |v|^2 in
     wall contact; without it their car grinded along the walls, a fixed cost made it freeze). 1 = 10 m of progress
@@ -253,6 +272,10 @@ def make_env(
         offroad_cost=args.offroad_cost,  # rlpilot
         width_bonus=args.width_bonus,  # rlpilot
         line_bonus=args.line_bonus,  # rlpilot
+        weave_cost=args.weave_cost,  # rlpilot
+        stuck_cost=args.stuck_cost,  # rlpilot
+        crashed_share=args.crashed_share,  # rlpilot
+        idle_cost=args.idle_cost,  # rlpilot
     )
     env = norm = NormalizeObservation(
         env, fixed=observation.FIXED
@@ -455,12 +478,18 @@ def shift_mask(norm, x):
 
 
 def steer_noise_scale(norm, x, args):
-    """rlpilot: x [n, obs] normalized observations -> [n] multiplier of the steering's std, from the car's speed"""
-    if args.steer_noise_power == 0:
-        return torch.ones(len(x), device=x.device)
-    speed = car_speed(norm, x)
-    scale = torch.clamp(args.steer_noise_speed / speed.clamp(min=1e-3), max=1.0) ** args.steer_noise_power
-    return scale.clamp(min=args.steer_noise_floor)
+    """rlpilot: x [n, obs] normalized observations -> [n] multiplier of the steering's std, from the car's speed
+    (--steer-noise-power) and whether it is on a long straight (--steer-noise-straight, from the env's last
+    observation, which x is)"""
+    scale = torch.ones(len(x), device=x.device)
+    if args.steer_noise_power != 0:
+        speed = car_speed(norm, x)
+        scale = torch.clamp(args.steer_noise_speed / speed.clamp(min=1e-3), max=1.0) ** args.steer_noise_power
+        scale = scale.clamp(min=args.steer_noise_floor)
+    if args.steer_noise_straight > 0:
+        straight = torch.as_tensor(norm.env.on_straight(), dtype=torch.float32, device=x.device)
+        scale = scale * (1.0 - (1.0 - args.steer_noise_straight) * straight)
+    return scale
 
 
 # rlpilot: the metrics are logged to W&B in numbered sections: 2_ppo (health), 3_eval (every tier of both splits),
@@ -678,14 +707,7 @@ if __name__ == "__main__":
                 "refused_shifts",
                 "offroad_frac",
                 "mean_speed",
-                "reward_progress",
-                "reward_damage",
-                "reward_control",
-                "reward_terminal",
-                "reward_wall",
-                "reward_offroad",
-                "reward_width",
-                "reward_line",
+                *(f"reward_{c}" for c in COMPONENTS),  # every component, as reward.py lists them
                 "lost_contact",
                 "lost_backwards",
                 "lost_far_off",
