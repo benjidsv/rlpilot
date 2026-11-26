@@ -777,6 +777,7 @@ if __name__ == "__main__":
         torch.set_num_threads(args.update_threads)  # rlpilot
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+        grad_norms = []  # rlpilot: before clipping, one per minibatch
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -831,7 +832,7 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                grad_norms.append(nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm).item())  # rlpilot: logged
                 optimizer.step()
 
             if args.target_kl is not None and approx_kl > args.target_kl:
@@ -852,6 +853,8 @@ if __name__ == "__main__":
         logs["2_ppo/entropy"] = entropy_loss.item()
         logs["2_ppo/approx_kl"] = approx_kl.item()
         logs["2_ppo/clipfrac"] = np.mean(clipfracs)
+        logs["2_ppo/grad_norm"] = np.mean(grad_norms)  # rlpilot: before clipping
+        logs["2_ppo/grad_clipped"] = np.mean(np.array(grad_norms) > args.max_grad_norm)  # rlpilot: share clipped
         logs["2_ppo/explained_variance"] = explained_var
         bar.update(args.batch_size)  # rlpilot
         bar.set_postfix(
