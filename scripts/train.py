@@ -139,6 +139,15 @@ class Args:
     """the pedal's std never goes below this (learned std: the squashing's lower end, per dimension; it still starts at
     1). 0 = off (the steer and pedal floor is exp(LOGSTD_MIN) = 0.03). The pedal std at speed collapses to ~0.05, and
     past seeds' pace was ordered by how fast it did (2026-11-24 speed round, arm B)"""
+    std_max: float = 0.0
+    """the std of steer and pedal never goes above this (learned std: the squashing's upper end, and it starts just
+    under it instead of at 1). 0 = off (exp(LOGSTD_MAX) = 1.65). v1 clamped every action's std to [0.1, 0.5]; v2's
+    learned std at standstill climbs to the 1.65 end after a crash (random actions beat a mean that was never trained
+    there), so the mean the eval drives brakes and stays stopped (2026-11-25, steer01 / gate05: most no-progress ends)"""
+    steer_std_floor: float = 0.0
+    """the steering's std never goes below this (as pedal_std_floor). 0 = off (0.03). With a learned std, every 30M run
+    sits on the 0.03 end at all speeds; v1 (proto-8-cont, 6.7% faster than the bot on train tracks) had a fixed 0.1 on
+    the same steering-rate action, ~3x more steering exploration at speed (2026-11-25)"""
     noise_beta: float = 0.0
     """colored exploration noise (Hollenstein et al., AAAI 2024): the Gaussian's standard normal draws z for
     `noise_dims` come from a per-env sequence with power spectrum 1 / f^beta, fresh at each episode, instead of white
@@ -267,9 +276,16 @@ LOGSTD_MIN, LOGSTD_MAX = -3.5, 0.5  # rlpilot: a learned std stays in [0.03, 1.6
 LOGSTD_BIAS = float(np.log(-LOGSTD_MIN / LOGSTD_MAX))  # rlpilot: sigmoid(bias) = 3.5 / 4, so the std starts at 1
 
 
-def logstd_min(pedal_std_floor=0.0):
-    """rlpilot: [steer, pedal] lower ends of the learned log std (Args.pedal_std_floor raises the pedal's)"""
-    return np.array([LOGSTD_MIN, max(LOGSTD_MIN, float(np.log(pedal_std_floor)) if pedal_std_floor > 0 else LOGSTD_MIN)])
+def logstd_max(std_max=0.0):
+    """rlpilot: [steer, pedal] upper ends of the learned log std (Args.std_max lowers both)"""
+    hi = min(LOGSTD_MAX, float(np.log(std_max))) if std_max > 0 else LOGSTD_MAX
+    return np.array([hi, hi])
+
+
+def logstd_min(pedal_std_floor=0.0, steer_std_floor=0.0):
+    """rlpilot: [steer, pedal] lower ends of the learned log std (Args.steer_std_floor / pedal_std_floor raise them)"""
+    floor = lambda f: max(LOGSTD_MIN, float(np.log(f))) if f > 0 else LOGSTD_MIN
+    return np.array([floor(steer_std_floor), floor(pedal_std_floor)])
 
 
 class Agent(nn.Module):
@@ -278,8 +294,8 @@ class Agent(nn.Module):
     # sum of the two, and so is the entropy.
     def __init__(
         self, envs, hidden=64, hold_bias=0.0, activation="tanh", first_gain=np.sqrt(2), learned_std=False,
-        pedal_std_floor=0.0,
-    ):  # rlpilot: activation, first_gain, learned_std and pedal_std_floor are our arguments (see Args)
+        pedal_std_floor=0.0, steer_std_floor=0.0, std_max=0.0,
+    ):  # rlpilot: activation, first_gain, learned_std and the std floors are our arguments (see Args)
         super().__init__()
         n_obs = np.array(envs.single_observation_space.shape).prod()
         act = {"tanh": nn.Tanh, "relu": nn.ReLU}[activation]
@@ -308,13 +324,19 @@ class Agent(nn.Module):
         with torch.no_grad():
             self.shift_logits.bias[1] = hold_bias
         self.learned_std = learned_std  # rlpilot: a per-state std (Args.learned_std), created last: off = as before
-        self.logstd_min = torch.tensor(logstd_min(pedal_std_floor), dtype=torch.float32)  # rlpilot: not a parameter
+        self.logstd_min = torch.tensor(logstd_min(pedal_std_floor, steer_std_floor), dtype=torch.float32)  # rlpilot: not a parameter
+        self.logstd_max = torch.tensor(logstd_max(std_max), dtype=torch.float32)  # rlpilot: not a parameter
+        # rlpilot: any std floor or cap set (off: the code path is the one before both existed)
+        self.floored = bool((self.logstd_min > LOGSTD_MIN).any() or (self.logstd_max < LOGSTD_MAX).any())
         if learned_std:
             self.logstd_head = layer_init(nn.Linear(hidden, 2), std=0.01, bias_const=LOGSTD_BIAS)
-            if pedal_std_floor > 0:  # rlpilot: a higher lower end for the pedal, its bias moved so its std still starts at 1
-                lo = float(self.logstd_min[1])
-                with torch.no_grad():
-                    self.logstd_head.bias[1] = float(np.log(-lo / LOGSTD_MAX))
+            for i in range(2):  # rlpilot: other ends, the bias moved so the std still starts at 1 (or just under a cap)
+                lo, hi = float(self.logstd_min[i]), float(self.logstd_max[i])
+                if lo > LOGSTD_MIN or hi < LOGSTD_MAX:
+                    start = min(0.0, hi - 0.05)  # the log std it starts at (0 = std 1, as without a cap)
+                    p = (start - lo) / (hi - lo)
+                    with torch.no_grad():
+                        self.logstd_head.bias[i] = float(np.log(p / (1 - p)))
 
     def get_value(self, x):
         return self.critic(x)
@@ -327,15 +349,15 @@ class Agent(nn.Module):
         h = self.actor_body(x)
         action_mean = self.actor_mean(h)
         if self.learned_std:  # rlpilot: squashed into [LOGSTD_MIN, LOGSTD_MAX], so no state's noise can vanish
-            if self.logstd_min[1] > LOGSTD_MIN:  # rlpilot: --pedal-std-floor
-                lo = self.logstd_min.to(h.device)
-                action_logstd = lo + (LOGSTD_MAX - lo) * torch.sigmoid(self.logstd_head(h))
+            if self.floored:  # rlpilot: --pedal-std-floor / --steer-std-floor
+                lo, hi = self.logstd_min.to(h.device), self.logstd_max.to(h.device)
+                action_logstd = lo + (hi - lo) * torch.sigmoid(self.logstd_head(h))
             else:
                 action_logstd = LOGSTD_MIN + (LOGSTD_MAX - LOGSTD_MIN) * torch.sigmoid(self.logstd_head(h))
         else:
             action_logstd = self.actor_logstd.expand_as(action_mean)
-            if self.logstd_min[1] > LOGSTD_MIN:  # rlpilot: --pedal-std-floor without a learned std: a clamp
-                action_logstd = torch.maximum(action_logstd, self.logstd_min.to(h.device))
+            if self.floored:  # rlpilot: a std floor / cap without a learned std: a clamp
+                action_logstd = torch.clamp(action_logstd, self.logstd_min.to(h.device), self.logstd_max.to(h.device))
         action_std = torch.exp(action_logstd)
         if steer_scale is not None:  # rlpilot
             action_std = action_std * torch.stack([steer_scale, torch.ones_like(steer_scale)], 1)
@@ -540,7 +562,7 @@ if __name__ == "__main__":
     envs, norm = make_env(args)  # rlpilot
 
     agent = Agent(envs, args.hidden, args.hold_bias, args.activation, args.first_gain, args.learned_std,
-                  args.pedal_std_floor).to(
+                  args.pedal_std_floor, args.steer_std_floor, args.std_max).to(
         device
     )  # rlpilot: hidden width, hold bias
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
